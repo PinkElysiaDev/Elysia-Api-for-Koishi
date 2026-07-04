@@ -1,0 +1,31 @@
+# TS 编译产物（仅 Koishi 包根的 lib/，不误伤 webui 的 src/lib 源码目录）
+packages/*/lib
+backend/lib
+lib/
+!packages/webui/src/lib/
+dist
+external
+
+node_modules
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+tsconfig.tsbuildinfo
+
+.eslintcache
+.DS_Store
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# 运行时 / 本地产物，不应提交
+backend/**/usage-records.jsonl
+backend/**/*.sqlite3
+backend/**/*.sqlite3-shm
+backend/**/*.sqlite3-wal
+backend/**/.db-key
+backend/**/master.key
+package-lock.json
