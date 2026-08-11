@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $backendDir = Join-Path $RepoRoot 'backend'
-$binDir = Join-Path $RepoRoot 'packages/orchestrator/assets/bin'
+$binDir = Join-Path $RepoRoot 'packages/elysia-api/assets/bin'
 $stagingDir = Join-Path $backendDir '.codex-backend-build'
 $goCacheDir = Join-Path $backendDir '.codex-gocache'
 $goTmpDir = Join-Path $backendDir '.codex-gotmp'
@@ -55,7 +55,7 @@ try {
   Build-Backend 'darwin' 'amd64' 'elysia-backend-darwin-amd64'
   Build-Backend 'darwin' 'arm64' 'elysia-backend-darwin-arm64'
 
-  Write-Step 'Moving binaries into orchestrator assets'
+  Write-Step 'Moving binaries into elysia-api assets'
   Copy-Item -LiteralPath (Join-Path $stagingDir 'elysia-backend.exe') -Destination (Join-Path $binDir 'elysia-backend.exe') -Force
   Copy-Item -LiteralPath (Join-Path $stagingDir 'elysia-backend-linux') -Destination (Join-Path $binDir 'elysia-backend-linux') -Force
   Copy-Item -LiteralPath (Join-Path $stagingDir 'elysia-backend-darwin-amd64') -Destination (Join-Path $binDir 'elysia-backend-darwin-amd64') -Force
