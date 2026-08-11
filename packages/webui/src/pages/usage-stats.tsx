@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { Cell, Pie, PieChart, ResponsiveContainer } from 'recharts'
 import { BarChart3, CheckCircle2, Cpu, Gauge, Timer } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
@@ -14,10 +14,10 @@ import {
   compactNumber,
   formatDuration,
   formatNumber,
+  normalizedNow,
   percent,
   ratePerMinute,
   startOfRange,
-  toRFC3339,
   uniqueSorted,
 } from '@/lib/utils'
 
@@ -35,16 +35,16 @@ export function UsageStatsPage() {
   const modelOptions = useMemo(() => uniqueSorted((models ?? []).map((m) => m.name)), [models])
   const keyOptions = useMemo(() => uniqueSorted((tokens ?? []).map((t) => t.name)), [tokens])
 
-  const params = useMemo(
-    () => ({
-      from: startOfRange(range),
-      to: toRFC3339(new Date()),
+  const params = useMemo(() => {
+    const to = normalizedNow()
+    return {
+      from: startOfRange(range, to),
+      to,
       groupNames: groupNames.length ? groupNames : undefined,
       modelNames: modelNames.length ? modelNames : undefined,
       keyNames: keyNames.length ? keyNames : undefined,
-    }),
-    [range, groupNames, modelNames, keyNames],
-  )
+    }
+  }, [range, groupNames, modelNames, keyNames])
 
   const { data: stats, isLoading, error, mutate } = useUsageStats(params)
 
@@ -66,12 +66,21 @@ export function UsageStatsPage() {
   const tokenData = useMemo(
     () => [
       { name: '输入', value: stats?.inputTokens ?? 0, color: 'hsl(var(--primary))' },
-      // 输出用高饱和青绿，与输入的粉色形成强区分；缓存命中沿用旧输出的浅粉，区分度更低。
       { name: '输出', value: stats?.outputTokens ?? 0, color: 'hsl(160 84% 45%)' },
-      { name: '缓存命中', value: stats?.cacheHitTokens ?? 0, color: 'hsl(330 86% 78%)' },
     ],
     [stats],
   )
+
+  const tokenHoverData = useMemo(() => {
+    const input = stats?.inputTokens ?? 0
+    const hit = stats?.cacheHitTokens ?? 0
+    const miss = Math.max(0, input - hit)
+    return [
+      { name: '缓存未命中', value: miss, color: 'hsl(var(--primary))' },
+      { name: '缓存命中', value: hit, color: 'hsl(330 86% 78%)' },
+      { name: '输出', value: stats?.outputTokens ?? 0, color: 'hsl(160 84% 45%)' },
+    ]
+  }, [stats])
 
   return (
     <div className="space-y-6">
@@ -142,7 +151,7 @@ export function UsageStatsPage() {
               <DonutChart data={pieData} total={stats?.requests ?? 0} centerLabel="请求" />
             </ChartCard>
             <ChartCard title="累计 token 分布">
-              <DonutChart data={tokenData} total={stats?.totalTokens ?? 0} centerLabel="Token" />
+              <DonutChart data={tokenData} hoverData={tokenHoverData} total={stats?.totalTokens ?? 0} centerLabel="Token" />
             </ChartCard>
           </div>
         </>
@@ -173,29 +182,56 @@ function ChartCard({
 
 function DonutChart({
   data,
+  hoverData,
   total,
   centerLabel,
 }: {
   data: { name: string; value: number; color: string }[]
+  hoverData?: { name: string; value: number; color: string }[]
   total: number
   centerLabel: string
 }) {
-  // 悬停的扇区下标；null 时圆环中央显示总计。鼠标移开圆环即恢复总计。
+  // 悬停状态与悬停的扇区下标；null 时圆环中央显示总计。鼠标移开圆环即恢复总计。
+  const [isHovered, setIsHovered] = useState(false)
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
-  const hasData = data.some((d) => d.value > 0)
+  const chartRef = useRef<HTMLDivElement>(null)
+
+  const activeData = isHovered && hoverData ? hoverData : data
+  const hasData = activeData.some((d) => d.value > 0)
   // 单项数据（只有一个非零扇区）时 paddingAngle=0，让圆环完全闭合；
   // 多项时保留 2° 间隔便于区分扇区。
-  const nonZeroCount = data.filter((d) => d.value > 0).length
+  const nonZeroCount = activeData.filter((d) => d.value > 0).length
   const paddingAngle = nonZeroCount <= 1 ? 0 : 2
-  const active = activeIndex != null ? data[activeIndex] : null
+  const active = activeIndex != null ? activeData[activeIndex] : null
+
+  function updateHoverFromMouse(clientX: number, clientY: number) {
+    const container = chartRef.current
+    if (!container) return
+    const rect = container.getBoundingClientRect()
+    const cx = rect.left + rect.width / 2
+    const cy = rect.top + rect.height / 2
+    const dx = clientX - cx
+    const dy = clientY - cy
+    const distance = Math.sqrt(dx * dx + dy * dy)
+    // outerRadius=92，允许少量容差让触发更自然。
+    setIsHovered(distance <= 98)
+  }
 
   return (
-    <div className="relative h-64">
+    <div
+      ref={chartRef}
+      className="relative h-64"
+      onMouseMove={(e) => updateHoverFromMouse(e.clientX, e.clientY)}
+      onMouseLeave={() => {
+        setIsHovered(false)
+        setActiveIndex(null)
+      }}
+    >
       {hasData ? (
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Pie
-              data={data}
+              data={activeData}
               dataKey="value"
               nameKey="name"
               innerRadius={64}
@@ -206,7 +242,7 @@ function DonutChart({
               onMouseLeave={() => setActiveIndex(null)}
               isAnimationActive={false}
             >
-              {data.map((entry, index) => (
+              {activeData.map((entry, index) => (
                 <Cell
                   key={entry.name}
                   fill={entry.color}
@@ -245,7 +281,7 @@ function DonutChart({
       )}
       {hasData && (
         <div className="absolute bottom-0 left-0 right-0 flex justify-center gap-4">
-          {data.map((entry, index) => (
+          {activeData.map((entry, index) => (
             <span
               key={entry.name}
               className="flex cursor-default items-center gap-1.5 text-xs text-muted-foreground transition-opacity"
