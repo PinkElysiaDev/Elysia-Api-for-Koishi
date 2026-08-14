@@ -386,7 +386,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 	// 生产转换路径统一为 Maheshvara：
 	//   非流式：client wire -> MaheshvaraRequest -> target wire；provider response -> MaheshvaraResponse -> client wire。
 	//   流式：provider SSE -> source decoder -> MaheshvaraStreamEvent -> target renderer -> client SSE。
-	// 仅在 relay.passthrough 显式开启、协议同源且请求未被过滤时允许绕过该路径。
+	// 协议同源且请求未被过滤时，直接绕过 Maheshvara 往返、零转换透传。
 	startTime := time.Now()
 
 	// 读取原始请求体
@@ -533,7 +533,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		// （cache_control / thinking / 各类未知扩展）。借鉴 Responses 透传与 new-api
 		// 的 should_convert=false 分支。vision 过滤改写了 canonicalReq 而非原始字节，
 		// 故 filtered=true 时必须回退到转换路径，否则被过滤的图片会随原始字节漏给上游。
-		usePassthrough := s.config.IsRelayPassthroughEnabled() && !filtered && relay.FormatMatchesPlatform(inputFormat, targetPlatform)
+		usePassthrough := !filtered && relay.FormatMatchesPlatform(inputFormat, targetPlatform)
 
 		// 流式意图取自客户端原始请求：OpenAI/Claude 看请求体 stream 字段，
 		// Gemini 看 URL action（:streamGenerateContent）。
@@ -562,6 +562,11 @@ func (s *Server) chatCompletions(c *gin.Context) {
 			targetBody, err = relay.PassthroughBody(bodyBytes, passModelName, ensureStream, addStreamOptions)
 			if err == nil {
 				record.RelayMode = "passthrough"
+				// OpenAI 系透传同样补齐缺失的 tool call id：部分客户端重建历史时
+				// 会遗漏 tool_calls[].id，直接透传会被严格上游以 missing field id 拒绝。
+				if targetPlatform == relay.PlatformOpenAI || targetPlatform == relay.PlatformDeepSeek || targetPlatform == relay.PlatformAzure {
+					targetBody, err = relay.NormalizeOpenAIToolCallIDs(targetBody)
+				}
 			}
 		} else if relay.IsCustomPlatform(targetPlatform) {
 			customRequest, err = relay.RenderRegisteredCustomProtocolRequest(canonicalReq, relay.CustomProtocolID(targetPlatform))
@@ -954,7 +959,13 @@ func (s *Server) handleStreamRequest(c *gin.Context, group *config.ModelGroupCon
 		record.StatusCode = http.StatusOK
 		observeUpstreamUsage(resp, record, targetPlatform)
 
-		forwardErr = relay.TransformStreamViaMaheshvara(c.Request.Context(), resp, relay.FormatOpenAIChat, inputFormat, writer, selectedModel.Name)
+		if record.RelayMode == "passthrough" {
+			// OpenAI 系同协议透传：原始转发上游 SSE，保留 tool call id、
+			// reasoning_content 等字段，不经过 Maheshvara 重渲染。
+			forwardErr = relay.ForwardOpenAIStream(c.Request.Context(), resp, writer)
+		} else {
+			forwardErr = relay.TransformStreamViaMaheshvara(c.Request.Context(), resp, relay.FormatOpenAIChat, inputFormat, writer, selectedModel.Name)
+		}
 	}
 
 	// 上游已建连、SSE 已开始后的转发/转换错误：HTTP 状态码已无法更改，
@@ -1187,6 +1198,23 @@ func (s *Server) adjustTokenUsage(groupID string, actualTokens int) {
 	if state.Tokens < 0 {
 		state.Tokens = 0
 	}
+}
+
+// forgetGroupRuntimeState 删除模型组后清理其残留的限流、轮询游标与粘滞映射，
+// 避免已删除组的键永远留在内存中。所有删除都在对应锁内完成。
+func (s *Server) forgetGroupRuntimeState(groupID string) {
+	if groupID == "" {
+		return
+	}
+	s.rateLimitMu.Lock()
+	delete(s.rateLimits, groupID)
+	s.rateLimitMu.Unlock()
+
+	s.roundRobinMutex.Lock()
+	delete(s.roundRobinIndex, groupID)
+	s.roundRobinMutex.Unlock()
+
+	s.affinity.removeGroup(groupID)
 }
 
 func (s *Server) getOrCreateRateLimitStateLocked(groupID string) *rateLimitState {
