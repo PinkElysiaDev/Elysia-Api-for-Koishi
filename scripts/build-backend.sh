@@ -20,16 +20,16 @@ echo "WebUI assets synced to backend/webui/dist"
 cd backend
 
 echo "Building Windows amd64..."
-GOOS=windows GOARCH=amd64 go build -o ../packages/elysia-api/assets/bin/elysia-backend.exe .
+GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o ../packages/elysia-api/assets/bin/elysia-backend.exe .
 
 echo "Building Linux amd64..."
-GOOS=linux GOARCH=amd64 go build -o ../packages/elysia-api/assets/bin/elysia-backend-linux .
+GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o ../packages/elysia-api/assets/bin/elysia-backend-linux .
 
 echo "Building macOS amd64 (Intel)..."
-GOOS=darwin GOARCH=amd64 go build -o ../packages/elysia-api/assets/bin/elysia-backend-darwin-amd64 .
+GOOS=darwin GOARCH=amd64 go build -ldflags "-s -w" -o ../packages/elysia-api/assets/bin/elysia-backend-darwin-amd64 .
 
 echo "Building macOS arm64 (Apple Silicon)..."
-GOOS=darwin GOARCH=arm64 go build -o ../packages/elysia-api/assets/bin/elysia-backend-darwin-arm64 .
+GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o ../packages/elysia-api/assets/bin/elysia-backend-darwin-arm64 .
 
 cd ..
 

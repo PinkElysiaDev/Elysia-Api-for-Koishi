@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -17,7 +16,6 @@ import (
 
 	"github.com/elysia-api/backend/config"
 	"github.com/elysia-api/backend/relay"
-	"github.com/elysia-api/backend/storage"
 	"github.com/gin-gonic/gin"
 )
 
@@ -77,6 +75,7 @@ type usageRecord struct {
 	GroupName           string           `json:"groupName"`
 	ModelID             string           `json:"modelId"`
 	ModelName           string           `json:"modelName"`
+	SourceID            string           `json:"sourceId,omitempty"`
 	Platform            string           `json:"platform"`
 	InputFormat         string           `json:"inputFormat"`
 	TargetPlatform      string           `json:"targetPlatform"`
@@ -107,55 +106,8 @@ type usageRecord struct {
 	// downstream 是写回下游客户端的 ResponseWriter 捕获器，运行期内部使用，
 	// 不参与 JSON 序列化。recordUsage 会从它回读 DownstreamResponse。
 	downstream *downstreamCaptureWriter `json:"-"`
-}
-
-type usageSummary struct {
-	Requests                     int       `json:"requests"`
-	Success                      int       `json:"success"`
-	Failed                       int       `json:"failed"`
-	SuccessRate                  float64   `json:"successRate"`
-	FailedRate                   float64   `json:"failedRate"`
-	StreamRequests               int       `json:"streamRequests"`
-	EstimatedRequests            int       `json:"estimatedRequests"`
-	InputTokens                  int       `json:"inputTokens"`
-	OutputTokens                 int       `json:"outputTokens"`
-	TotalTokens                  int       `json:"totalTokens"`
-	CacheHitTokens               int       `json:"cacheHitTokens"`
-	EstimatedTokens              int       `json:"estimatedTokens"`
-	ReasoningTokens              int       `json:"reasoningTokens"`
-	WebSearchCalls               int       `json:"webSearchCalls"`
-	FileSearchCalls              int       `json:"fileSearchCalls"`
-	ImageGenerationCalls         int       `json:"imageGenerationCalls"`
-	OpenAIChatRequests           int       `json:"openaiChatRequests"`
-	ClaudeRequests               int       `json:"claudeRequests"`
-	GeminiRequests               int       `json:"geminiRequests"`
-	ResponsesRequests            int       `json:"responsesRequests"`
-	NativeResponsesRequests      int       `json:"nativeResponsesRequests"`
-	TransformedResponsesRequests int       `json:"transformedResponsesRequests"`
-	AvgInputTokens               float64   `json:"avgInputTokens"`
-	AvgOutputTokens              float64   `json:"avgOutputTokens"`
-	AvgTotalTokens               float64   `json:"avgTotalTokens"`
-	CacheHitRate                 float64   `json:"cacheHitRate"`
-	AvgFirstByteMs               float64   `json:"avgFirstByteMs"`
-	P95FirstByteMs               int64     `json:"p95FirstByteMs"`
-	AvgDurationMs                float64   `json:"avgDurationMs"`
-	P95DurationMs                int64     `json:"p95DurationMs"`
-	AvgLatencyMs                 float64   `json:"avgLatencyMs"`
-	FirstUsedAt                  time.Time `json:"firstUsedAt,omitempty"`
-	FirstModelName               string    `json:"firstModelName,omitempty"`
-	LastUsedAt                   time.Time `json:"lastUsedAt,omitempty"`
-	LastModelName                string    `json:"lastModelName,omitempty"`
-}
-
-type usageAggregate struct {
-	Key          string       `json:"key"`
-	KeyName      string       `json:"keyName,omitempty"`
-	KeyHash      string       `json:"keyHash,omitempty"`
-	GroupName    string       `json:"groupName,omitempty"`
-	ModelName    string       `json:"modelName,omitempty"`
-	Platform     string       `json:"platform,omitempty"`
-	Window       string       `json:"window,omitempty"`
-	UsageSummary usageSummary `json:"summary"`
+	// writeGen 与 Server.usageWriteGen 对齐；reset 递增后丢弃更早的写入。
+	writeGen uint64 `json:"-"`
 }
 
 func shortTokenHash(token string) string {
@@ -241,10 +193,6 @@ type providerUsageResult struct {
 	HasUsage bool
 }
 
-func usageFromProviderBody(platform relay.Platform, body []byte) usageTokenUsage {
-	return extractProviderUsageFromBody(platform, "", body).Usage
-}
-
 func extractProviderUsageFromBody(platform relay.Platform, format relay.FormatType, body []byte) providerUsageResult {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -278,25 +226,14 @@ func extractProviderUsageFromPayload(platform relay.Platform, format relay.Forma
 			return usageResultFromClaudeUsage(raw, source)
 		}
 	}
-	switch platform {
-	case relay.PlatformAnthropic:
+	// Claude 的顶层 usage 键是上面前置探测未覆盖的最后一处；message/message_delta/
+	// usageMetadata 已在前置探测处理，平台分支不再重复。
+	if platform == relay.PlatformAnthropic {
 		if raw, ok := payload["usage"].(map[string]interface{}); ok {
 			return usageResultFromClaudeUsage(raw, source)
 		}
-		if raw, ok := payload["message"].(map[string]interface{}); ok {
-			if usageRaw, ok := raw["usage"].(map[string]interface{}); ok {
-				return usageResultFromClaudeUsage(usageRaw, source)
-			}
-		}
-		if usageRaw, ok := payload["message_delta"].(map[string]interface{}); ok {
-			if raw, ok := usageRaw["usage"].(map[string]interface{}); ok {
-				return usageResultFromClaudeUsage(raw, source)
-			}
-		}
-	case relay.PlatformGemini:
-		if raw, ok := payload["usageMetadata"].(map[string]interface{}); ok {
-			return usageResultFromGeminiUsageMetadata(raw, source)
-		}
+	}
+	switch platform {
 	default:
 		if format == relay.FormatResponses {
 			if result := usageResultFromResponsesPayload(payload, source, true); result.HasUsage {
@@ -378,17 +315,14 @@ func usageResultFromOpenAIUsage(raw map[string]interface{}, source string) provi
 	if usage.CacheHitTokens != nil {
 		detail.CachedInputTokens = intPtr(getInt(usage.CacheHitTokens))
 	}
-	if details, ok := raw["completion_tokens_details"].(map[string]interface{}); ok {
-		setDetailInt(&detail.ReasoningTokens, details, "reasoning_tokens")
-		setDetailInt(&detail.TextOutputTokens, details, "text_tokens")
-		setDetailInt(&detail.AudioOutputTokens, details, "audio_tokens")
-		setDetailInt(&detail.ImageOutputTokens, details, "image_tokens")
-	}
-	if details, ok := raw["output_tokens_details"].(map[string]interface{}); ok {
-		setDetailInt(&detail.ReasoningTokens, details, "reasoning_tokens")
-		setDetailInt(&detail.TextOutputTokens, details, "text_tokens")
-		setDetailInt(&detail.AudioOutputTokens, details, "audio_tokens")
-		setDetailInt(&detail.ImageOutputTokens, details, "image_tokens")
+	// completion/output 两个键是同一明细的两种命名（Responses 与 chat 兼容上游各用其一）。
+	for _, key := range []string{"completion_tokens_details", "output_tokens_details"} {
+		if details, ok := raw[key].(map[string]interface{}); ok {
+			setDetailInt(&detail.ReasoningTokens, details, "reasoning_tokens")
+			setDetailInt(&detail.TextOutputTokens, details, "text_tokens")
+			setDetailInt(&detail.AudioOutputTokens, details, "audio_tokens")
+			setDetailInt(&detail.ImageOutputTokens, details, "image_tokens")
+		}
 	}
 	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
 		if details, ok := raw[key].(map[string]interface{}); ok {
@@ -693,178 +627,52 @@ func (s *Server) recordUsage(record *usageRecord) {
 		record.DurationMs = record.EndedAt.Sub(record.StartedAt).Milliseconds()
 	}
 
-	if s.store != nil {
-		// 优先异步落库，避免请求路径阻塞在 SQLite 写入上；
-		// 队列满或未启动时降级为同步写，保证不丢记录。
-		if s.enqueueUsageRecord(record) {
-			return
-		}
-		if err := s.saveUsageRecordToStore(record); err != nil {
-			log.Printf("failed to save usage record to sqlite: %v", err)
-		}
+	if s.store == nil {
+		// 无 store 的降级模式不再留存 usage（遗留面板已下线，无任何读取方）。
 		return
 	}
-
-	s.usageMu.Lock()
-	defer s.usageMu.Unlock()
-	s.usageRecords = append(s.usageRecords, *record)
-	s.appendUsageRecordLocked(*record)
-	s.compactUsageRecordsLocked()
-}
-
-func (s *Server) usageSnapshot() []usageRecord {
-	s.usageMu.Lock()
-	defer s.usageMu.Unlock()
-	snapshot := make([]usageRecord, len(s.usageRecords))
-	copy(snapshot, s.usageRecords)
-	return snapshot
-}
-
-func (s *Server) usageDashboard(c *gin.Context) {
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(usageDashboardHTML))
-}
-
-func (s *Server) usageStats(c *gin.Context) {
-	from, to := usageTimeRange(c)
-	window := usageWindow(c.Query("window"), from, to)
-	if s.store != nil {
-		query := usageQueryFromRequest(c)
-		summary, err := s.store.UsageTotals(c.Request.Context(), query)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		// allTimeSummary 是"累计"口径：不带任何过滤再查一次，
-		// 与非 store 分支的 summarizeUsage(snapshot) 语义保持一致。
-		allTimeSummary, err := s.store.UsageTotals(c.Request.Context(), storage.UsageQuery{})
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"from": from, "to": to, "window": window, "summary": summary, "allTimeSummary": allTimeSummary})
+	record.writeGen = s.usageWriteGen.Load()
+	// 优先异步落库，避免请求路径阻塞在 SQLite 写入上；
+	// 队列满或未启动时降级为同步写，保证不丢记录。
+	if s.enqueueUsageRecord(record) {
 		return
 	}
-	snapshot := s.usageSnapshot()
-	records := filterUsageRecords(snapshot, c, from, to)
-
-	response := gin.H{
-		"from":           from,
-		"to":             to,
-		"window":         window,
-		"summary":        summarizeUsage(records),
-		"allTimeSummary": summarizeUsage(snapshot),
-		"series":         aggregateUsage(records, "window", window),
-		"chartSeries":    aggregateUsageSeries(records, window, from, to),
-		"byCaller":       aggregateUsage(records, "key", window),
-		"byKey":          aggregateUsage(records, "key", window),
-		"byModelGroup":   aggregateUsage(records, "modelGroup", window),
-		"byModel":        aggregateUsage(records, "model", window),
-		"bySourceFormat": aggregateUsage(records, "sourceFormat", window),
-		"byTargetFormat": aggregateUsage(records, "targetFormat", window),
-		"byRelayMode":    aggregateUsage(records, "relayMode", window),
-		"byUsageSource":  aggregateUsage(records, "usageSource", window),
-	}
-	c.JSON(http.StatusOK, response)
+	s.persistUsageRecord(record)
 }
 
-func (s *Server) usageLogs(c *gin.Context) {
-	if s.store != nil {
-		total, items, err := s.store.QueryUsageLogs(c.Request.Context(), usageQueryFromRequest(c))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"total": total, "items": items})
-		return
-	}
-	from, to := usageTimeRange(c)
-	records := filterUsageRecords(s.usageSnapshot(), c, from, to)
-	sort.Slice(records, func(i, j int) bool { return records[i].StartedAt.After(records[j].StartedAt) })
-
-	limit := parsePositiveInt(c.Query("limit"), 50)
-	if limit <= 0 {
-		limit = 50
-	}
-	offset := parsePositiveInt(c.Query("offset"), 0)
-	if offset > len(records) {
-		offset = len(records)
-	}
-	end := offset + limit
-	if end > len(records) {
-		end = len(records)
-	}
-
-	items := make([]gin.H, 0, end-offset)
-	for _, record := range records[offset:end] {
-		items = append(items, gin.H{
-			"requestId":                 record.RequestID,
-			"startedAt":                 record.StartedAt,
-			"keyName":                   record.KeyName,
-			"keyHash":                   record.KeyHash,
-			"groupName":                 record.GroupName,
-			"modelName":                 record.ModelName,
-			"platform":                  record.Platform,
-			"sourceFormat":              record.SourceFormat,
-			"targetFormat":              record.TargetFormat,
-			"relayMode":                 record.RelayMode,
-			"responsesMode":             record.ResponsesMode,
-			"usageSource":               record.UsageSource,
-			"stream":                    record.Stream,
-			"statusCode":                record.StatusCode,
-			"error":                     record.Error,
-			"firstByteMs":               record.FirstByteMs,
-			"durationMs":                record.DurationMs,
-			"usage":                     record.Usage,
-			"usageDetail":               record.UsageDetail,
-			"builtinToolUsage":          record.BuiltinToolUsage,
-			"requestWarnings":           record.RequestWarnings,
-			"retryCount":                record.RetryCount,
-			"incomingBodyTruncated":     record.IncomingBody.Truncated,
-			"outgoingBodyTruncated":     record.OutgoingBody.Truncated,
-			"providerResponseTruncated": record.ProviderResponse.Truncated,
-		})
-	}
-
-	c.JSON(http.StatusOK, gin.H{"total": len(records), "items": items})
-}
-
-func (s *Server) usageLogDetail(c *gin.Context) {
-	id := c.Param("id")
-	if s.store != nil {
-		payload, found, err := s.store.GetUsageRecordJSON(c.Request.Context(), id)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		if !found {
-			c.JSON(http.StatusNotFound, gin.H{"error": "usage log not found"})
-			return
-		}
-		c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
-		return
-	}
-	for _, record := range s.usageSnapshot() {
-		if record.RequestID == id {
-			c.JSON(http.StatusOK, record)
-			return
-		}
-	}
-	c.JSON(http.StatusNotFound, gin.H{"error": "usage log not found"})
-}
-
+// resetUsage 清空全部 usage 数据并失效响应缓存。仅由 admin 端点调用；
+// 面板下线后不再有无 store 的内存态分支。
 func (s *Server) resetUsage(c *gin.Context) {
-	if s.store != nil {
-		if err := s.store.ClearUsage(c.Request.Context()); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"reset": true})
+	if s.store == nil {
+		respondFail(c, http.StatusServiceUnavailable, "store_unavailable", "sqlite store is unavailable")
 		return
 	}
-	if err := s.clearUsageRecords(); err != nil {
+	// 先挡住 enqueue（w.mu），再拿 persist 锁清库/切 generation。
+	// 顺序必须是 writer mu → persist mu：stopUsageWriter 持 writer mu 后 Wait
+	// writer，而 writer 落库要 persist mu；若此处反序会与 stop 死锁。
+	w := s.usageWriterSnapshot()
+	if w != nil {
+		w.mu.Lock()
+	}
+	s.usagePersistMu.Lock()
+	if err := s.store.ClearUsage(c.Request.Context()); err != nil {
+		s.usagePersistMu.Unlock()
+		if w != nil {
+			w.mu.Unlock()
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// 清库成功后，在 enqueue 仍被挡住时排空旧队列并递增 generation，
+	// 避免「先加 generation 再 drain」把 reset 之后、drain 之前入队的新记录丢掉。
+	s.drainUsageQueueFrom(w)
+	s.usageWriteGen.Add(1)
+	s.usagePersistMu.Unlock()
+	if w != nil {
+		w.mu.Unlock()
+	}
+	s.usageCache.flush()
+	s.usageSeq.Add(1)
 	c.JSON(http.StatusOK, gin.H{"reset": true})
 }
 
@@ -882,59 +690,6 @@ func usageTimeRange(c *gin.Context) (time.Time, time.Time) {
 		}
 	}
 	return from, to
-}
-
-func usageWindow(raw string, from, to time.Time) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "5m", "15m", "hour", "day":
-		return strings.ToLower(strings.TrimSpace(raw))
-	case "minute":
-		return "5m"
-	}
-
-	if from.IsZero() {
-		return "day"
-	}
-
-	duration := to.Sub(from)
-	if duration <= 24*time.Hour {
-		return "5m"
-	}
-	if duration <= 7*24*time.Hour {
-		return "hour"
-	}
-	return "day"
-}
-
-func filterUsageRecords(records []usageRecord, c *gin.Context, from, to time.Time) []usageRecord {
-	result := make([]usageRecord, 0, len(records))
-	keyNames := c.QueryArray("keyName")
-	groupNames := c.QueryArray("groupName")
-	modelNames := c.QueryArray("modelName")
-	stream := strings.TrimSpace(c.Query("stream"))
-	status := strings.TrimSpace(c.Query("status"))
-	for _, record := range records {
-		if (!from.IsZero() && record.StartedAt.Before(from)) || (!to.IsZero() && record.StartedAt.After(to)) {
-			continue
-		}
-		if !usageValueMatches(keyNames, record.KeyName) {
-			continue
-		}
-		if !usageValueMatches(groupNames, record.GroupName) {
-			continue
-		}
-		if !usageValueMatches(modelNames, record.ModelName) {
-			continue
-		}
-		if stream != "" && strconv.FormatBool(record.Stream) != strings.ToLower(stream) {
-			continue
-		}
-		if status != "" && !usageStatusMatches(record.StatusCode, status) {
-			continue
-		}
-		result = append(result, record)
-	}
-	return result
 }
 
 func usageValueMatches(filters []string, value string) bool {
@@ -963,51 +718,6 @@ func usageStatusMatches(statusCode int, filter string) bool {
 	}
 }
 
-func summarizeUsage(records []usageRecord) usageSummary {
-	var summary usageSummary
-	firstByteSamples := make([]int64, 0, len(records))
-	durationSamples := make([]int64, 0, len(records))
-	latencySamples := make([]int64, 0, len(records))
-	for _, record := range records {
-		addRecordToSummary(&summary, record)
-		if record.FirstByteMs > 0 {
-			firstByteSamples = append(firstByteSamples, record.FirstByteMs)
-		}
-		if record.DurationMs > 0 {
-			durationSamples = append(durationSamples, record.DurationMs)
-		}
-		if record.FirstByteMs > 0 && record.DurationMs > 0 {
-			latencySamples = append(latencySamples, record.FirstByteMs+record.DurationMs)
-		}
-	}
-	finalizeUsageSummary(&summary, firstByteSamples, durationSamples, latencySamples)
-	return summary
-}
-
-func finalizeUsageSummary(summary *usageSummary, firstByteSamples []int64, durationSamples []int64, latencySamples []int64) {
-	if summary.Requests > 0 {
-		summary.SuccessRate = float64(summary.Success) / float64(summary.Requests)
-		summary.FailedRate = float64(summary.Failed) / float64(summary.Requests)
-		summary.AvgInputTokens = float64(summary.InputTokens) / float64(summary.Requests)
-		summary.AvgOutputTokens = float64(summary.OutputTokens) / float64(summary.Requests)
-		summary.AvgTotalTokens = float64(summary.TotalTokens) / float64(summary.Requests)
-	}
-	if summary.InputTokens > 0 {
-		summary.CacheHitRate = float64(summary.CacheHitTokens) / float64(summary.InputTokens)
-	}
-	if len(firstByteSamples) > 0 {
-		summary.AvgFirstByteMs = avgInt64(firstByteSamples)
-		summary.P95FirstByteMs = percentileInt64(firstByteSamples, 0.95)
-	}
-	if len(durationSamples) > 0 {
-		summary.AvgDurationMs = avgInt64(durationSamples)
-		summary.P95DurationMs = percentileInt64(durationSamples, 0.95)
-	}
-	if len(latencySamples) > 0 {
-		summary.AvgLatencyMs = avgInt64(latencySamples)
-	}
-}
-
 func avgInt64(values []int64) float64 {
 	var total int64
 	for _, value := range values {
@@ -1024,130 +734,6 @@ func percentileInt64(values []int64, percentile float64) int64 {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	idx := int(float64(len(sorted)-1) * percentile)
 	return sorted[idx]
-}
-
-func addRecordToSummary(summary *usageSummary, record usageRecord) {
-	summary.Requests++
-	if record.StatusCode >= 200 && record.StatusCode < 400 {
-		summary.Success++
-	} else {
-		summary.Failed++
-	}
-	if record.Stream {
-		summary.StreamRequests++
-	}
-	if record.Usage.Estimated {
-		summary.EstimatedRequests++
-	}
-	summary.InputTokens += getInt(record.Usage.InputTokens)
-	summary.OutputTokens += getInt(record.Usage.OutputTokens)
-	summary.TotalTokens += getInt(record.Usage.TotalTokens)
-	summary.CacheHitTokens += getInt(record.Usage.CacheHitTokens)
-	summary.EstimatedTokens += record.Usage.EstimatedTokens
-	summary.ReasoningTokens += getInt(record.UsageDetail.ReasoningTokens)
-	summary.WebSearchCalls += record.BuiltinToolUsage.WebSearchCalls
-	summary.FileSearchCalls += record.BuiltinToolUsage.FileSearchCalls
-	summary.ImageGenerationCalls += record.BuiltinToolUsage.ImageGenerationCalls
-	switch record.SourceFormat {
-	case string(relay.FormatOpenAIChat), string(relay.FormatOpenAI):
-		summary.OpenAIChatRequests++
-	case string(relay.FormatClaude):
-		summary.ClaudeRequests++
-	case string(relay.FormatGemini):
-		summary.GeminiRequests++
-	case string(relay.FormatResponses):
-		summary.ResponsesRequests++
-	}
-	switch record.ResponsesMode {
-	case "native_responses":
-		summary.NativeResponsesRequests++
-	case "transformed_responses":
-		summary.TransformedResponsesRequests++
-	}
-	if summary.FirstUsedAt.IsZero() || record.StartedAt.Before(summary.FirstUsedAt) {
-		summary.FirstUsedAt = record.StartedAt
-		summary.FirstModelName = record.ModelName
-	}
-	if record.StartedAt.After(summary.LastUsedAt) {
-		summary.LastUsedAt = record.StartedAt
-		summary.LastModelName = record.ModelName
-	}
-}
-
-func aggregateUsage(records []usageRecord, dimension string, window string) []usageAggregate {
-	groups := map[string]*usageAggregate{}
-	firstByteSamples := map[string][]int64{}
-	durationSamples := map[string][]int64{}
-	latencySamples := map[string][]int64{}
-	for _, record := range records {
-		key := aggregateKey(record, dimension, window)
-		if key == "" {
-			continue
-		}
-		item := groups[key]
-		if item == nil {
-			item = &usageAggregate{Key: key}
-			fillAggregateLabels(item, record, dimension, key)
-			groups[key] = item
-		}
-		addRecordToSummary(&item.UsageSummary, record)
-		if record.FirstByteMs > 0 {
-			firstByteSamples[key] = append(firstByteSamples[key], record.FirstByteMs)
-		}
-		if record.DurationMs > 0 {
-			durationSamples[key] = append(durationSamples[key], record.DurationMs)
-		}
-		if record.FirstByteMs > 0 && record.DurationMs > 0 {
-			latencySamples[key] = append(latencySamples[key], record.FirstByteMs+record.DurationMs)
-		}
-	}
-
-	items := make([]usageAggregate, 0, len(groups))
-	for key, item := range groups {
-		finalizeUsageSummary(&item.UsageSummary, firstByteSamples[key], durationSamples[key], latencySamples[key])
-		items = append(items, *item)
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Key < items[j].Key })
-	return items
-}
-
-func aggregateUsageSeries(records []usageRecord, window string, from, to time.Time) []usageAggregate {
-	aggregates := aggregateUsage(records, "window", window)
-	byWindow := make(map[string]usageAggregate, len(aggregates))
-	for _, item := range aggregates {
-		byWindow[item.Key] = item
-	}
-
-	location := time.Local
-	if len(records) > 0 {
-		location = records[0].StartedAt.Location()
-	}
-	startFrom := from
-	if startFrom.IsZero() {
-		if len(records) > 0 {
-			earliest := records[0].StartedAt
-			for _, r := range records {
-				if r.StartedAt.Before(earliest) {
-					earliest = r.StartedAt
-				}
-			}
-			startFrom = earliest
-		} else {
-			startFrom = to
-		}
-	}
-	start := truncateUsageWindow(startFrom.In(location), window)
-	end := truncateUsageWindow(to.In(location), window)
-	series := make([]usageAggregate, 0)
-	for current := start; !current.After(end); current = nextUsageWindow(current, window) {
-		key := current.Format(time.RFC3339)
-		if item, ok := byWindow[key]; ok {
-			series = append(series, item)
-			continue
-		}
-		series = append(series, usageAggregate{Key: key, Window: key})
-	}
-	return series
 }
 
 func nextUsageWindow(t time.Time, window string) time.Time {
@@ -1189,22 +775,6 @@ func aggregateKey(record usageRecord, dimension string, window string) string {
 		return truncateUsageWindow(record.StartedAt, window).Format(time.RFC3339)
 	default:
 		return ""
-	}
-}
-
-func fillAggregateLabels(item *usageAggregate, record usageRecord, dimension string, key string) {
-	switch dimension {
-	case "key":
-		item.KeyName = record.KeyName
-		item.KeyHash = record.KeyHash
-	case "modelGroup":
-		item.GroupName = record.GroupName
-	case "model":
-		item.GroupName = record.GroupName
-		item.ModelName = record.ModelName
-		item.Platform = record.Platform
-	case "window":
-		item.Window = key
 	}
 }
 
@@ -1355,16 +925,6 @@ func (b *upstreamUsageObservingBody) observeLine(line string) {
 	}
 	result := extractProviderUsageFromStreamEvent(b.platform, b.format, payload)
 	applyProviderUsageToRecord(b.record, result)
-}
-
-func parsePlatformStreamUsage(platform relay.Platform, payload string) (usageTokenUsage, bool) {
-	result := extractProviderUsageFromStreamEvent(platform, "", payload)
-	return result.Usage, usageHasAnyTokens(result.Usage)
-}
-
-func parseStreamUsage(payload string) (usageTokenUsage, bool) {
-	result := extractProviderUsageFromStreamEvent("", relay.FormatResponses, payload)
-	return result.Usage, usageHasAnyTokens(result.Usage)
 }
 
 func usageFromOpenAIUsage(raw map[string]interface{}) usageTokenUsage {
@@ -1529,7 +1089,7 @@ func estimateTextTokens(text string, cfg config.UsageConfig) int {
 	return (chars + charsPerToken - 1) / charsPerToken
 }
 
-func extractOutputTextFromCanonicalResponse(resp *relay.CanonicalResponse) string {
+func extractOutputTextFromMaheshvaraResponse(resp *relay.MaheshvaraResponse) string {
 	if resp == nil {
 		return ""
 	}
@@ -1685,6 +1245,7 @@ func setRecordModel(record *usageRecord, model config.ModelRef, platform relay.P
 	}
 	record.ModelID = model.ID
 	record.ModelName = model.Name
+	record.SourceID = model.SourceID
 	record.Platform = model.Platform
 	record.TargetPlatform = string(platform)
 }

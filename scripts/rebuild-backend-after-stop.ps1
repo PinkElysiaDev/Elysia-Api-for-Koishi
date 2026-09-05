@@ -22,7 +22,7 @@ function Build-Backend([string]$Goos, [string]$Goarch, [string]$OutputName) {
   $env:GOARCH = $Goarch
   $outputPath = Join-Path $stagingDir $OutputName
   Write-Step "Building $OutputName ($Goos/$Goarch)"
-  go build -o $outputPath .
+  go build -ldflags '-s -w' -o $outputPath .
 }
 
 if (!(Test-Path $backendDir)) {

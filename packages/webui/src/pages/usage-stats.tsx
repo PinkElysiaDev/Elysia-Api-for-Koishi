@@ -1,75 +1,131 @@
 import { useMemo, useRef, useState } from 'react'
-import { Cell, Pie, PieChart, ResponsiveContainer } from 'recharts'
-import { BarChart3, CheckCircle2, Cpu, Gauge, Timer } from 'lucide-react'
-import { PageHeader } from '@/components/page-header'
-import { StatCard } from '@/components/stat-card'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Label } from '@/components/ui/label'
-import { Skeleton } from '@/components/ui/skeleton'
-import { ErrorState } from '@/components/ui/states'
-import { MultiSelect } from '@/components/ui/multi-select'
-import { RangeSelect, type RangeKey } from '@/components/range-select'
-import { useUsageStats, useGroups, useModels, useTokens, useMinuteTick } from '@/lib/hooks'
 import {
+  Area,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  ComposedChart,
+  Line,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts'
+import {
+  Activity,
+  BarChart3,
+  CheckCircle2,
+  Clock,
+  Coins,
+  Cpu,
+  Flame,
+  PieChart as PieIcon,
+  RefreshCw,
+} from 'lucide-react'
+import { PageHeader } from '@/components/page-header'
+import { KpiCard, KpiGrid } from '@/components/kpi-card'
+import { RoleWatermark } from '@/components/role-watermark'
+import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { ErrorState } from '@/components/ui/states'
+import { Fchip } from '@/components/ui/fchip'
+import { UsageFilterBar, type RangeKey } from '@/components/usage-filter-bar'
+import { ModelBreakdownTooltip } from '@/components/model-breakdown-tooltip'
+import {
+  useUsageStats,
+  useUsageTrend,
+  useUsageByModel,
+  useUsageFilterOptions,
+  useMinuteTick,
+  useSources,
+} from '@/lib/hooks'
+import {
+  bucketedTimeISO,
+  CHART_TICK,
   compactNumber,
   formatDuration,
+  formatHitRate,
   formatNumber,
-  normalizedNow,
   percent,
-  ratePerMinute,
   startOfRange,
-  uniqueSorted,
 } from '@/lib/utils'
 
 export function UsageStatsPage() {
   const [range, setRange] = useState<RangeKey>('7d')
   const [groupNames, setGroupNames] = useState<string[]>([])
   const [modelNames, setModelNames] = useState<string[]>([])
+  const [sourceIds, setSourceIds] = useState<string[]>([])
   const [keyNames, setKeyNames] = useState<string[]>([])
+  const [showReqLine, setShowReqLine] = useState(true)
+  const [showTokBar, setShowTokBar] = useState(true)
   const minuteTick = useMinuteTick()
 
-  const { data: groups } = useGroups()
-  const { data: models } = useModels()
-  const { data: tokens } = useTokens()
+  const { groupOptions, modelOptions, keyOptions } = useUsageFilterOptions()
+  const { data: sources } = useSources()
 
-  const groupOptions = useMemo(() => uniqueSorted((groups ?? []).map((g) => g.name)), [groups])
-  const modelOptions = useMemo(() => uniqueSorted((models ?? []).map((m) => m.name)), [models])
-  const keyOptions = useMemo(() => uniqueSorted((tokens ?? []).map((t) => t.name)), [tokens])
+  const sourceOptions = useMemo(
+    () => (sources ?? []).filter((s) => s.enabled).map((s) => ({ value: s.id, label: s.name || s.id })),
+    [sources],
+  )
 
   const params = useMemo(() => {
-    const to = normalizedNow()
+    // to 取下一 5 分钟边界：缓存键稳定，且当前桶内新记录能进半开区间。
+    // 日历日 / 相对窗起点用 now，避免临近午夜时 from 被推到次日。
+    const nowMs = minuteTick * 60_000
+    const to = bucketedTimeISO(nowMs, 5 * 60_000)
     return {
-      from: startOfRange(range, to),
+      from: startOfRange(range, new Date(nowMs).toISOString()),
       to,
       groupNames: groupNames.length ? groupNames : undefined,
       modelNames: modelNames.length ? modelNames : undefined,
+      sourceIds: sourceIds.length ? sourceIds : undefined,
       keyNames: keyNames.length ? keyNames : undefined,
     }
-    // minuteTick 让 to 随时间推进，避免查询窗口冻结在挂载时刻。
- // eslint-disable-next-line react-hooks/exhaustive-deps -- minuteTick 驱动查询窗口随时间推进，不在回调体内使用是有意的
-  }, [range, groupNames, modelNames, keyNames, minuteTick])
+  }, [range, groupNames, modelNames, sourceIds, keyNames, minuteTick])
 
-  const { data: stats, isLoading, error, mutate } = useUsageStats(params)
+  const { data: stats, isLoading, error, mutate, isValidating } = useUsageStats(params)
 
-  const successRate = percent(stats?.success ?? 0, stats?.requests ?? 0)
-  // 范围跨度优先用实际首末调用时间（更贴近真实速率），缺失时回退到查询窗口。
-  const spanFrom = stats?.firstUsedAt || params.from
-  const spanTo = stats?.lastUsedAt || params.to
-  const rpm = stats ? ratePerMinute(stats.requests, spanFrom, spanTo) : null
-  const tpm = stats ? ratePerMinute(stats.totalTokens, spanFrom, spanTo) : null
+  // 趋势图聚合（支持模型级细分 hover）
+  const trendParams = useMemo(() => {
+    const now = new Date(minuteTick * 60_000)
+    const offsetMinutes = -now.getTimezoneOffset()
+    return {
+      ...params,
+      utcOffsetMinutes: offsetMinutes,
+    }
+  }, [params, minuteTick])
+  const {
+    data: trendBuckets,
+    isLoading: trendLoading,
+    error: trendError,
+    mutate: retryTrend,
+  } = useUsageTrend(trendParams)
+
+  // 按模型聚合（后端 SQL 分组，与 stats 同窗口同筛选）
+  const {
+    data: byModelRows,
+    isLoading: byModelLoading,
+    error: byModelError,
+    mutate: retryByModel,
+    isValidating: byModelValidating,
+  } = useUsageByModel(params)
+  const byModel = byModelRows ?? []
+  const updating = (isLoading && !!stats) || isValidating || byModelValidating
 
   const pieData = useMemo(
     () => [
-      { name: '成功', value: stats?.success ?? 0, color: 'hsl(var(--success))' },
-      { name: '失败', value: stats?.failed ?? 0, color: 'hsl(var(--destructive))' },
+      { name: '成功', value: stats?.success ?? 0, color: 'var(--jade)' },
+      { name: '失败', value: stats?.failed ?? 0, color: 'var(--ember)' },
     ],
     [stats],
   )
 
   const tokenData = useMemo(
     () => [
-      { name: '输入', value: stats?.inputTokens ?? 0, color: 'hsl(var(--primary))' },
-      { name: '输出', value: stats?.outputTokens ?? 0, color: 'hsl(160 84% 45%)' },
+      { name: '输入', value: stats?.inputTokens ?? 0, color: 'var(--rose)' },
+      { name: '输出', value: stats?.outputTokens ?? 0, color: 'var(--jade)' },
     ],
     [stats],
   )
@@ -79,107 +135,329 @@ export function UsageStatsPage() {
     const hit = stats?.cacheHitTokens ?? 0
     const miss = Math.max(0, input - hit)
     return [
-      { name: '缓存未命中', value: miss, color: 'hsl(var(--primary))' },
-      { name: '缓存命中', value: hit, color: 'hsl(330 86% 78%)' },
-      { name: '输出', value: stats?.outputTokens ?? 0, color: 'hsl(160 84% 45%)' },
+      { name: '缓存未命中', value: miss, color: 'var(--rose)' },
+      { name: '缓存命中', value: hit, color: 'var(--rose-soft)' },
+      { name: '输出', value: stats?.outputTokens ?? 0, color: 'var(--jade)' },
     ]
   }, [stats])
 
   return (
-    <div className="space-y-6">
-      <PageHeader title="Usage 统计" description="按时间范围与过滤条件汇总的请求与 token 用量" />
+    <>
+      <RoleWatermark className="-right-8 top-0 opacity-[0.05] dark:opacity-[0.08]" />
 
-      {/* 过滤条件 */}
-      <Card className="p-4">
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="space-y-1.5">
-            <Label className="text-xs">时间范围</Label>
-            <RangeSelect value={range} onChange={setRange} />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">模型组</Label>
-            <MultiSelect options={groupOptions} value={groupNames} onChange={setGroupNames} placeholder="全部模型组" searchPlaceholder="搜索模型组" />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">模型</Label>
-            <MultiSelect options={modelOptions} value={modelNames} onChange={setModelNames} placeholder="全部模型" searchPlaceholder="搜索模型" />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">调用方 API Key</Label>
-            <MultiSelect options={keyOptions} value={keyNames} onChange={setKeyNames} placeholder="全部调用方" searchPlaceholder="搜索调用方" />
-          </div>
-        </div>
-      </Card>
+      <div className="relative z-[1] space-y-6">
+        <PageHeader title="Usage 统计" />
 
-      {error ? (
-        <Card>
+        {/* 共用筛选条（含模型源维度）+ 更新指示 */}
+        <UsageFilterBar
+          range={range}
+          onRangeChange={setRange}
+          groupOptions={groupOptions}
+          modelOptions={modelOptions}
+          keyOptions={keyOptions}
+          sourceOptions={sourceOptions}
+          groupNames={groupNames}
+          onGroupNamesChange={setGroupNames}
+          modelNames={modelNames}
+          onModelNamesChange={setModelNames}
+          sourceIds={sourceIds}
+          onSourceIdsChange={setSourceIds}
+          keyNames={keyNames}
+          onKeyNamesChange={setKeyNames}
+          right={
+            updating ? (
+              <span className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+                <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary" /> 聚合计算中…
+              </span>
+            ) : undefined
+          }
+        />
+
+        {error ? (
           <ErrorState message={(error as Error).message} onRetry={() => mutate()} />
-        </Card>
-      ) : (
-        <>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard
-              accent
-              label="成功率"
-              value={isLoading ? <Skeleton className="h-7 w-20" /> : successRate}
-              hint={
-                stats
-                  ? `成功 ${formatNumber(stats.success)} · 失败 ${formatNumber(stats.failed)} · 共 ${formatNumber(stats.requests)}`
-                  : undefined
-              }
-              icon={<CheckCircle2 className="h-5 w-5" />}
-            />
-            <StatCard
-              label="Token 总量"
-              value={isLoading ? <Skeleton className="h-7 w-24" /> : formatNumber(stats?.totalTokens)}
-              hint={stats ? `缓存命中率 ${percent(stats.cacheHitTokens, stats.inputTokens)}` : undefined}
-              icon={<Cpu className="h-5 w-5" />}
-            />
-            <StatCard
-              label="平均耗时"
-              value={isLoading ? <Skeleton className="h-7 w-20" /> : formatDuration(stats?.avgDurationMs)}
-              hint={stats ? `平均首字 ${formatDuration(stats.avgFirstByteMs)}` : undefined}
-              icon={<Timer className="h-5 w-5" />}
-            />
-            <StatCard
-              label="平均吞吐"
-              value={isLoading ? <Skeleton className="h-7 w-20" /> : tpm == null ? '—' : `${compactNumber(tpm)} tpm`}
-              hint={rpm == null ? undefined : `${rpm.toFixed(rpm < 10 ? 2 : rpm < 100 ? 1 : 0)} rpm`}
-              icon={<Gauge className="h-5 w-5" />}
-            />
-          </div>
+        ) : (
+          <>
+            {/* 核心 KPI 锚点 */}
+            <section aria-label="核心指标">
+              <KpiGrid cols={6}>
+                <KpiCard
+                  variant="hero"
+                  label="总请求数"
+                  value={stats ? formatNumber(stats.requests) : '—'}
+                  icon={<Flame className="h-4 w-4 text-rose" />}
+                />
+                <KpiCard
+                  label="成功请求"
+                  value={stats ? formatNumber(stats.success) : '—'}
+                  deltaTone="up"
+                  icon={<CheckCircle2 className="h-4 w-4 text-jade" />}
+                  delta={stats ? `占比 ${percent(stats.success, stats.requests)}` : undefined}
+                />
+                <KpiCard
+                  label="失败请求"
+                  value={stats ? formatNumber(stats.failed) : '—'}
+                  deltaTone={stats?.failed ? 'down' : 'neutral'}
+                  delta={stats ? (stats.failed ? `占比 ${percent(stats.failed, stats.requests)}` : '0 次失败') : undefined}
+                />
+                <KpiCard
+                  label="Token 总消耗"
+                  value={stats ? compactNumber(stats.totalTokens) : '—'}
+                  icon={<Coins className="h-4 w-4 text-amber" />}
+                />
+                <KpiCard
+                  label="Prompt 缓存命中"
+                  value={stats ? compactNumber(stats.cacheHitTokens) : '—'}
+                  delta={stats ? `命中率 ${formatHitRate(stats.cacheHitRate)}` : undefined}
+                />
+                <KpiCard
+                  label="平均请求耗时"
+                  value={stats ? formatDuration(stats.avgDurationMs) : '—'}
+                  icon={<Clock className="h-4 w-4 text-muted-foreground" />}
+                  delta={stats ? `首字耗时 ${formatDuration(stats.avgFirstByteMs)}` : undefined}
+                />
+              </KpiGrid>
+            </section>
 
-          <div className="grid gap-4 lg:grid-cols-2">
-            <ChartCard title="请求成功 / 失败">
-              <DonutChart data={pieData} total={stats?.requests ?? 0} centerLabel="请求" />
-            </ChartCard>
-            <ChartCard title="累计 token 分布">
-              <DonutChart data={tokenData} hoverData={tokenHoverData} total={stats?.totalTokens ?? 0} centerLabel="Token" />
-            </ChartCard>
-          </div>
-        </>
-      )}
-    </div>
+            {/* 双流时序趋势图表 */}
+            <section className="space-y-4 pt-2">
+              <div className="flex flex-row flex-wrap items-center justify-between gap-4 border-b border-border/50 pb-3.5">
+                <div className="flex items-center gap-2">
+                  <Activity className="h-4 w-4 text-primary" />
+                  <h3 className="text-sm font-semibold text-foreground">时间序列双流趋势</h3>
+                </div>
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <Fchip label="请求折线" color="var(--rose)" active={showReqLine} onClick={() => setShowReqLine(!showReqLine)} />
+                  <Fchip label="Token 柱图" color="var(--jade)" active={showTokBar} onClick={() => setShowTokBar(!showTokBar)} />
+                </div>
+              </div>
+              <div className="pt-2">
+                <div className="h-[280px] w-full">
+                  {trendError ? (
+                    <ErrorState className="h-full py-8" message={(trendError as Error).message} onRetry={() => retryTrend()} />
+                  ) : trendLoading && !trendBuckets ? (
+                    <div className="skeleton h-full w-full rounded-md" />
+                  ) : (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ComposedChart data={trendBuckets ?? []} margin={{ top: 12, right: 36, bottom: 0, left: 0 }}>
+                        <defs>
+                          <linearGradient id="usageReqAreaGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="var(--rose)" stopOpacity={0.16} />
+                            <stop offset="95%" stopColor="var(--rose)" stopOpacity={0.0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid stroke="hsl(var(--border) / 0.45)" strokeDasharray="3 3" vertical={false} />
+                        <XAxis
+                          dataKey="date"
+                          tick={CHART_TICK}
+                          tickLine={false}
+                          axisLine={{ stroke: 'hsl(var(--border) / 0.6)' }}
+                          interval="preserveStartEnd"
+                          minTickGap={24}
+                          tickFormatter={(v: string) => v.slice(5).replace('-', '/')}
+                        />
+                        {/* 双流纵轴按各自流色着色（左 Token=jade / 右 请求=rose），便于区分 */}
+                        <YAxis
+                          yAxisId="tok"
+                          tick={{ ...CHART_TICK, fill: 'var(--jade)' }}
+                          tickLine={false}
+                          axisLine={false}
+                          width={52}
+                          tickFormatter={(v: number) => compactNumber(v)}
+                        />
+                        <YAxis
+                          yAxisId="req"
+                          orientation="right"
+                          tick={{ ...CHART_TICK, fill: 'var(--rose)' }}
+                          tickLine={false}
+                          axisLine={false}
+                          width={40}
+                          allowDecimals={false}
+                        />
+                        <Tooltip
+                          content={<ModelBreakdownTooltip />}
+                          cursor={{ fill: 'var(--wash)' }}
+                        />
+                        {showTokBar && (
+                          <Bar
+                            yAxisId="tok"
+                            dataKey="tokens"
+                            name="Token 消耗"
+                            fill="var(--jade)"
+                            fillOpacity={0.45}
+                            radius={[4, 4, 0, 0]}
+                            maxBarSize={24}
+                          />
+                        )}
+                        {showReqLine && (
+                          <>
+                            <Area
+                              yAxisId="req"
+                              dataKey="requests"
+                              type="monotone"
+                              fill="url(#usageReqAreaGrad)"
+                              stroke="none"
+                              tooltipType="none"
+                            />
+                            <Line
+                              yAxisId="req"
+                              dataKey="requests"
+                              name="请求数"
+                              type="monotone"
+                              stroke="var(--rose)"
+                              strokeWidth={2.2}
+                              dot={false}
+                              activeDot={{ r: 4.5, fill: 'var(--rose)', stroke: 'hsl(var(--card))', strokeWidth: 2 }}
+                            />
+                          </>
+                        )}
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  )}
+                </div>
+              </div>
+            </section>
+
+            {/* 分布环图面板 */}
+            <div className="grid grid-cols-1 gap-8 lg:grid-cols-2 pt-2">
+              <div className="space-y-4">
+                <div className="border-b border-border/50 pb-3 flex items-center gap-2">
+                  <PieIcon className="h-4 w-4 text-jade" />
+                  <h3 className="text-sm font-semibold text-foreground">请求成功 / 失败分布</h3>
+                </div>
+                <div className="pt-2">
+                  {isLoading && !stats ? (
+                    <div className="skeleton h-64 rounded-md" />
+                  ) : (
+                    <DonutChart data={pieData} total={stats?.requests ?? 0} centerLabel="请求" />
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="border-b border-border/50 pb-3 flex items-center gap-2">
+                  <Coins className="h-4 w-4 text-rose" />
+                  <h3 className="text-sm font-semibold text-foreground">累计 Token 结构分布</h3>
+                </div>
+                <div className="pt-2">
+                  {isLoading && !stats ? (
+                    <div className="skeleton h-64 rounded-md" />
+                  ) : (
+                    <DonutChart data={tokenData} hoverData={tokenHoverData} total={stats?.totalTokens ?? 0} centerLabel="Token" />
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* 按模型聚合面板 */}
+            <section className="space-y-4 pt-2">
+              {byModelError ? (
+                <ErrorState className="py-8" message={(byModelError as Error).message} onRetry={() => retryByModel()} />
+              ) : byModelLoading && !byModelRows ? (
+                <div className="p-5">
+                  <div className="skeleton h-[240px] rounded-md" />
+                </div>
+              ) : (
+                <>
+                  <div className="flex flex-row items-center justify-between border-b border-border/50 pb-3">
+                    <div className="flex items-center gap-2">
+                      <Cpu className="h-4 w-4 text-primary" />
+                      <h3 className="text-sm font-semibold text-foreground">Top 模型调用热度与消耗明细</h3>
+                    </div>
+                    {byModel.length > 0 && (
+                      <span className="text-xs text-muted-foreground font-mono">共聚合 {byModel.length} 个模型</span>
+                    )}
+                  </div>
+                  <div className="pt-2">
+                    {byModel.length === 0 ? (
+                      <p className="py-8 text-center text-sm text-muted-foreground">当前筛选范围内暂无模型调用记录</p>
+                    ) : (
+                      <>
+                        <div className="h-[220px]">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={byModel.slice(0, 8)} margin={{ top: 8, right: 8, bottom: 0, left: 4 }}>
+                              <CartesianGrid stroke="hsl(var(--border) / 0.45)" strokeDasharray="3 3" vertical={false} />
+                              <XAxis
+                                dataKey="model"
+                                tick={CHART_TICK}
+                                tickLine={false}
+                                axisLine={{ stroke: 'hsl(var(--border) / 0.6)' }}
+                                interval={0}
+                                tickFormatter={(v: string) => {
+                                  const label = v || '—'
+                                  return label.length > 14 ? label.slice(0, 13) + '…' : label
+                                }}
+                              />
+                              <YAxis
+                                tick={CHART_TICK}
+                                tickLine={false}
+                                axisLine={false}
+                                width={40}
+                                allowDecimals={false}
+                              />
+                              <Tooltip cursor={{ fill: 'var(--wash)' }} content={<ModelBarTooltip />} />
+                              <Bar dataKey="requests" name="请求数" radius={[4, 4, 0, 0]} maxBarSize={36}>
+                                {byModel.slice(0, 8).map((entry) => (
+                                  <Cell key={entry.model || '__unknown__'} fill="var(--rose)" fillOpacity={0.65} />
+                                ))}
+                              </Bar>
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+
+                        <div className="mt-6 overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <TableHeader className="bg-secondary/20">
+                              <TableRow className="border-b border-border/60 hover:bg-transparent">
+                                <TableHead className="py-3 pl-4 font-semibold text-2xs uppercase tracking-wider text-muted-foreground">模型标识</TableHead>
+                                <TableHead className="py-3 num font-semibold text-2xs uppercase tracking-wider text-muted-foreground">请求次数</TableHead>
+                                <TableHead className="py-3 num font-semibold text-2xs uppercase tracking-wider text-muted-foreground">失败次数</TableHead>
+                                <TableHead className="py-3 num font-semibold text-2xs uppercase tracking-wider text-muted-foreground">总 Tokens</TableHead>
+                                <TableHead className="py-3 pr-4 num font-semibold text-2xs uppercase tracking-wider text-muted-foreground">用量占比</TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody className="divide-y divide-border/30">
+                              {byModel.map((row) => (
+                                <TableRow key={row.model || '__unknown__'} className="transition-colors hover:bg-secondary/30">
+                                  <TableCell className="py-2.5 pl-4 max-w-[280px] truncate font-mono text-xs text-foreground font-medium" title={row.model || '未知模型'}>
+                                    {row.model || '—'}
+                                  </TableCell>
+                                  <TableCell className="py-2.5 num font-medium text-foreground">{formatNumber(row.requests)}</TableCell>
+                                  <TableCell className="py-2.5 num">
+                                    <span className={row.failed > 0 ? 'text-ember font-semibold' : 'text-muted-foreground'}>{row.failed}</span>
+                                  </TableCell>
+                                  <TableCell className="py-2.5 num font-mono text-xs">{formatNumber(row.tokens)}</TableCell>
+                                  <TableCell className="py-2.5 pr-4 num font-mono text-xs text-muted-foreground">{percent(row.requests, stats?.requests ?? 0)}</TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </table>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </>
+              )}
+            </section>
+          </>
+        )}
+      </div>
+    </>
   )
 }
 
-function ChartCard({
-  title,
-  description,
-  children,
-}: {
-  title: string
-  description?: string
-  children: React.ReactNode
+function ModelBarTooltip({ active, payload, label }: {
+  active?: boolean
+  payload?: { name?: string; value?: number | string }[]
+  label?: string
 }) {
+  if (!active || !payload?.length) return null
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-        {description && <CardDescription>{description}</CardDescription>}
-      </CardHeader>
-      <CardContent>{children}</CardContent>
-    </Card>
+    <div className="rounded-xl border border-border/80 bg-card/95 px-3 py-2 text-xs shadow-md backdrop-blur-sm tnum">
+      <p className="font-mono text-2xs font-semibold text-muted-foreground">{label}</p>
+      <p className="mt-1">
+        {payload[0]?.name}: <b className="font-semibold text-foreground">{formatNumber(Number(payload[0]?.value))}</b>
+      </p>
+    </div>
   )
 }
 
@@ -267,17 +545,17 @@ function DonutChart({
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
           {active ? (
             <>
-              <span className="max-w-[8rem] truncate text-2xl font-semibold tracking-tight" style={{ color: active.color }}>
+              <span className="tnum max-w-[8rem] truncate font-display text-xl font-semibold" style={{ color: active.color }}>
                 {formatNumber(active.value)}
               </span>
-              <span className="text-xs text-muted-foreground">
+              <span className="text-xs text-muted-foreground font-mono">
                 {active.name} · {percent(active.value, total)}
               </span>
             </>
           ) : (
             <>
-              <span className="text-2xl font-semibold tracking-tight">{formatNumber(total)}</span>
-              <span className="text-xs text-muted-foreground">{centerLabel}</span>
+              <span className="tnum font-display text-xl font-semibold">{formatNumber(total)}</span>
+              <span className="text-xs text-muted-foreground font-mono">{centerLabel}</span>
             </>
           )}
         </div>
@@ -287,12 +565,12 @@ function DonutChart({
           {activeData.map((entry, index) => (
             <span
               key={entry.name}
-              className="flex cursor-default items-center gap-1.5 text-xs text-muted-foreground transition-opacity"
+              className="tnum flex cursor-default items-center gap-1.5 text-xs text-muted-foreground transition-opacity font-mono"
               style={{ opacity: activeIndex == null || activeIndex === index ? 1 : 0.45 }}
               onMouseEnter={() => setActiveIndex(index)}
               onMouseLeave={() => setActiveIndex(null)}
             >
-              <span className="h-2.5 w-2.5 rounded-full" style={{ background: entry.color }} />
+              <span className="h-2 w-2 rounded-[2px]" style={{ background: entry.color }} />
               {entry.name} {formatNumber(entry.value)}
             </span>
           ))}

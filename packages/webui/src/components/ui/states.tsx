@@ -72,6 +72,7 @@ export function LoadingState({ rows, columns }: { rows?: number; columns?: numbe
 
 /**
  * 统一的列表三态封装：loading / error / empty / content。
+ * 不包卡片壳——三态都以居中信息直接呈现，与无卡片的内容态表格一致。
  */
 export function AsyncState<T>({
   isLoading,
@@ -101,6 +102,13 @@ export function AsyncState<T>({
   if (isLoading && !data) return <LoadingState rows={loadingRows} columns={loadingColumns} />
   if (error) return <ErrorState message={(error as Error)?.message} onRetry={onRetry} />
   if (!data || data.length === 0)
-    return <EmptyState title={emptyTitle} description={emptyDescription} action={emptyAction} icon={emptyIcon} />
+    return (
+      <EmptyState
+        title={emptyTitle}
+        description={emptyDescription}
+        action={emptyAction}
+        icon={emptyIcon}
+      />
+    )
   return <>{children(data)}</>
 }

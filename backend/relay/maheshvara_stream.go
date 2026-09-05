@@ -8,11 +8,11 @@ func int64Value(value any) int64 {
 	return int64(number)
 }
 
-func canonicalUsageFromRawMap(raw map[string]any) *CanonicalUsage {
+func maheshvaraUsageFromRawMap(raw map[string]any) *MaheshvaraUsage {
 	if len(raw) == 0 {
 		return nil
 	}
-	usage := &CanonicalUsage{
+	usage := &MaheshvaraUsage{
 		InputTokens:       intValue(firstNonValue(raw, "input_tokens", "inputTokens", "prompt_tokens", "promptTokenCount")),
 		OutputTokens:      intValue(firstNonValue(raw, "output_tokens", "outputTokens", "completion_tokens", "candidatesTokenCount")),
 		TotalTokens:       intValue(firstNonValue(raw, "total_tokens", "totalTokens", "totalTokenCount")),
@@ -23,6 +23,9 @@ func canonicalUsageFromRawMap(raw map[string]any) *CanonicalUsage {
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
+	// 原始 usage 对象整体留存：同线渲染时未知计数键原样透传（XF5b：不重释、
+	// 不丢弃），已知键由类型化字段覆盖。
+	usage.Raw = raw
 	return usage
 }
 

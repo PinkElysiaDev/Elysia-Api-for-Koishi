@@ -3,91 +3,161 @@
 @tailwind utilities;
 
 /*
- * 主题色板：
- *  - 日间：粉色 + 白色（柔和奶白底 + 玫粉主色）
- *  - 夜间：粉色 + 黑色（近黑暖底 + 亮粉主色）
- * 数值沿用后端 usage_dashboard 的配色精神，统一转换为 HSL 以便 Tailwind 调用。
+ * 瓷梅刻印 2.0（Porcelain / Plum-ink）设计 token。
+ * 上半部分沿用 shadcn HSL 语义变量，下半部分提供清透品牌效果变量。
+ * 纯净冷瓷基底 + 澄澈中性灰阶 + 瑰梅为钻点缀，彻底去除混浊脏粉杂色。
  */
 :root {
-  --background: 345 100% 98%;
-  --foreground: 340 100% 10%;
+  /* ---- shadcn 语义变量（HSL）· 羊脂冷瓷浅色 ---- */
+  --background: 230 14% 98.5%;          /* #FAFAFC 极净冷瓷白底 */
+  --foreground: 228 24% 12%;            /* #171A23 墨黑（高对比清晰易读） */
 
-  --card: 0 0% 100%;
-  --card-foreground: 340 100% 10%;
+  --card: 0 0% 100%;                    /* #FFFFFF 纯白卡片 */
+  --card-foreground: 228 24% 12%;
 
   --popover: 0 0% 100%;
-  --popover-foreground: 340 100% 10%;
+  --popover-foreground: 228 24% 12%;
 
-  --primary: 333 71% 51%;
+  --primary: 336 80% 48%;               /* #DC185D 鲜活瑰梅红（明亮透澈） */
   --primary-foreground: 0 0% 100%;
 
-  --secondary: 342 100% 96%;
-  --secondary-foreground: 336 45% 33%;
+  --secondary: 230 10% 95%;             /* #F1F2F6 纯净浅灰底 */
+  --secondary-foreground: 228 12% 38%;  /* #595E6B 次级文本 */
 
-  --muted: 342 100% 97%;
-  --muted-foreground: 335 28% 49%;
+  --muted: 230 10% 95%;
+  --muted-foreground: 226 12% 34%;      /* #4C5363 次级文字，大屏必须可读 */
 
-  --accent: 330 100% 94%;
-  --accent-foreground: 336 60% 32%;
+  --accent: 336 85% 96%;                /* #FDF0F4 瑰梅洗色底 */
+  --accent-foreground: 336 80% 38%;
 
-  --destructive: 347 77% 50%;
+  --destructive: 0 84% 56%;             /* #EE2A2A 纯正朱砂红 */
   --destructive-foreground: 0 0% 100%;
 
-  --success: 160 84% 32%;
+  --success: 160 84% 33%;               /* #0DA574 翡翠碧玉绿 */
   --success-foreground: 0 0% 100%;
 
-  --border: 343 100% 91%;
-  --input: 343 100% 91%;
-  --ring: 333 71% 51%;
+  --border: 230 12% 89%;                /* #DEE1E9 清爽微冷刻线 */
+  --input: 230 12% 89%;
+  --ring: 336 80% 48%;
 
-  --sidebar: 0 0% 100%;
-  --sidebar-foreground: 340 100% 10%;
+  --sidebar: 230 14% 97.5%;             /* #F7F8FB 侧栏浅色 */
+  --sidebar-foreground: 228 24% 12%;
 
-  --radius: 0.85rem;
+  --radius: 0.5rem;                     /* 8px 现代微圆角 */
+
+  /* 图表轴刻度：rem 随根字号流式缩放（16px 根时 11px）。字重不能跟着 rem 走——
+   * 等宽数字在深色底上笔画随字号等比变粗，相对观感反而发细，故按视口阶梯补字重
+   * （ui-monospace/SF Mono 是静态字重，只有 500/600/700 档可用）。 */
+  --chart-tick-size: 0.6875rem;
+  --chart-tick-weight: 500;
 
   color-scheme: light;
+
+  /* ---- 品牌效果 token ---- */
+  --rose: hsl(var(--primary));
+  --rose-soft: #F43F85;
+  --orchid: #7C4DBE;
+  --jade: hsl(var(--success));
+  --ember: hsl(var(--destructive));
+  --amber: #D97706;
+
+  --wash: rgba(220, 24, 93, 0.05);
+  --code-bg: #F2F4F8;
+
+  --halo-a: rgba(220, 24, 93, 0.06);    /* 弱化全局光晕扩散，避免全屏泛色 */
+  --btn-inset-hi: rgba(255, 255, 255, 0.22); /* 主按钮顶边高光（暗色下减弱） */
+  --halo-b: rgba(99, 102, 241, 0.04);
+
+  --grad-a: var(--rose);                /* 品牌渐变：瑰梅 → 明艳粉 */
+  --grad-b: #F43F85;
+
+  --scrim: rgba(15, 23, 42, 0.45);
+
+  --shadow-soft: 0 1px 3px rgba(15, 23, 42, 0.03), 0 8px 20px -8px rgba(15, 23, 42, 0.06);
+  --shadow-lg: 0 4px 6px -1px rgba(15, 23, 42, 0.04), 0 20px 32px -12px rgba(15, 23, 42, 0.09);
 }
 
 .dark {
-  --background: 336 45% 5%;
-  --foreground: 327 73% 95%;
+  /* ---- shadcn 语义变量（HSL）· 玄曜夜釉深色 ---- */
+  --background: 240 16% 7%;             /* #0F0F14 极深玄曜 */
+  --foreground: 230 20% 96%;            /* #F3F4F9 冰瓷白 */
 
-  --card: 334 32% 8%;
-  --card-foreground: 327 73% 95%;
+  --card: 240 14% 10%;                  /* #16161D 沉静深空卡片 */
+  --card-foreground: 230 20% 96%;
 
-  --popover: 334 32% 8%;
-  --popover-foreground: 327 73% 95%;
+  --popover: 240 14% 10%;
+  --popover-foreground: 230 20% 96%;
 
-  --primary: 330 86% 70%;
-  --primary-foreground: 336 45% 6%;
+  --primary: 336 90% 64%;               /* #FB4D88 霓虹梅粉 */
+  --primary-foreground: 240 16% 7%;
 
-  --secondary: 332 30% 14%;
-  --secondary-foreground: 327 60% 92%;
+  --secondary: 240 10% 14%;             /* #202028 */
+  --secondary-foreground: 230 12% 72%;  /* #B2B5C4 */
 
-  --muted: 332 28% 13%;
-  --muted-foreground: 326 22% 70%;
+  --muted: 240 10% 13%;
+  --muted-foreground: 230 10% 72%;      /* #B0B4C2 次级文字，暗底必须可读 */
 
-  --accent: 331 35% 18%;
-  --accent-foreground: 327 73% 95%;
+  --accent: 336 40% 15%;
+  --accent-foreground: 336 90% 75%;
 
-  --destructive: 351 95% 82%;
-  --destructive-foreground: 336 45% 8%;
+  --destructive: 0 84% 60%;             /* #F84F4F */
+  --destructive-foreground: 240 16% 7%;
 
-  --success: 158 64% 52%;
-  --success-foreground: 336 45% 6%;
+  --success: 160 70% 45%;               /* #22C58B */
+  --success-foreground: 240 16% 7%;
 
-  --border: 333 30% 22%;
-  --input: 333 30% 22%;
-  --ring: 330 86% 70%;
+  --border: 240 10% 18%;                /* #2B2B36 清晰微冷暗刻线 */
+  --input: 240 10% 18%;
+  --ring: 336 90% 64%;
 
-  --sidebar: 335 36% 7%;
-  --sidebar-foreground: 327 73% 95%;
+  --sidebar: 240 16% 8.5%;              /* #131319 */
+  --sidebar-foreground: 230 20% 96%;
 
   color-scheme: dark;
+
+  /* ---- 品牌 token（暗色）---- */
+  --rose: hsl(var(--primary));
+  --rose-soft: #DB2777;
+  --orchid: #A78BEA;
+  --jade: hsl(var(--success));
+  --ember: hsl(var(--destructive));
+  --amber: #F59E0B;
+
+  --wash: rgba(251, 77, 136, 0.08);
+  --code-bg: #1A1A23;
+
+  --halo-a: rgba(251, 77, 136, 0.08);
+  --btn-inset-hi: rgba(255, 255, 255, 0.08);
+  --halo-b: rgba(129, 140, 248, 0.05);
+
+  --grad-a: var(--rose);                /* 品牌渐变：霓虹梅粉 → 兰花紫 */
+  --grad-b: #C084FC;
+
+  --scrim: rgba(0, 0, 0, 0.72);
+
+  --shadow-soft: 0 1px 3px rgba(0, 0, 0, 0.4), 0 12px 28px -10px rgba(0, 0, 0, 0.6);
+  --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.5), 0 24px 48px -15px rgba(0, 0, 0, 0.7);
 }
 
 * {
   border-color: hsl(var(--border));
+}
+
+html {
+  /* 流式根字号：≤1536px 时 16px，随视口平滑增至 2560px 的 18px——全站 rem（含图表刻度）统一跟随。
+   * 下限用 1rem 而非 16px：尊重浏览器「字号」偏好（Josh Comeau, Pixels and Accessibility）。
+   * 插值配比：16 = 0.8125×16 + 0.1953125%×1536，18 = 0.8125×16 + 0.1953125%×2560。
+   * 幅度刻意保守（+12.5% 封顶）：大屏易读即可，不能让熟客觉得「字变大变松」。 */
+  font-size: clamp(1rem, 0.8125rem + 0.1953125vw, 1.125rem);
+  /* 立绘水印右缘出血会撑出 8px 横向滚动：clip 必须设在根元素上——
+   * Chrome 不把 body 的 overflow 传播到视口。clip 不产生滚动容器，sticky 侧栏不受影响 */
+  overflow-x: clip;
+}
+
+/* 刻度字重大屏阶梯：缩放缓和后 1920px 时刻度仅 ~11.5px，w500 观感足够；
+ * ≥2560 时 ~12.4px 提一档到 Semibold 补偿笔画发细。 */
+@media (min-width: 2560px) {
+  :root { --chart-tick-weight: 600; }
 }
 
 html,
@@ -103,17 +173,26 @@ body {
   font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  /* 立绘水印向内容画布右缘出血，clip 掉横向溢出（不产生滚动条，也不破坏 sticky） */
+  overflow-x: clip;
 }
 
-/* 柔和的粉色光晕背景，营造优雅氛围 */
-.app-aurora {
+/* 页面光晕：左上瑰梅 + 右下靛蓝 + 中右角色光环，极轻量 radial 挂在 fixed 伪元素上，不污染正文 */
+body::before {
+  content: '';
   position: fixed;
   inset: 0;
   z-index: -1;
   pointer-events: none;
   background:
-    radial-gradient(60rem 60rem at 110% -10%, hsl(var(--primary) / 0.12), transparent 60%),
-    radial-gradient(50rem 50rem at -10% 110%, hsl(var(--primary) / 0.08), transparent 55%);
+    radial-gradient(52rem 36rem at 85% 15%, var(--halo-a), transparent 65%),
+    radial-gradient(42rem 28rem at 5% -4%, var(--halo-a), transparent 60%),
+    radial-gradient(40rem 30rem at 98% 106%, var(--halo-b), transparent 60%);
+}
+
+::selection {
+  background: var(--wash);
+  color: var(--rose);
 }
 
 /* 滚动条美化 */
@@ -133,6 +212,15 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: hsl(var(--primary) / 0.45);
   background-clip: padding-box;
+}
+
+/* 隐藏滚动条但保留滚动能力（筛选下拉等窄弹层里，滚动条挤占行宽且显突兀） */
+.hide-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 /* 骨架屏微光 */
@@ -158,4 +246,103 @@ body {
 :focus-visible {
   outline: 2px solid hsl(var(--ring));
   outline-offset: 2px;
+}
+
+/* 源健康轮播：双份内容无缝上滚（hover 暂停由 group-hover 控制；
+   prefers-reduced-motion 下被全局规则停用）。 */
+@keyframes source-marquee {
+  from { transform: translateY(0); }
+  to { transform: translateY(-50%); }
+}
+.animate-source-marquee {
+  animation-name: source-marquee;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@layer utilities {
+  /* mono 数字等宽对齐（表格 / KPI 数字用） */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 表格数字与副行 */
+  .num {
+    font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+    font-size: 0.8125rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .sub {
+    display: block;
+    margin-top: 1px;
+    font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    color: hsl(var(--muted-foreground));
+  }
+
+  /* 状态点（状态视图 / 源健康表）：jade 呼吸光环 / ember / 熄灭 */
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+    display: inline-block;
+  }
+  .dot-ok {
+    background: var(--jade);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--jade) 18%, transparent);
+    animation: breathe 2.6s ease-in-out infinite;
+  }
+  .dot-err {
+    background: var(--ember);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ember) 18%, transparent);
+  }
+  .dot-off {
+    background: hsl(var(--border));
+  }
+
+  /* JSON 高亮（lib/json-highlight.ts 输出）：j-k 键 / j-s 字符串 / j-n 数字 / j-b 布尔 */
+  .j-k {
+    color: hsl(var(--secondary-foreground));
+    font-weight: 500;
+  }
+  .j-s {
+    color: var(--jade);
+  }
+  .j-n {
+    color: var(--amber);
+  }
+  .j-b {
+    color: var(--ember);
+    font-style: italic;
+  }
+
+  /* 立绘水印（总览 .deco .fig）：渐变底；mask 图片路径带 /ui/ base，由组件内联注入 */
+  .role-fig {
+    background: linear-gradient(172deg, var(--grad-a) 8%, var(--grad-b) 92%);
+    -webkit-mask-size: contain;
+    mask-size: contain;
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    -webkit-mask-position: bottom center;
+    mask-position: bottom center;
+  }
+
+  /* 晶辉微光无界分隔线 */
+
+  /* 通透玻璃面板（用于无界画布上的轻盈功能区） */
+
+  /* 浮动晶光卡槽 */
 }

@@ -39,8 +39,10 @@ func OpenWithKey(path string, key []byte) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	store := &Store{db: db, codec: codec}
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &Store{db: db, codec: codec, rollupCtx: ctx, rollupCancel: cancel}
 	if err := store.init(context.Background()); err != nil {
+		cancel()
 		db.Close()
 		return nil, err
 	}
@@ -48,7 +50,14 @@ func OpenWithKey(path string, key []byte) (*Store, error) {
 }
 
 func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
+		return nil
+	}
+	if s.rollupCancel != nil {
+		s.rollupCancel()
+	}
+	s.rollupWG.Wait()
+	if s.db == nil {
 		return nil
 	}
 	return s.db.Close()
@@ -68,6 +77,12 @@ func (s *Store) init(ctx context.Context) error {
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA synchronous=NORMAL",
+		// GROUP BY 的临时 B-tree 进内存而非临时文件；大窗口聚合（日×模型分组）
+		// 依赖临时结构，落盘会让大库统计明显变慢。
+		"PRAGMA temp_store=MEMORY",
+		// 64MiB 页缓存：大索引（idx_usage_agg_cover）扫描时热页驻留内存，
+		// 避免反复从磁盘重读索引页。
+		"PRAGMA cache_size=-65536",
 	}
 	for _, stmt := range pragmas {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -82,14 +97,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS api_tokens (name TEXT PRIMARY KEY, token TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS model_sources (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, auto_fetch_models INTEGER NOT NULL DEFAULT 1, manual_models_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS models (id TEXT NOT NULL, source_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, source_name TEXT NOT NULL DEFAULT '', base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'llm', max_tokens INTEGER NOT NULL DEFAULT 0, vision_capable INTEGER NOT NULL DEFAULT 0, tools_capable INTEGER NOT NULL DEFAULT 0, structured_output INTEGER NOT NULL DEFAULT 0, thinking_mode TEXT NOT NULL DEFAULT 'both', available INTEGER NOT NULL DEFAULT 1, last_checked_at TEXT NOT NULL, PRIMARY KEY (id, source_id))`,
+		`CREATE TABLE IF NOT EXISTS model_sources (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, auto_fetch_models INTEGER NOT NULL DEFAULT 1, manual_models_json TEXT NOT NULL DEFAULT '[]', fetch_base_url TEXT NOT NULL DEFAULT '', api_keys TEXT NOT NULL DEFAULT '', key_strategy TEXT NOT NULL DEFAULT 'single', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS models (id TEXT NOT NULL, source_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, source_name TEXT NOT NULL DEFAULT '', base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'llm', max_tokens INTEGER NOT NULL DEFAULT 0, vision_capable INTEGER NOT NULL DEFAULT 0, tools_capable INTEGER NOT NULL DEFAULT 0, structured_output INTEGER NOT NULL DEFAULT 0, thinking_mode TEXT NOT NULL DEFAULT 'both', available INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1, origin TEXT NOT NULL DEFAULT 'fetched', capability_source TEXT NOT NULL DEFAULT '', last_checked_at TEXT NOT NULL, PRIMARY KEY (id, source_id))`,
 		`CREATE TABLE IF NOT EXISTS model_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, strategy TEXT NOT NULL DEFAULT 'round-robin', max_retries INTEGER NOT NULL DEFAULT 3, retry_interval INTEGER NOT NULL DEFAULT 1000, max_concurrency INTEGER NOT NULL DEFAULT 0, daily_limit_max_requests INTEGER NOT NULL DEFAULT 0, daily_limit_max_tokens INTEGER NOT NULL DEFAULT 0, type TEXT NOT NULL DEFAULT 'llm', max_tokens INTEGER NOT NULL DEFAULT 0, vision_capable INTEGER NOT NULL DEFAULT 0, tools_capable INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS model_group_models (group_id TEXT NOT NULL, model_id TEXT NOT NULL, source_id TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (group_id, model_id, source_id), FOREIGN KEY(group_id) REFERENCES model_groups(id) ON DELETE CASCADE)`,
 		`CREATE TABLE IF NOT EXISTS usage_records (request_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT NOT NULL, key_name TEXT NOT NULL DEFAULT '', key_hash TEXT NOT NULL DEFAULT '', requested_model_group TEXT NOT NULL DEFAULT '', group_id TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', model_name TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL DEFAULT '', source_format TEXT NOT NULL DEFAULT '', target_format TEXT NOT NULL DEFAULT '', relay_mode TEXT NOT NULL DEFAULT '', responses_mode TEXT NOT NULL DEFAULT '', usage_source TEXT NOT NULL DEFAULT '', stream INTEGER NOT NULL DEFAULT 0, status_code INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', first_byte_ms INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, request_truncated INTEGER NOT NULL DEFAULT 0, response_truncated INTEGER NOT NULL DEFAULT 0, record_json TEXT NOT NULL)`,
-		`CREATE INDEX IF NOT EXISTS idx_usage_started_at ON usage_records(started_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_usage_group ON usage_records(group_name)`,
-		`CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_records(model_name)`,
 		`CREATE TABLE IF NOT EXISTS system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL, fields_json TEXT NOT NULL DEFAULT '{}')`,
 		`CREATE INDEX IF NOT EXISTS idx_system_logs_created_at ON system_logs(created_at)`,
 	}
@@ -168,9 +180,86 @@ func (s *Store) migrate(ctx context.Context) error {
 		!strings.Contains(err.Error(), "duplicate column") {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_started_ms ON usage_records(started_ms)`); err != nil {
+	// 聚合覆盖索引：统计 KPI（UsageTotals）、按模型分组（UsageByModel）与按日趋势
+	// （UsageDaily）的全部过滤与聚合列都在索引内——index-only 扫描，不回表读取
+	// 含 record_json（完整请求/响应体，单行可达几十 KB）的胖行。月级数据的聚合
+	// 从 GB 级行读取降为几十 MB 索引扫描。列全为整数/短字符串，空间开销可控；
+	// 幂等建索引，大表首次执行为一次性启动成本。
+	// 增量迁移：usage 记录持久化模型源 ID，来源筛选按 source_id 精确匹配，
+	// 不再把源名展开成模型名（同名跨源会串数据）。存量行默认为空，不会命中源筛选。
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE usage_records ADD COLUMN source_id TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
 		return err
 	}
+	// 大库上首次建索引要扫全表胖行，可达分钟级且期间无任何输出——升级后首启
+	// 会停在本步。先探存在性，确实要建时说一声，避免看起来像"卡住"。
+	var hasAggIndex int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_agg_cover'`).Scan(&hasAggIndex); err != nil {
+		return err
+	}
+	if hasAggIndex == 0 {
+		log.Printf("[migration] building usage aggregate index — one-time on first start after upgrade, duration scales with usage history")
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_agg_cover ON usage_records(started_ms, model_name, group_name, key_name, status_code, stream, input_tokens, output_tokens, total_tokens, cache_hit_tokens, duration_ms, first_byte_ms)`); err != nil {
+		return err
+	}
+	// 旧的时间索引成为覆盖索引前缀的冗余（写入双份维护），删除。
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_usage_started_ms`); err != nil {
+		return err
+	}
+	// 遗留单列索引（started_at / group_name / model_name）是带筛选查询的性能
+	// 陷阱：无 ANALYZE 统计时，规划器会把 model_name IN / group_name = 等筛选
+	// 引到单列索引上，随后 ORDER BY started_ms 走临时 B-tree 排序、聚合逐行
+	// 回表读取 record_json 胖行（大库上带筛选查询几十秒的根因）。覆盖索引的
+	// 列已覆盖全部筛选/聚合/排序形态，删除后每次写入也少维护 3 个索引。
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_usage_started_at`,
+		`DROP INDEX IF EXISTS idx_usage_group`,
+		`DROP INDEX IF EXISTS idx_usage_model`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	// 回填存量 started_ms（详见 backfillStartedMs）。
+	if err := s.backfillStartedMs(ctx); err != nil {
+		return err
+	}
+	// 小时级 rollup 预聚合表（详见 migrateRollupTables）。
+	if err := s.migrateRollupTables(ctx); err != nil {
+		return err
+	}
+	// 增量迁移（幂等，duplicate column 忽略）：
+	//   model_sources.fetch_base_url —— 模型列表拉取专用地址（空=与 base_url 一致）；
+	//   model_sources.api_keys / key_strategy —— 多 Key 配置与调度策略；
+	//   models.enabled —— 用户手动启停（与 available 健康位分离）；
+	//   models.origin —— 行来源（fetched 随刷新合并替换 / manual 刷新永不触碰）；
+	//   models.capability_source —— 能力字段填充来源（''/catalog/manual，
+	//     manual 的用户修改在刷新时保留，catalog 值随刷新更新）。
+	for _, stmt := range []string{
+		`ALTER TABLE model_sources ADD COLUMN fetch_base_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE model_sources ADD COLUMN api_keys TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE model_sources ADD COLUMN key_strategy TEXT NOT NULL DEFAULT 'single'`,
+		`ALTER TABLE models ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE models ADD COLUMN origin TEXT NOT NULL DEFAULT 'fetched'`,
+		`ALTER TABLE models ADD COLUMN capability_source TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	if err := s.migrateMaheshvaraLabels(ctx); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)`, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+// backfillProgressBar 渲染等宽字符进度条。只用 ASCII 的 '#' 与 '.'，
+// 避免宽字符进度条在部分 Windows 控制台代码页下乱码。
+// backfillStartedMs 为存量 usage_records 行回填 started_ms（一次性迁移）。
+func (s *Store) backfillStartedMs(ctx context.Context) error {
 	// 回填存量行的 started_ms。单连接约束：先全部读进内存并关闭游标，再 UPDATE。
 	type usageRow struct{ requestID, startedAt string }
 	var pendingUsage []usageRow
@@ -232,9 +321,10 @@ func (s *Store) migrate(ctx context.Context) error {
 					return rollbackErr
 				}
 			}
-			parsed, perr := time.Parse(time.RFC3339Nano, r.startedAt)
-			if perr != nil {
-				// 无法解析的旧行保持 0；写入侧全部走 RFC3339Nano，实际不应出现。
+			parsed := parseTime(r.startedAt)
+			if parsed.IsZero() {
+				// 无法解析的旧行保持 started_ms=0，与 rollup / 时间窗查询隔离；
+				// 全时段 totals/by-model 另走 raw fallback 计入。
 				log.Printf("[migration] usage_records: unparseable started_at %q for %q (skipped)", r.startedAt, r.requestID)
 			} else if _, err = stmt.ExecContext(ctx, parsed.UnixMilli(), r.requestID); err != nil {
 				_ = tx.Rollback()
@@ -255,12 +345,44 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		log.Printf("[migration] usage_records: started_ms backfill complete in %s", time.Since(backfillStartedAt).Round(time.Millisecond))
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)`, time.Now().UTC().Format(time.RFC3339Nano))
-	return err
+	return nil
 }
 
-// backfillProgressBar 渲染等宽字符进度条。只用 ASCII 的 '#' 与 '.'，
-// 避免宽字符进度条在部分 Windows 控制台代码页下乱码。
+// migrateRollupTables 创建小时级预聚合表并初始化状态（设计见 rollup.go）。
+func (s *Store) migrateRollupTables(ctx context.Context) error {
+	// 小时级 rollup 预聚合表 + 状态表（rollup.go）：仪表盘聚合与原始表大小
+	// 解耦。只新增、不改任何现有表/列——usage_records 数据零风险，两张新表
+	// 均为纯派生数据，可随时删除重建。WITHOUT ROWID 让 PK 即表结构，
+	// hour_ms 范围扫描与 UPSERT 都走主键。
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS usage_rollup_hour (
+		hour_ms INTEGER NOT NULL,
+		model_name TEXT NOT NULL DEFAULT '',
+		group_name TEXT NOT NULL DEFAULT '',
+		key_name TEXT NOT NULL DEFAULT '',
+		status_code INTEGER NOT NULL DEFAULT 0,
+		cnt INTEGER NOT NULL DEFAULT 0,
+		in_tok INTEGER NOT NULL DEFAULT 0,
+		out_tok INTEGER NOT NULL DEFAULT 0,
+		total_tok INTEGER NOT NULL DEFAULT 0,
+		cache_tok INTEGER NOT NULL DEFAULT 0,
+		dur_ms_sum INTEGER NOT NULL DEFAULT 0,
+		fb_ms_sum INTEGER NOT NULL DEFAULT 0,
+		fb_cnt INTEGER NOT NULL DEFAULT 0,
+		min_started_ms INTEGER NOT NULL DEFAULT 0,
+		max_started_ms INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (hour_ms, model_name, group_name, key_name, status_code)
+	) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS usage_rollup_state (key TEXT PRIMARY KEY, int_value INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		return err
+	}
+	if err := s.initRollupState(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
 func backfillProgressBar(done, total int) string {
 	const width = 30
 	if total <= 0 || done < 0 {
@@ -435,7 +557,7 @@ func (s *Store) FindAPIToken(ctx context.Context, token string) (APIToken, bool,
 }
 
 func (s *Store) ListSources(ctx context.Context) ([]ModelSource, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, base_url, api_key, platform, enabled, auto_fetch_models, manual_models_json, created_at, updated_at FROM model_sources ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, base_url, api_key, platform, enabled, auto_fetch_models, manual_models_json, fetch_base_url, api_keys, key_strategy, created_at, updated_at FROM model_sources ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -444,12 +566,14 @@ func (s *Store) ListSources(ctx context.Context) ([]ModelSource, error) {
 	for rows.Next() {
 		var item ModelSource
 		var enabled, autoFetch int
-		var manual, created, updated string
-		if err := rows.Scan(&item.ID, &item.Name, &item.BaseURL, &item.APIKey, &item.Platform, &enabled, &autoFetch, &manual, &created, &updated); err != nil {
+		var manual, fetchBase, storedKeys, strategy, created, updated string
+		if err := rows.Scan(&item.ID, &item.Name, &item.BaseURL, &item.APIKey, &item.Platform, &enabled, &autoFetch, &manual, &fetchBase, &storedKeys, &strategy, &created, &updated); err != nil {
 			return nil, err
 		}
 		item.Enabled = intBool(enabled)
 		item.AutoFetchModels = intBool(autoFetch)
+		item.FetchBaseURL = fetchBase
+		item.KeyStrategy = SourceKeyStrategy(strategy)
 		item.CreatedAt = parseTime(created)
 		item.UpdatedAt = parseTime(updated)
 		if plain, err := s.codec.decrypt(item.APIKey); err == nil {
@@ -458,6 +582,13 @@ func (s *Store) ListSources(ctx context.Context) ([]ModelSource, error) {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(manual), &item.ManualModels)
+		if storedKeys != "" {
+			if plain, err := s.codec.decrypt(storedKeys); err == nil {
+				_ = json.Unmarshal([]byte(plain), &item.APIKeys)
+			} else {
+				return nil, err
+			}
+		}
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -475,9 +606,55 @@ func (s *Store) UpsertSource(ctx context.Context, item ModelSource) error {
 	if err != nil {
 		return err
 	}
+	// api_keys 为 JSON 数组整体加密存储；空列表落空串（单 key 模式）。
+	storedKeys := ""
+	if len(item.APIKeys) > 0 {
+		payload, err := json.Marshal(item.APIKeys)
+		if err != nil {
+			return err
+		}
+		if storedKeys, err = s.codec.encrypt(string(payload)); err != nil {
+			return err
+		}
+	}
+	strategy := string(item.KeyStrategy)
+	if strategy == "" {
+		strategy = string(KeyStrategySingle)
+	}
 	now := nowString()
-	_, err = s.db.ExecContext(ctx, `INSERT INTO model_sources(id, name, base_url, api_key, platform, enabled, auto_fetch_models, manual_models_json, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, base_url=excluded.base_url, api_key=excluded.api_key, platform=excluded.platform, enabled=excluded.enabled, auto_fetch_models=excluded.auto_fetch_models, manual_models_json=excluded.manual_models_json, updated_at=excluded.updated_at`, item.ID, item.Name, item.BaseURL, storedKey, item.Platform, boolInt(item.Enabled), boolInt(item.AutoFetchModels), string(manual), now, now)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO model_sources(id, name, base_url, api_key, platform, enabled, auto_fetch_models, manual_models_json, fetch_base_url, api_keys, key_strategy, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, base_url=excluded.base_url, api_key=excluded.api_key, platform=excluded.platform, enabled=excluded.enabled, auto_fetch_models=excluded.auto_fetch_models, manual_models_json=excluded.manual_models_json, fetch_base_url=excluded.fetch_base_url, api_keys=excluded.api_keys, key_strategy=excluded.key_strategy, updated_at=excluded.updated_at`, item.ID, item.Name, item.BaseURL, storedKey, item.Platform, boolInt(item.Enabled), boolInt(item.AutoFetchModels), string(manual), item.FetchBaseURL, storedKeys, strategy, now, now)
 	return err
+}
+
+// UpdateSourceAPIKeys 定向更新某个源的 key 列表（加密整列重写，不碰其他字段）。
+// 供逐 key 拉取后回写 fetchedModels/allowedModels 使用——避免为了改 key 元数据
+// 而走整源 Upsert 与用户编辑产生竞争。
+func (s *Store) UpdateSourceAPIKeys(ctx context.Context, sourceID string, keys []SourceAPIKey) error {
+	payload, err := json.Marshal(keys)
+	if err != nil {
+		return err
+	}
+	stored, err := s.codec.encrypt(string(payload))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE model_sources SET api_keys = ?, updated_at = ? WHERE id = ?`, stored, nowString(), sourceID)
+	return err
+}
+
+// UpdateSourceEnabled 仅更新源的启停开关（方向：源级轻量 PATCH）。
+// 与整源 Upsert 不同：不触发「保存后自动同步模型」之类的副作用，也不触碰
+// key/模型数据——启停与模型列表无关，重拉上游纯属多余（可能触发限流）。
+func (s *Store) UpdateSourceEnabled(ctx context.Context, id string, enabled bool) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE model_sources SET enabled = ?, updated_at = ? WHERE id = ?`, boolInt(enabled), nowString(), id)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }
 
 func (s *Store) DeleteSource(ctx context.Context, id string) error {
@@ -510,31 +687,40 @@ func (s *Store) ReplaceSourceModels(ctx context.Context, source ModelSource, mod
 	if _, err := tx.ExecContext(ctx, `DELETE FROM models WHERE source_id = ?`, source.ID); err != nil {
 		return err
 	}
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO models(id, source_id, name, source_name, base_url, api_key, platform, type, max_tokens, vision_capable, tools_capable, structured_output, thinking_mode, available, last_checked_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO models(id, source_id, name, source_name, base_url, api_key, platform, type, max_tokens, vision_capable, tools_capable, structured_output, thinking_mode, available, enabled, origin, capability_source, last_checked_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	checked := nowString()
-	storedKey, err := s.codec.encrypt(source.APIKey)
+	// models.api_key 冗余列写入首个有效 key：热路径已改用源级 key 集合（方向6），
+	// 该列仅供健康检测等遗留消费方回退，避免空 key 探测必败。
+	storedKey, err := s.codec.encrypt(firstEffectiveKey(source))
 	if err != nil {
 		return err
 	}
 	for _, model := range models {
-		if model.Type == "" {
-			model.Type = "llm"
+		model = normalizeModelDefaults(model)
+		// platform 优先取模型自带值（legacy 配置导入的模型可逐模型声明平台，
+		// 如 responses/gemini），为空才回落源级平台（自动拉取的模型两者一致）。
+		platform := model.Platform
+		if strings.TrimSpace(platform) == "" {
+			platform = source.Platform
 		}
-		if model.ThinkingMode == "" {
-			model.ThinkingMode = "both"
-		}
-		if model.Name == "" {
-			model.Name = model.ID
-		}
-		if _, err := stmt.ExecContext(ctx, model.ID, source.ID, model.Name, source.Name, source.BaseURL, storedKey, normalizePlatform(source.Platform), model.Type, model.MaxTokens, boolInt(model.VisionCapable), boolInt(model.ToolsCapable), boolInt(model.StructuredOutput), model.ThinkingMode, boolInt(true), checked); err != nil {
+		if _, err := stmt.ExecContext(ctx, model.ID, source.ID, model.Name, source.Name, model.BaseURL, storedKey, normalizePlatform(platform), model.Type, model.MaxTokens, boolInt(model.VisionCapable), boolInt(model.ToolsCapable), boolInt(model.StructuredOutput), model.ThinkingMode, boolInt(true), boolInt(model.Enabled), model.Origin, model.CapabilitySource, checked); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// firstEffectiveKey 返回源的首个有效 key（多 key 时取第一个启用项，单 key 即 APIKey），
+// 供 models.api_key 冗余列的向后兼容写入。
+func firstEffectiveKey(source ModelSource) string {
+	for _, key := range source.EffectiveKeys() {
+		return key.Value
+	}
+	return ""
 }
 
 func normalizePlatform(platform string) string {
@@ -542,4 +728,191 @@ func normalizePlatform(platform string) string {
 		return "openai"
 	}
 	return platform
+}
+
+// ModelMergeResult 汇总一次刷新合并的变更，供前端展示「新增 N / 移除 M」。
+type ModelMergeResult struct {
+	Added   []string `json:"added"`
+	Removed []string `json:"removed"`
+}
+
+// MergeSourceModels 用新拉取（或手动同步）的模型列表合并进该源的模型表，
+// 替代旧的全删全插（ReplaceSourceModels）：
+//   - manual 行（origin='manual'）永不触碰：既不更新也不删除——手动模型与
+//     用户显式保留的模型不随上游变动丢失（借鉴 axonhub manual∪fetched 合并策略）；
+//   - fetched 行更新源身份（base_url/api_key/platform/name）与上游返回的元数据，
+//     但保留用户手动启停（enabled）与健康位（available）；
+//   - 能力字段（vision/tools/structured/thinking/maxTokens/type）：incoming 携带
+//     capability_source='manual'（用户在 UI 编辑过）的行保留现有值，否则用
+//     incoming 值（目录回填或上游解析）覆盖；
+//   - 上游消失的 fetched 行删除并同步清理组内引用；manual 行即使上游消失也保留。
+func (s *Store) MergeSourceModels(ctx context.Context, source ModelSource, incoming []Model) (ModelMergeResult, error) {
+	result := ModelMergeResult{Added: []string{}, Removed: []string{}}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, err
+	}
+	defer tx.Rollback()
+
+	// 读取现有行（单连接库：先全部读进内存再写，避免游标占用连接死锁）。
+	type existingRow struct {
+		id, name, thinking, origin, capabilitySource string
+		maxTokens                                    int
+		vision, tools, structured                    bool
+	}
+	existing := make(map[string]existingRow, len(incoming))
+	rows, err := tx.QueryContext(ctx, `SELECT id, name, thinking_mode, origin, capability_source, max_tokens, vision_capable, tools_capable, structured_output FROM models WHERE source_id = ?`, source.ID)
+	if err != nil {
+		return result, err
+	}
+	for rows.Next() {
+		var r existingRow
+		var vision, tools, structured int
+		if err := rows.Scan(&r.id, &r.name, &r.thinking, &r.origin, &r.capabilitySource, &r.maxTokens, &vision, &tools, &structured); err != nil {
+			rows.Close()
+			return result, err
+		}
+		r.vision, r.tools, r.structured = intBool(vision), intBool(tools), intBool(structured)
+		existing[r.id] = r
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return result, err
+	}
+	rows.Close()
+
+	checked := nowString()
+	storedKey, err := s.codec.encrypt(firstEffectiveKey(source))
+	if err != nil {
+		return result, err
+	}
+	insertStmt, err := tx.PrepareContext(ctx, `INSERT INTO models(id, source_id, name, source_name, base_url, api_key, platform, type, max_tokens, vision_capable, tools_capable, structured_output, thinking_mode, available, enabled, origin, capability_source, last_checked_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return result, err
+	}
+	defer insertStmt.Close()
+	updateStmt, err := tx.PrepareContext(ctx, `UPDATE models SET name = ?, source_name = ?, base_url = ?, api_key = ?, platform = ?, type = ?, max_tokens = ?, vision_capable = ?, tools_capable = ?, structured_output = ?, thinking_mode = ?, capability_source = ?, last_checked_at = ? WHERE id = ? AND source_id = ?`)
+	if err != nil {
+		return result, err
+	}
+	defer updateStmt.Close()
+
+	incomingIDs := make(map[string]struct{}, len(incoming))
+	for i := range incoming {
+		model := normalizeModelDefaults(incoming[i])
+		incomingIDs[model.ID] = struct{}{}
+		prev, existed := existing[model.ID]
+		if existed && prev.origin == "manual" {
+			// manual 行完全保留（含能力与启停），只刷新检查时间。
+			if _, err := tx.ExecContext(ctx, `UPDATE models SET last_checked_at = ? WHERE id = ? AND source_id = ?`, checked, model.ID, source.ID); err != nil {
+				return result, err
+			}
+			continue
+		}
+		if existed {
+			// 用户编辑过的能力字段（capability_source='manual'）在刷新时保留，
+			// 其余能力值随 incoming（目录回填/上游解析）更新。
+			vision, tools, structured, thinking, maxTokens, modelType, capabilitySource :=
+				model.VisionCapable, model.ToolsCapable, model.StructuredOutput, model.ThinkingMode, model.MaxTokens, model.Type, model.CapabilitySource
+			if prev.capabilitySource == "manual" {
+				vision, tools, structured = prev.vision, prev.tools, prev.structured
+				thinking, maxTokens = prev.thinking, prev.maxTokens
+				capabilitySource = "manual"
+			}
+			if _, err := updateStmt.ExecContext(ctx, model.Name, source.Name, source.BaseURL, storedKey, normalizePlatform(source.Platform), modelType, maxTokens, boolInt(vision), boolInt(tools), boolInt(structured), thinking, capabilitySource, checked, model.ID, source.ID); err != nil {
+				return result, err
+			}
+			continue
+		}
+		// 新模型默认启用（已确认的默认值），available 初始为 true 由健康检测接管。
+		result.Added = append(result.Added, model.ID)
+		if _, err := insertStmt.ExecContext(ctx, model.ID, source.ID, model.Name, source.Name, source.BaseURL, storedKey, normalizePlatform(source.Platform), model.Type, model.MaxTokens, boolInt(model.VisionCapable), boolInt(model.ToolsCapable), boolInt(model.StructuredOutput), model.ThinkingMode, boolInt(true), boolInt(model.Enabled), model.Origin, model.CapabilitySource, checked); err != nil {
+			return result, err
+		}
+	}
+
+	// 上游消失的 fetched 行删除（manual 行保留）；同步清理组内引用防悬空。
+	for id, prev := range existing {
+		if _, stillPresent := incomingIDs[id]; stillPresent || prev.origin == "manual" {
+			continue
+		}
+		result.Removed = append(result.Removed, id)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM models WHERE id = ? AND source_id = ?`, id, source.ID); err != nil {
+			return result, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM model_group_models WHERE model_id = ? AND source_id = ?`, id, source.ID); err != nil {
+			return result, err
+		}
+	}
+	return result, tx.Commit()
+}
+
+// normalizeModelDefaults 补齐模型字段的落库默认值。
+// Enabled 恒置 true：该函数只服务于「新插入行」（合并的新模型默认启用——已确认
+// 的产品决策；已有行的启停由 UPDATE 语句不涉及该列而天然保留，manual 行整体跳过）。
+func normalizeModelDefaults(model Model) Model {
+	if model.Type == "" {
+		model.Type = "llm"
+	}
+	if model.ThinkingMode == "" {
+		model.ThinkingMode = "both"
+	}
+	if model.Name == "" {
+		model.Name = model.ID
+	}
+	if model.Origin == "" {
+		model.Origin = "fetched"
+	}
+	model.Enabled = true
+	return model
+}
+
+// maheshvaraLabelsMigrationVersion 标记"canonical → maheshvara 展示标签改写"
+// 已完成的 schema_migrations 版本号。改写本身幂等，但 WHERE LIKE 需要全表扫
+// 描胖行——大库上每次启动都重跑会明显拖慢启动，故用版本门控只跑一次。
+const maheshvaraLabelsMigrationVersion = 2
+
+// migrateMaheshvaraLabels 把历史 usage 记录里的 canonical_* 展示标签改写为
+// maheshvara_*（命名统一的一次性数据迁移；写入侧已改用新值）。以
+// schema_migrations 版本门控：已改写的库直接返回，不再全表扫描。record_json
+// 的 REPLACE 用带引号的完整成员上下文（"usageSource":"..."）与数组元素
+// （"canonical_request"），误碰撞仅影响展示字段，无功能语义。
+func (s *Store) migrateMaheshvaraLabels(ctx context.Context) error {
+	var applied int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, maheshvaraLabelsMigrationVersion).Scan(&applied); err != nil {
+		return err
+	}
+	if applied > 0 {
+		return nil
+	}
+	// 与覆盖索引同理：全表扫描在数据量大的库上可达分钟级，先说一声。
+	started := time.Now()
+	log.Printf("[migration] rewriting legacy usage labels — one-time on first start after upgrade, duration scales with usage history")
+	// usage_source 列自建表即在 CREATE TABLE 内，本库恒存在；探测仅为防御
+	// 外来/前代工程的库（缺列则不可能存有 canonical_estimate，跳过列改写
+	// 是正确行为）——record_json 的改写不受探测门控。
+	var hasUsageSource int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('usage_records') WHERE name = 'usage_source'`).Scan(&hasUsageSource); err == nil && hasUsageSource > 0 {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE usage_records SET usage_source = 'maheshvara_estimate' WHERE usage_source = 'canonical_estimate'`); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE usage_records
+		SET record_json = REPLACE(REPLACE(REPLACE(record_json,
+			'"usageSource":"canonical_estimate"', '"usageSource":"maheshvara_estimate"'),
+			'"canonical_request"', '"maheshvara_request"'),
+			'"canonical_response"', '"maheshvara_response"')
+		WHERE record_json LIKE '%canonical_%'`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, ?)`,
+		maheshvaraLabelsMigrationVersion, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	log.Printf("[migration] legacy usage labels rewritten in %s", time.Since(started).Round(time.Millisecond))
+	return nil
 }

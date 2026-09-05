@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,8 +13,10 @@ import (
 	"net/http/pprof"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/elysia-api/backend/config"
@@ -40,17 +43,35 @@ type Server struct {
 	roundRobinIndex map[string]int
 	roundRobinMutex sync.Mutex
 
+	// 源级多 key round-robin 游标（方向6）：sourceID -> 当前 key 索引。
+	keyRRMutex sync.Mutex
+	keyRRIndex map[string]int
+
+	// 模型拉取后台任务状态（refresh_jobs.go）：去重标志、结果快照与源间并发
+	// 信号量。任务异步执行，端点发起即返回，前端轮询 refreshState。
+	sourceRefreshMu  sync.Mutex
+	sourceRefreshing map[string]bool
+	sourceLastFetch  map[string]sourceRefreshState
+	refreshSem       chan struct{}
+
 	rateLimitMu sync.Mutex
 	rateLimits  map[string]*rateLimitState
 
-	usageMu      sync.Mutex
-	usageRecords []usageRecord
-	store        *storage.Store
+	store *storage.Store
 
 	// 异步 usage 写入：store 模式下，请求路径只把记录投递到 buffer channel，
 	// 由单个 writer goroutine 落库，避免请求在 SQLite 写入（单连接串行）上阻塞。
-	usageQueue    chan *usageRecord
-	usageWriterWG sync.WaitGroup
+	// usageWriter 包含队列与关闭标志（usage_writer.go），关停后入队安全降级。
+	usageWriterMu sync.Mutex
+	usageWriter   *usageWriterState
+	// usageWriteGen 在 reset 时递增，丢掉队列里尚未落库的旧记录。
+	usageWriteGen  atomic.Uint64
+	usageSeq       atomic.Uint64
+	usagePersistMu sync.Mutex
+	shutdownOnce   sync.Once
+
+	// usage 只读端点的短 TTL 响应缓存 + 并发合并（usage_cache.go）。
+	usageCache usageResponseCache
 
 	// 渠道亲和性：token+group → 上次成功模型的短 TTL 粘连映射。
 	affinity *affinityCache
@@ -64,10 +85,15 @@ type Server struct {
 	// 路由缓存：把 groups+models 装配结果与 tokens 载入内存，
 	// 让请求热路径无需每次查 SQLite（消除 N+1 + 单连接串行瓶颈）。
 	// 借鉴 new-api 的 *_cache.go + SyncOptions：读走内存，写后失效。
-	routeCacheMu     sync.RWMutex
-	cachedGroups     []config.ModelGroupConfig
-	cachedTokens     map[string]config.AccessToken
-	routeCacheLoaded bool
+	// routeCacheGeneration 是失效代际：装配期间发生失效则旧快照不得落缓存。
+	routeCacheMu         sync.RWMutex
+	cachedGroups         []config.ModelGroupConfig
+	cachedTokens         map[string]config.AccessToken
+	routeCacheLoaded     bool
+	routeCacheGeneration uint64
+
+	// 模型能力元数据目录（models.dev）：刷新模型时自动回填能力字段（方向1）。
+	catalog *modelCatalog
 
 	// 存在需要重启才能生效的配置变更（host/port/databasePath/pprof），
 	// 由 adminUpdateRuntimeConfig 置位，restart-required/check 查询；进程重启自然清零。
@@ -97,19 +123,35 @@ func New(cfg *config.Config) *Server {
 	}
 
 	server := &Server{
-		config:          cfg,
-		engine:          engine,
-		openaiAdapter:   relay.NewOpenAIAdapter(httpTimeout),
-		claudeAdapter:   relay.NewClaudeAdapter(httpTimeout),
-		geminiAdapter:   relay.NewGeminiAdapter(httpTimeout),
-		roundRobinIndex: make(map[string]int),
-		rateLimits:      make(map[string]*rateLimitState),
-		affinity:        newAffinityCache(),
+		config:           cfg,
+		engine:           engine,
+		openaiAdapter:    relay.NewOpenAIAdapter(httpTimeout),
+		claudeAdapter:    relay.NewClaudeAdapter(httpTimeout),
+		geminiAdapter:    relay.NewGeminiAdapter(httpTimeout),
+		roundRobinIndex:  make(map[string]int),
+		rateLimits:       make(map[string]*rateLimitState),
+		affinity:         newAffinityCache(),
+		sourceRefreshing: make(map[string]bool),
+		sourceLastFetch:  make(map[string]sourceRefreshState),
+		refreshSem:       make(chan struct{}, sourceRefreshConcurrency),
+		catalog: newModelCatalog(cfg.GetModelCatalog, func() string {
+			// 缓存落在数据库同目录，跟随用户的数据目录布局。
+			dbPath := cfg.GetDatabasePath()
+			if strings.TrimSpace(dbPath) == "" {
+				return ""
+			}
+			return filepath.Join(filepath.Dir(dbPath), "model-catalog.json")
+		}),
 	}
+	// 目录定期后台更新（周期动态读取配置，管理页修改即时生效）。
+	go server.catalog.runPeriodic()
 	if store, err := storage.OpenWithKey(cfg.DatabasePath, cfg.GetDBEncryptionKey()); err != nil {
 		log.Printf("failed to open sqlite store: %v", err)
 	} else {
 		server.store = store
+		// 历史数据回填进小时级 rollup 预聚合表（后台、幂等、可断点续跑）；
+		// 完成前聚合查询自动走 raw 路径，功能不受影响。
+		store.StartRollupBackfill()
 		if err := server.importLegacyConfig(); err != nil {
 			log.Printf("failed to import legacy config into sqlite: %v", err)
 		}
@@ -153,10 +195,6 @@ func compactLogJSON(data []byte) string {
 	return string(compacted)
 }
 
-func isVisionCapable(group *config.ModelGroupConfig) bool {
-	return group != nil && group.VisionCapable != nil && *group.VisionCapable
-}
-
 func (s *Server) setupRoutes() {
 	if s.config.MaxBodyBytes > 0 {
 		s.engine.Use(func(c *gin.Context) {
@@ -184,7 +222,6 @@ func (s *Server) setupRoutes() {
 		v1beta.POST("/models/*action", s.chatCompletions)
 	}
 
-	s.engine.GET("/usage", s.usageDashboard)
 	s.mountWebUI()
 	if s.config.EnablePprof {
 		debug := s.engine.Group("/debug/pprof")
@@ -200,15 +237,6 @@ func (s *Server) setupRoutes() {
 		debug.GET("/heap", gin.WrapH(pprof.Handler("heap")))
 		debug.GET("/mutex", gin.WrapH(pprof.Handler("mutex")))
 		debug.GET("/threadcreate", gin.WrapH(pprof.Handler("threadcreate")))
-	}
-
-	usage := s.engine.Group("/__usage")
-	usage.Use(s.dashboardAuthMiddleware())
-	{
-		usage.GET("/stats", s.usageStats)
-		usage.GET("/logs", s.usageLogs)
-		usage.GET("/logs/:id", s.usageLogDetail)
-		usage.POST("/reset", s.resetUsage)
 	}
 
 	admin := s.engine.Group("/api/admin")
@@ -242,7 +270,7 @@ func (s *Server) mountWebUI() {
 		// 子目录一律 404，阻止 http.FileServer 渲染目录列表页（文件名枚举）。
 		ui := s.engine.Group("/ui", func(c *gin.Context) {
 			if strings.HasPrefix(c.Request.URL.Path, "/ui/assets/") {
-				c.Header("Cache-Control", "public, max-age=31536000, immutable")
+				c.Header("Cache-Control", CacheHeaderImmutable)
 			} else {
 				c.Header("Cache-Control", "no-cache")
 			}
@@ -452,38 +480,35 @@ func (s *Server) chatCompletions(c *gin.Context) {
 	if inputFormat == relay.FormatGemini {
 		urlModel = geminiModelFromAction(c.Param("action"))
 	}
-	canonicalReq, _, canonicalErr := relay.ConvertRequestToCanonical(bodyBytes, inputFormat, urlModel)
-	if canonicalErr != nil {
-		log.Printf("Error converting request to Maheshvara: %v", canonicalErr)
-		c.JSON(400, gin.H{"error": fmt.Sprintf("Failed to convert request to Maheshvara: %v", canonicalErr)})
+	maheshvaraReq, _, maheshvaraErr := relay.ConvertRequestToMaheshvara(bodyBytes, inputFormat, urlModel)
+	if maheshvaraErr != nil {
+		log.Printf("Error converting request to Maheshvara: %v", maheshvaraErr)
+		c.JSON(400, gin.H{"error": fmt.Sprintf("Failed to convert request to Maheshvara: %v", maheshvaraErr)})
 		return
 	}
 
 	// Gemini 原生路径 /v1beta/models/MODEL:generateContent 中模型名在 URL 里
 	// 若请求体没有 model 字段，从路径参数提取
-	if canonicalReq.Model == "" {
+	if maheshvaraReq.Model == "" {
 		if action := c.Param("action"); action != "" {
-			// action 形如 /gemini-2.0-flash:generateContent
-			modelPart := geminiModelFromAction(action)
-			if idx := strings.LastIndex(modelPart, ":"); idx != -1 {
-				modelPart = modelPart[:idx]
-			}
-			canonicalReq.Model = modelPart
+			// action 形如 /gemini-2.0-flash:generateContent（geminiModelFromAction
+			// 内部已剥离 :action 后缀，无需二次处理）。
+			maheshvaraReq.Model = geminiModelFromAction(action)
 		}
 	}
-	if canonicalJSON, err := json.Marshal(canonicalReq); err == nil {
-		s.logVerbose("[Maheshvara Request] %s", compactLogJSON(canonicalJSON))
+	if maheshvaraJSON, err := json.Marshal(maheshvaraReq); err == nil {
+		s.logVerbose("[Maheshvara Request] %s", compactLogJSON(maheshvaraJSON))
 	}
 
 	// 模型组级访问权限：先于 validateModelGroup 校验请求的模型组名，
 	// 这样即使目标组为空/未配置，越权访问也返回 403（而非泄露组的存在性/状态）。
-	if !s.tokenAllowsGroup(c, canonicalReq.Model) {
-		s.failRequest(c, record, startTime, http.StatusForbidden, fmt.Sprintf("api key is not allowed to access model group '%s'", canonicalReq.Model))
+	if !s.tokenAllowsGroup(c, maheshvaraReq.Model) {
+		s.failRequest(c, record, startTime, http.StatusForbidden, fmt.Sprintf("api key is not allowed to access model group '%s'", maheshvaraReq.Model))
 		return
 	}
 
 	// 验证并获取模型组
-	group, err := s.validateModelGroup(canonicalReq.Model)
+	group, err := s.validateModelGroup(maheshvaraReq.Model)
 	if err != nil {
 		statusCode := 500
 		if errMsg := err.Error(); strings.Contains(errMsg, "not found") {
@@ -507,23 +532,37 @@ func (s *Server) chatCompletions(c *gin.Context) {
 	if sticky := s.affinity.get(record.KeyHash, group.ID, startTime); sticky != "" {
 		candidates = applyAffinity(candidates, sticky)
 	}
+	// 组内候选软过滤（方向2）：按请求内容把不支持所需能力的候选移到末尾。
+	candidates = reorderCandidatesByRequestNeeds(candidates,
+		maheshvaraRequestHasMultimodalInput(maheshvaraReq), maheshvaraRequestUsesTools(maheshvaraReq))
+	// 多 key 展开（方向6）：按源策略把候选解析为逐次尝试序列（single 时原样）。
+	candidates = s.expandCandidatesByKeyStrategy(candidates)
 
 	// 如果模型组配置了 MaxTokens，覆盖客户端发来的值
 	if group.MaxTokens > 0 {
-		canonicalReq.MaxOutputTokens = group.MaxTokens
+		maheshvaraReq.MaxOutputTokens = group.MaxTokens
 	}
-	filtered, filteredParts := filterCanonicalVisionInputsIfNeeded(group, canonicalReq)
+	// 组级 tools 能力落地（方向2）：组声明不支持工具而请求携带工具定义/工具消息时，
+	// 400 拒绝并明确报错——静默剥离会破坏 agent 循环语义（已确认的产品决策）。
+	if rejectToolRequestsIfNeeded(group, maheshvaraReq) {
+		s.failRequest(c, record, startTime, http.StatusBadRequest,
+			fmt.Sprintf("model group '%s' does not support tool calling, but the request contains tools or tool messages", group.Name))
+		return
+	}
+	filtered, filteredParts, filteredModalities := filterMaheshvaraMultimodalInputsIfNeeded(group, maheshvaraReq)
 	if filtered {
-		s.logVerbose("[Maheshvara Vision Filter] group=%s filteredImageParts=%d", group.Name, filteredParts)
-		if canonicalJSON, err := json.Marshal(canonicalReq); err == nil {
-			s.logVerbose("[Maheshvara Request After Vision Filter] %s", compactLogJSON(canonicalJSON))
+		s.logVerbose("[Maheshvara Multimodal Filter] group=%s filteredParts=%d modalities=%v", group.Name, filteredParts, filteredModalities)
+		if maheshvaraJSON, err := json.Marshal(maheshvaraReq); err == nil {
+			s.logVerbose("[Maheshvara Request After Multimodal Filter] %s", compactLogJSON(maheshvaraJSON))
 		}
+		// 让客户端可感知剥离行为（非纯静默）：形如 "image,audio"。
+		c.Writer.Header().Set("X-Elysia-Filtered-Modalities", strings.Join(filteredModalities, ","))
 	}
 
-	estimatedUsage := estimateCanonicalRequestUsage(canonicalReq, s.config.GetUsageConfig())
+	estimatedUsage := estimateMaheshvaraRequestUsage(maheshvaraReq, s.config.GetUsageConfig())
 	estimatedTokens := estimatedUsage.EstimatedTotalTokens
-	record.Usage = usageTokenUsageFromCanonical(estimatedUsage)
-	record.UsageDetail = usageDetailFromCanonical(estimatedUsage)
+	record.Usage = usageTokenUsageFromMaheshvara(estimatedUsage)
+	record.UsageDetail = usageDetailFromMaheshvara(estimatedUsage)
 	record.UsageSource = estimatedUsage.Source
 	releaseLimiter, err := s.acquireRateLimit(group, estimatedTokens)
 	if err != nil {
@@ -559,7 +598,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 			continue
 		}
 
-		canonicalReq.Model = selectedModel.Name
+		maheshvaraReq.Model = selectedModel.Name
 		targetPlatform := relay.DetectPlatform(selectedModel.BaseURL, selectedModel.Platform)
 		setRecordModel(record, selectedModel, targetPlatform)
 		s.logDebug("Request model group: '%s' attempt %d/%d, selected: %s", group.Name, attempt+1, attempts, selectedModel.Name)
@@ -568,7 +607,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		// Gemini→Gemini、OpenAI→OpenAI 系），且本次未因 vision 过滤改写过请求体时，
 		// 以原始请求字节直发上游，跳过 Maheshvara 往返——保留尚未纳入核心协议的私有字段
 		// （cache_control / thinking / 各类未知扩展）。借鉴 Responses 透传与 new-api
-		// 的 should_convert=false 分支。vision 过滤改写了 canonicalReq 而非原始字节，
+		// 的 should_convert=false 分支。vision 过滤改写了 maheshvaraReq 而非原始字节，
 		// 故 filtered=true 时必须回退到转换路径，否则被过滤的图片会随原始字节漏给上游。
 		usePassthrough := !filtered && relay.FormatMatchesPlatform(inputFormat, targetPlatform)
 
@@ -577,7 +616,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		isStream := relay.IsStreamRequest(bodyBytes)
 		if action := c.Param("action"); strings.Contains(action, ":streamGenerateContent") {
 			isStream = true
-			canonicalReq.Stream = true
+			maheshvaraReq.Stream = true
 		}
 
 		var targetBody []byte
@@ -598,7 +637,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 			}
 			targetBody, err = relay.PassthroughBody(bodyBytes, passModelName, ensureStream, addStreamOptions)
 			if err == nil {
-				record.RelayMode = "passthrough"
+				record.RelayMode = RelayModePassthrough
 				// OpenAI 系透传同样补齐缺失的 tool call id：部分客户端重建历史时
 				// 会遗漏 tool_calls[].id，直接透传会被严格上游以 missing field id 拒绝。
 				if targetPlatform == relay.PlatformOpenAI || targetPlatform == relay.PlatformDeepSeek || targetPlatform == relay.PlatformAzure {
@@ -606,22 +645,22 @@ func (s *Server) chatCompletions(c *gin.Context) {
 				}
 			}
 		} else if relay.IsCustomPlatform(targetPlatform) {
-			customRequest, err = relay.RenderRegisteredCustomProtocolRequest(canonicalReq, relay.CustomProtocolID(targetPlatform))
+			customRequest, err = relay.RenderRegisteredCustomProtocolRequest(maheshvaraReq, relay.CustomProtocolID(targetPlatform))
 			if err == nil {
 				targetBody = customRequest.Body
 			}
 			if err == nil {
-				record.RelayMode = "transform"
+				record.RelayMode = RelayModeTransform
 			}
 		} else {
 			targetFormat, formatErr := relay.TargetFormatForPlatform(targetPlatform)
 			if formatErr != nil {
 				err = formatErr
 			} else {
-				targetBody, err = relay.CanonicalToTargetRequest(canonicalReq, targetFormat, nil)
+				targetBody, err = relay.MaheshvaraToTargetRequest(maheshvaraReq, targetFormat, nil)
 			}
 			if err == nil {
-				record.RelayMode = "transform"
+				record.RelayMode = RelayModeTransform
 			}
 		}
 		if err != nil {
@@ -686,7 +725,14 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		lastErr = outcome.errMsg
 		s.appendRetryEvent(record, attempt, selectedModel.Name, outcome.errMsg)
 		if !isLast && group.RetryInterval > 0 {
-			time.Sleep(time.Duration(group.RetryInterval) * time.Millisecond)
+			// 尊重客户端取消：被放弃的请求不再空耗等待 + 对剩余候选扇出。
+			select {
+			case <-c.Request.Context().Done():
+				committed = true
+				record.StatusCode = 499 // client closed request（nginx 惯例码）
+				return
+			case <-time.After(time.Duration(group.RetryInterval) * time.Millisecond):
+			}
 		}
 	}
 
@@ -774,15 +820,15 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 		actualTokens := getInt(record.Usage.TotalTokens)
 		s.adjustTokenUsage(group.ID, actualTokens)
 
-		canonicalResp, canonicalErr := relay.ClaudeResponseToCanonical(&claudeResp)
-		if canonicalErr != nil {
-			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to convert Claude response to Maheshvara: %v", canonicalErr), nil, "")
+		maheshvaraResp, maheshvaraErr := relay.AnthropicResponseToMaheshvara(&claudeResp)
+		if maheshvaraErr != nil {
+			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to convert Claude response to Maheshvara: %v", maheshvaraErr), nil, "")
 			return result
 		}
 		s.logDebug("Request completed in %dms", time.Since(startTime).Milliseconds())
 
 		record.StatusCode = http.StatusOK
-		output, renderErr := renderCanonicalChatResponse(canonicalResp, inputFormat)
+		output, renderErr := renderMaheshvaraChatResponse(maheshvaraResp, inputFormat)
 		if renderErr != nil {
 			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to render Maheshvara response: %v", renderErr), nil, "")
 			return result
@@ -815,9 +861,9 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 			return result
 		}
 
-		canonicalResp, canonicalErr := relay.GeminiResponseToCanonical(&geminiResp)
-		if canonicalErr != nil {
-			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to convert Gemini response to Maheshvara: %v", canonicalErr), nil, "")
+		maheshvaraResp, maheshvaraErr := relay.GeminiResponseToMaheshvara(&geminiResp)
+		if maheshvaraErr != nil {
+			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to convert Gemini response to Maheshvara: %v", maheshvaraErr), nil, "")
 			return result
 		}
 		applyProviderUsageToRecord(record, extractProviderUsageFromBody(targetPlatform, "", respBody))
@@ -828,7 +874,7 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 		s.logDebug("Request completed in %dms", time.Since(startTime).Milliseconds())
 
 		record.StatusCode = http.StatusOK
-		output, renderErr := renderCanonicalChatResponse(canonicalResp, inputFormat)
+		output, renderErr := renderMaheshvaraChatResponse(maheshvaraResp, inputFormat)
 		if renderErr != nil {
 			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to render Maheshvara response: %v", renderErr), nil, "")
 			return result
@@ -864,12 +910,12 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 		s.logDebug("Request completed in %dms", time.Since(startTime).Milliseconds())
 
 		record.StatusCode = http.StatusOK
-		canonicalResp, canonicalErr := relay.OpenAIChatResponseToCanonical(resp)
-		if canonicalErr != nil {
-			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to convert OpenAI response to Maheshvara: %v", canonicalErr), nil, "")
+		maheshvaraResp, maheshvaraErr := relay.OpenAIChatResponseToMaheshvara(resp)
+		if maheshvaraErr != nil {
+			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to convert OpenAI response to Maheshvara: %v", maheshvaraErr), nil, "")
 			return result
 		}
-		output, renderErr := renderCanonicalChatResponse(canonicalResp, inputFormat)
+		output, renderErr := renderMaheshvaraChatResponse(maheshvaraResp, inputFormat)
 		if renderErr != nil {
 			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to render Maheshvara response: %v", renderErr), nil, "")
 			return result
@@ -893,6 +939,16 @@ func (s *Server) handleStreamRequest(c *gin.Context, group *config.ModelGroupCon
 		record.DurationMs = time.Since(startTime).Milliseconds()
 		s.recordUsage(record)
 	}()
+
+	// upstreamErrorStatus 从错误中提取上游真实状态码（UpstreamStatusError），
+	// 无则回退 fallback——永久错误（401/403/400）不得洗白成可重试的 502。
+	upstreamErrorStatus := func(err error, fallback int) int {
+		var statusErr *relay.UpstreamStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode > 0 {
+			return statusErr.StatusCode
+		}
+		return fallback
+	}
 
 	// 流式失败的可重试性判定。注意：一旦开始向客户端写出 SSE 字节，
 	// 就无法再重试（响应头已发出），因此重试只发生在"建立上游连接 +
@@ -994,7 +1050,9 @@ func (s *Server) handleStreamRequest(c *gin.Context, group *config.ModelGroupCon
 		resp, err := s.openaiAdapter.SendRequestStream(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
 		if err != nil {
 			log.Printf("Error forwarding stream request: %v", err)
-			result = failResult(http.StatusBadGateway, fmt.Sprintf("Failed to forward request: %v", err), nil)
+			// 上游真实状态码保真：401/403/400 等永久错误不得洗白成 502
+			// 触发对全部候选的扇出重试。
+			result = failResult(upstreamErrorStatus(err, http.StatusBadGateway), fmt.Sprintf("Failed to forward request: %v", err), nil)
 			return result
 		}
 
@@ -1002,7 +1060,7 @@ func (s *Server) handleStreamRequest(c *gin.Context, group *config.ModelGroupCon
 		record.StatusCode = http.StatusOK
 		observeUpstreamUsage(resp, record, targetPlatform)
 
-		if record.RelayMode == "passthrough" {
+		if record.RelayMode == RelayModePassthrough {
 			// OpenAI 系同协议透传：原始转发上游 SSE，保留 tool call id、
 			// reasoning_content 等字段，不经过 Maheshvara 重渲染。
 			forwardErr = relay.ForwardOpenAIStream(c.Request.Context(), resp, writer)
@@ -1131,13 +1189,6 @@ func (w *ginStreamWriter) Flush() error {
 // 现在复用 buildCandidates 的有序候选列表取第一个，避免旧实现里
 // round-robin 用过期索引访问 models[idx] 导致的越界 panic（高危1）。
 // 需要故障转移的路径应直接使用 buildCandidates 遍历全部候选。
-func (s *Server) selectModel(group *config.ModelGroupConfig) config.ModelRef {
-	candidates := s.buildCandidates(group)
-	if len(candidates) == 0 {
-		return config.ModelRef{}
-	}
-	return candidates[0]
-}
 
 // tokenAllowsGroup 校验当前请求的 API key 是否被允许访问指定模型组。
 // 从 gin context 取 authMiddleware 写入的 AllowedGroups：为空表示不限制（放行）；
@@ -1400,13 +1451,13 @@ func (s *Server) countTokens(c *gin.Context) {
 		return
 	}
 
-	canonicalReq, err := relay.ClaudeRequestToCanonical(bodyBytes)
+	maheshvaraReq, err := relay.AnthropicToMaheshvara(bodyBytes)
 	if err != nil {
 		c.JSON(400, gin.H{"error": fmt.Sprintf("Failed to convert request: %v", err)})
 		return
 	}
 
-	inputTokens := estimateCanonicalRequestUsage(canonicalReq, s.config.GetUsageConfig()).InputTokens
+	inputTokens := estimateMaheshvaraRequestUsage(maheshvaraReq, s.config.GetUsageConfig()).InputTokens
 
 	c.JSON(200, gin.H{
 		"input_tokens": inputTokens,
@@ -1457,20 +1508,22 @@ func (s *Server) ListenAndServe() error {
 // 仅允许本机回环调用。供本地管理工具或用户手动优雅停止进程。
 func (s *Server) shutdown(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"shuttingDown": true})
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if s.httpServer != nil {
-			if err := s.httpServer.Shutdown(ctx); err != nil {
-				log.Printf("graceful shutdown error: %v", err)
-			}
+	go s.shutdownOnce.Do(s.doShutdown)
+}
+
+func (s *Server) doShutdown() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if s.httpServer != nil {
+		if err := s.httpServer.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown error: %v", err)
 		}
-		// http.Server.Shutdown 已等待在途请求结束，此时不会再有新记录入队。
-		// 先停健康检查 goroutine，再冲刷 usage 队列把缓冲中的记录落库，
-		// 避免优雅关停时丢失计费/统计记录与 goroutine 泄漏。
-		if s.healthChecker != nil {
-			s.healthChecker.shutdown()
-		}
-		s.stopUsageWriter()
-	}()
+	}
+	// http.Server.Shutdown 已等待在途请求结束，此时不会再有新记录入队。
+	// 先停健康检查 goroutine，再冲刷 usage 队列把缓冲中的记录落库，
+	// 避免优雅关停时丢失计费/统计记录与 goroutine 泄漏。
+	if s.healthChecker != nil {
+		s.healthChecker.shutdown()
+	}
+	s.stopUsageWriter()
 }

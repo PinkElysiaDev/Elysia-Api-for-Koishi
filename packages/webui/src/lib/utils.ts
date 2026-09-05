@@ -1,15 +1,46 @@
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
+import type { Model } from '@/lib/types'
 
+/** Tailwind class 合并（后者覆盖前者同前缀）。 */
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+/**
+ * 旧的源→模型名交集（仅在无法下发 sourceId 时使用）。
+ * 用量页已改为把 sourceIds 直接传给后端；同名模型跨源时必须走 source_id 列。
+ * 交集为空且确有筛选输入时返回 [NO_MATCH_MODEL_FILTER]，避免空数组被当成「未筛选」。
+ */
+export const NO_MATCH_MODEL_FILTER = 'ￗno-match'
+
+export function effectiveModelFilter(
+  modelNames: string[],
+  sourceNames: string[],
+  models: Model[],
+  modelsLoaded = true,
+): string[] {
+  if (sourceNames.length === 0) return modelNames
+  // 模型目录尚未加载（或加载失败）时不做源→模型交集：空目录会把任何源
+  // 选择误判为"无命中"，页面显示永久空态。
+  if (!modelsLoaded) return modelNames
+  const set = new Set(sourceNames)
+  const fromSources = models.filter((m) => m.sourceName && set.has(m.sourceName)).map((m) => m.name)
+  if (modelNames.length === 0) {
+    return fromSources.length > 0 ? fromSources : [NO_MATCH_MODEL_FILTER]
+  }
+  const sourceSet = new Set(fromSources)
+  const matched = modelNames.filter((name) => sourceSet.has(name))
+  return matched.length > 0 ? matched : [NO_MATCH_MODEL_FILTER]
+}
+
+/** 千分位格式化数字；空值显示 0。 */
 export function formatNumber(value: number | undefined | null): string {
   if (value == null || Number.isNaN(value)) return '0'
   return new Intl.NumberFormat('zh-CN').format(value)
 }
 
+/** 字节数人性化显示（KB/MB/GB），保留两位小数。 */
 export function formatBytes(bytes: number | undefined | null): string {
   if (!bytes || bytes < 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -22,12 +53,14 @@ export function formatBytes(bytes: number | undefined | null): string {
   return `${value.toFixed(value >= 100 || unit === 0 ? 0 : 1)} ${units[unit]}`
 }
 
+/** 毫秒时长人性化显示（ms/s/min/h）。 */
 export function formatDuration(ms: number | undefined | null): string {
   if (ms == null || Number.isNaN(ms)) return '-'
   if (ms < 1000) return `${Math.round(ms)} ms`
   return `${(ms / 1000).toFixed(2)} s`
 }
 
+/** ISO 时间转本地 YYYY-MM-DD HH:mm:ss 显示。 */
 export function formatDateTime(value: string | number | Date | undefined | null): string {
   if (!value) return '-'
   const date = new Date(value)
@@ -43,6 +76,7 @@ export function formatDateTime(value: string | number | Date | undefined | null)
   }).format(date)
 }
 
+/** 相对时间（刚刚/N 分钟前/…），超过阈值回退绝对时间。 */
 export function formatRelative(value: string | number | Date | undefined | null): string {
   if (!value) return '-'
   const date = new Date(value)
@@ -59,9 +93,37 @@ export function formatRelative(value: string | number | Date | undefined | null)
   return formatDateTime(date)
 }
 
+/** 分子/分母 百分比字符串（保留一位小数）；分母为 0 显示 —。 */
 export function percent(part: number, total: number): string {
   if (!total) return '0%'
   return `${((part / total) * 100).toFixed(1)}%`
+}
+
+/** cacheHitRate（0–1）→ 百分比文案。 */
+export function formatHitRate(rate: number): string {
+  return `${(rate * 100).toFixed(1)}%`
+}
+
+/** Recharts 轴刻度共用样式。字号/字重由 --chart-tick-* 定义，rem 随根字号流式缩放。 */
+export const CHART_TICK = {
+  fontFamily: 'ui-monospace, SF Mono, Menlo, monospace',
+  fontSize: 'var(--chart-tick-size)',
+  fontWeight: 'var(--chart-tick-weight)' as const,
+  fill: 'hsl(var(--muted-foreground))',
+}
+
+/** 实测 --chart-tick-size 的解析像素值。自定义属性的计算值不换算单位（rem 会原样返回），
+ * 必须挂探针元素让 computed style 解析成 px，供横轴刻度避让测宽。 */
+export function readChartTickSizePx(): number {
+  if (typeof window === 'undefined' || typeof document === 'undefined' || !document.body) return 11
+  const probe = document.createElement('span')
+  probe.style.fontSize = 'var(--chart-tick-size)'
+  probe.style.position = 'absolute'
+  probe.style.visibility = 'hidden'
+  document.body.appendChild(probe)
+  const px = parseFloat(getComputedStyle(probe).fontSize)
+  probe.remove()
+  return Number.isFinite(px) && px > 0 ? px : 11
 }
 
 /** 紧凑数字：1234 → 1.2k，1200000 → 1.2m。用于 TPM 等大数值的大字展示。 */
@@ -72,24 +134,6 @@ export function compactNumber(value: number | undefined | null): string {
   if (abs < 1_000_000) return `${(n / 1000).toFixed(abs < 10_000 ? 1 : 0).replace(/\.0$/, '')}k`
   if (abs < 1_000_000_000) return `${(n / 1_000_000).toFixed(abs < 10_000_000 ? 1 : 0).replace(/\.0$/, '')}m`
   return `${(n / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}b`
-}
-
-/**
- * 速率（每分钟）。count 为请求数或 token 数，from/to 为 ISO 时间串。
- * 跨度无效（缺失或非正）时返回 null，由调用方决定展示占位符。
- */
-export function ratePerMinute(
-  count: number | undefined | null,
-  from: string | undefined | null,
-  to: string | undefined | null,
-): number | null {
-  if (!from || !to) return null
-  const start = new Date(from).getTime()
-  const end = new Date(to).getTime()
-  if (Number.isNaN(start) || Number.isNaN(end)) return null
-  const minutes = (end - start) / 60_000
-  if (minutes <= 0) return null
-  return Number(count || 0) / minutes
 }
 
 /** 去重 + 去空 + 按中文/字母序排序，返回 {value,label} 选项数组，供多选下拉使用。 */
@@ -106,23 +150,8 @@ export function uniqueSorted(values: (string | undefined | null)[]): { value: st
   return result.map((v) => ({ value: v, label: v }))
 }
 
-export function maskMiddle(value: string | undefined): string {
-  if (!value) return ''
-  if (value.length <= 8) return '***'
-  return `${value.slice(0, 4)}…${value.slice(-4)}`
-}
 
-/** RFC3339 时间戳，供 usage 查询参数使用。 */
-export function toRFC3339(date: Date): string {
-  return date.toISOString()
-}
-
-/** 规范化查询结束时间（向下舍入到 1 分钟），避免毫秒级时间戳导致 SWR Cache Key 频繁变动。 */
-export function normalizedNow(intervalMs = 60_000): string {
-  const now = Date.now()
-  return new Date(Math.floor(now / intervalMs) * intervalMs).toISOString()
-}
-
+/** 时间窗起点 ISO（24h/7d/30d；all 返回 undefined 表示无下界）。 */
 export function startOfRange(range: '24h' | '7d' | '30d' | 'all', nowIso?: string): string | undefined {
   if (range === 'all') return undefined
   const reference = nowIso ? new Date(nowIso).getTime() : Date.now()
@@ -132,6 +161,15 @@ export function startOfRange(range: '24h' | '7d' | '30d' | 'all', nowIso?: strin
     '30d': 30 * 24 * 60 * 60 * 1000,
   }
   return new Date(reference - map[range]).toISOString()
+}
+
+/** 把参考时刻向上取整到下一个 bucketMs 边界再序列化。
+ *  usage 查询是半开区间 [from, to)：to 必须在「现在」之后，当前桶内的新记录才会被包含。
+ *  用下一边界而不是上一边界，缓存键在桶内仍稳定，又不会把刚发生的调用排除在外。
+ *  不要用返回值去算「今天 0 点」：临近本地午夜时下一边界会落到次日 00:00，
+ *  localMidnight(0, new Date(to)) 会得到 from==to 的空窗。日历日一律用 atMs。 */
+export function bucketedTimeISO(atMs: number, bucketMs: number): string {
+  return new Date(Math.floor(atMs / bucketMs) * bucketMs + bucketMs).toISOString()
 }
 
 /** 把任意数据序列化为 JSON 文件并触发浏览器下载。 */
@@ -149,10 +187,22 @@ export function downloadJSON(filename: string, data: unknown): void {
 
 /** 尽量把字符串解析成 JSON 对象；失败则原样返回字符串。用于展示/导出捕获的请求体。 */
 export function tryParseJSON(content: string | undefined | null): unknown {
-  if (content == null || content === '') return content ?? ''
+  if (content == null || content === '') return ''
   try {
     return JSON.parse(content)
   } catch {
     return content
   }
+}
+
+/** 判断 HTTP 状态码是否属于成功区间（2xx/3xx）。 */
+export function isSuccessStatus(code: number): boolean {
+  return code >= 200 && code < 400
+}
+
+/** 模型检索谓词：按 id / 名称 / 所属源名的子串匹配（忽略大小写）。 */
+export function matchesModelKeyword(keyword: string, model: { id: string; name: string; sourceName?: string }): boolean {
+  const kw = keyword.trim().toLowerCase()
+  if (!kw) return true
+  return `${model.id} ${model.name} ${model.sourceName ?? ''}`.toLowerCase().includes(kw)
 }

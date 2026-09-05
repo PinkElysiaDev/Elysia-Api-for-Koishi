@@ -23,13 +23,16 @@ func (s *Server) ensureRouteCache() bool {
 	}
 	s.routeCacheMu.RLock()
 	loaded := s.routeCacheLoaded
+	// 代际计数：装配期间若有写操作触发失效，gen 会递增——旧快照不允许
+	// 带着 loaded=true 落缓存（已撤销的 token/已删模型会继续放行）。
+	generation := s.routeCacheGeneration
 	s.routeCacheMu.RUnlock()
 	if loaded {
 		return true
 	}
 
 	// 装配在锁外完成，减少持锁时间；多个并发请求可能重复装配一次，
-	// 但结果一致且幂等，可接受。
+	// 但结果一致且幂等，可接受（最终落缓存的以 gen 校验为准）。
 	groups, okGroups := s.assembleGroupsFromStore()
 	tokens, okTokens := s.loadTokensFromStore()
 	if !okGroups || !okTokens {
@@ -37,6 +40,11 @@ func (s *Server) ensureRouteCache() bool {
 	}
 
 	s.routeCacheMu.Lock()
+	if s.routeCacheGeneration != generation {
+		// 装配期间发生失效：丢弃本快照，让下次读取重新装配。
+		s.routeCacheMu.Unlock()
+		return false
+	}
 	s.cachedGroups = groups
 	s.cachedTokens = tokens
 	s.routeCacheLoaded = true
@@ -49,9 +57,19 @@ func (s *Server) ensureRouteCache() bool {
 func (s *Server) invalidateRouteCache() {
 	s.routeCacheMu.Lock()
 	s.routeCacheLoaded = false
+	s.routeCacheGeneration++
 	s.cachedGroups = nil
 	s.cachedTokens = nil
 	s.routeCacheMu.Unlock()
+}
+
+// sourceKeyMeta 是源级 key 调度元数据（方向6），装配时随 ModelRef 下发。
+// keys 保留完整 SourceAPIKey：除 value 外还需按 key 的
+// FetchedModels/AllowedModels 对每个模型过滤可服务该模型的 key 池
+//（多 key 权限发现，见 KeyAllowsModel）。
+type sourceKeyMeta struct {
+	keys     []storage.SourceAPIKey
+	strategy string
 }
 
 // assembleGroupsFromStore 一次性读取 groups + models 并装配成
@@ -67,6 +85,22 @@ func (s *Server) assembleGroupsFromStore() ([]config.ModelGroupConfig, bool) {
 	if err != nil {
 		s.logWarnf("failed to load models from sqlite: %v", err)
 		return nil, false
+	}
+	// 源级多 key 元数据：ModelRef 的 key 集合以源为准（models.api_key 冗余列仅作
+	// 单 key 回退，不再随多 key 演进——避免大迁移）。
+	sources, err := s.store.ListSources(ctx)
+	if err != nil {
+		s.logWarnf("failed to load model sources from sqlite: %v", err)
+		return nil, false
+	}
+	keyMeta := make(map[string]sourceKeyMeta, len(sources))
+	for _, source := range sources {
+		effective := source.EffectiveKeys()
+		keys := make([]storage.SourceAPIKey, 0, len(effective))
+		for _, key := range effective {
+			keys = append(keys, key)
+		}
+		keyMeta[source.ID] = sourceKeyMeta{keys: keys, strategy: string(source.KeyStrategy)}
 	}
 	// 同时按复合键(sourceId:id)与裸 id 建索引：复合键精确命中（解决同名模型路由错乱），
 	// 裸 id 用于向后兼容旧数据（models 元素无 ":" 前缀时回退）。
@@ -90,11 +124,30 @@ func (s *Server) assembleGroupsFromStore() ([]config.ModelGroupConfig, bool) {
 	for _, group := range groups {
 		refs := make([]config.ModelRef, 0, len(group.Models))
 		for _, modelRef := range group.Models {
+			// 可调度 = 健康可用（available，健康检测自动翻转）&& 用户启用（enabled，手动开关）。
 			model, ok := resolveModel(modelRef)
-			if !ok || !model.Available {
+			if !ok || !model.Available || !model.Enabled {
 				continue
 			}
-			refs = append(refs, config.ModelRef{ID: model.ID, Name: model.Name, BaseURL: model.BaseURL, APIKey: model.APIKey, Platform: model.Platform})
+			ref := config.ModelRef{ID: model.ID, Name: model.Name, BaseURL: model.BaseURL, APIKey: model.APIKey, Platform: model.Platform,
+				VisionCapable: model.VisionCapable, ToolsCapable: model.ToolsCapable, SourceID: model.SourceID}
+			if meta, ok := keyMeta[model.SourceID]; ok && len(meta.keys) > 0 {
+				// 按模型过滤可服务该模型的 key（多 key 权限发现）：不在任何 key 的
+				// 启用/拉取集合内的模型没有可用 key，该候选从组内剔除。
+				permitted := make([]string, 0, len(meta.keys))
+				for _, key := range meta.keys {
+					if key.KeyAllowsModel(model.ID) {
+						permitted = append(permitted, key.Value)
+					}
+				}
+				if len(permitted) == 0 {
+					s.logVerbose("[RouteCache] model %s (source %s) excluded: no api key in this source may serve it", model.ID, model.SourceID)
+					continue
+				}
+				ref.APIKeys = permitted
+				ref.KeyStrategy = meta.strategy
+			}
+			refs = append(refs, ref)
 		}
 		vision := group.VisionCapable
 		tools := group.ToolsCapable

@@ -1,0 +1,115 @@
+import type { ReactNode } from 'react'
+import { X } from 'lucide-react'
+import { MultiSelect, type MultiSelectOption } from '@/components/ui/multi-select'
+import { Seg } from '@/components/ui/seg'
+import { RANGE_OPTIONS } from '@/lib/range-options'
+
+export type RangeKey = '24h' | '7d' | '30d' | 'all'
+
+/**
+ * 用量页共用筛选工具栏（调用日志 + Usage 统计）：时间窗 Seg + 模型组 / 模型 /
+ * 模型源 / 调用方筛选胶囊。单行紧凑布局，窄屏 flex-wrap 换行为小胶囊而非
+ * 堆叠的大配置框；任一维度激活时提供一键「清除筛选」。页面专属筛选控件经
+ * children 追加，右侧汇总/指示区经 right 提供。
+ */
+export function UsageFilterBar({
+  range,
+  onRangeChange,
+  groupOptions,
+  modelOptions,
+  keyOptions,
+  sourceOptions,
+  groupNames,
+  onGroupNamesChange,
+  modelNames,
+  onModelNamesChange,
+  sourceIds,
+  onSourceIdsChange,
+  keyNames,
+  onKeyNamesChange,
+  children,
+  right,
+}: {
+  range: RangeKey
+  onRangeChange: (value: RangeKey) => void
+  groupOptions: (string | MultiSelectOption)[]
+  modelOptions: (string | MultiSelectOption)[]
+  keyOptions: (string | MultiSelectOption)[]
+  /** 启用源选项（value 必须是 source id，同名源才能区分）；为空则不显示源筛选。 */
+  sourceOptions: (string | MultiSelectOption)[]
+  groupNames: string[]
+  onGroupNamesChange: (value: string[]) => void
+  modelNames: string[]
+  onModelNamesChange: (value: string[]) => void
+  sourceIds: string[]
+  onSourceIdsChange: (value: string[]) => void
+  keyNames: string[]
+  onKeyNamesChange: (value: string[]) => void
+  /** 页面专属筛选控件（追加在调用方之后）。 */
+  children?: ReactNode
+  /** 右侧区域（汇总图例 / 更新指示）。 */
+  right?: ReactNode
+}) {
+  const hasFilters =
+    groupNames.length > 0 || modelNames.length > 0 || sourceIds.length > 0 || keyNames.length > 0
+
+  return (
+    <div className="flex flex-wrap items-center gap-x-2.5 gap-y-2">
+      <Seg
+        aria-label="时间窗"
+        className="h-[34px]"
+        options={RANGE_OPTIONS}
+        value={range}
+        onChange={onRangeChange}
+      />
+      <span className="h-5 w-px bg-border/70" aria-hidden />
+      <MultiSelect
+        label="模型组"
+        options={groupOptions}
+        value={groupNames}
+        onChange={onGroupNamesChange}
+        searchPlaceholder="搜索模型组"
+      />
+      <MultiSelect
+        label="模型"
+        options={modelOptions}
+        value={modelNames}
+        onChange={onModelNamesChange}
+        searchPlaceholder="搜索模型"
+      />
+      {sourceOptions.length > 0 && (
+        <MultiSelect
+          label="模型源"
+          options={sourceOptions}
+          value={sourceIds}
+          onChange={onSourceIdsChange}
+          searchPlaceholder="搜索模型源"
+        />
+      )}
+      <MultiSelect
+        label="调用方"
+        options={keyOptions}
+        value={keyNames}
+        onChange={onKeyNamesChange}
+        searchPlaceholder="搜索调用方"
+      />
+      {children}
+      {hasFilters && (
+        <button
+          type="button"
+          onClick={() => {
+            onGroupNamesChange([])
+            onModelNamesChange([])
+            onSourceIdsChange([])
+            onKeyNamesChange([])
+          }}
+          className="flex h-[34px] items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors duration-150 hover:bg-wash hover:text-rose focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <X className="h-3.5 w-3.5" />
+          清除筛选
+        </button>
+      )}
+      {right ? <div className="ml-auto pl-1">{right}</div> : null}
+    </div>
+  )
+}

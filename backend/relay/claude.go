@@ -5,8 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
-	"time"
+		"time"
 )
 
 // ========== Claude Adapter ==========
@@ -28,7 +27,7 @@ func (a *ClaudeAdapter) SetTimeout(d time.Duration) { a.client.SetTimeout(d) }
 // SendRequest 向 Claude /v1/messages 发送请求，返回原始 HTTP 响应。
 // ctx 传播客户端取消信号（断连即中止上游调用）。
 func (a *ClaudeAdapter) SendRequest(ctx context.Context, baseUrl, apiKey string, body []byte, isStream bool) (*http.Response, error) {
-	url := strings.TrimRight(strings.TrimSpace(baseUrl), "/") + "/v1/messages"
+	url := joinBasePath(baseUrl, "/v1/messages")
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -66,6 +65,36 @@ type ClaudeContent struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   any             `json:"content,omitempty"`
 	Source    map[string]any  `json:"source,omitempty"`
+	// Citations：text block 的引用标注（web_search_result_location 等），
+	// 原样往返，不做跨协议语义翻译。
+	Citations json.RawMessage `json:"citations,omitempty"`
+
+	// RawFields：块的完整原始对象（UnmarshalJSON 捕获）。server_tool_use /
+	// web_search_tool_result 等服务端工具块没有类型化字段，往返必须整块
+	// 原样搬运（MarshalJSON 时以原始对象为底、类型化字段覆盖）。
+	RawFields map[string]any `json:"-"`
+}
+
+// UnmarshalJSON 在类型化解码之外捕获完整原始块。
+func (c *ClaudeContent) UnmarshalJSON(data []byte) error {
+	type alias ClaudeContent
+	var typed alias
+	if err := json.Unmarshal(data, &typed); err != nil {
+		return err
+	}
+	*c = ClaudeContent(typed)
+	var raw map[string]any
+	if json.Unmarshal(data, &raw) == nil {
+		c.RawFields = raw
+	}
+	return nil
+}
+
+// MarshalJSON 以 RawFields 为底、非空类型化字段覆盖其上：服务端工具块的
+	// 载荷完整保留；常规块退化为普通结构体序列化。
+func (c ClaudeContent) MarshalJSON() ([]byte, error) {
+	type alias ClaudeContent
+	return mergeRawOverTyped(c.RawFields, alias(c))
 }
 
 type ClaudeUsage struct {
@@ -121,119 +150,6 @@ func openAIFinishReasonToClaude(reason string) string {
 }
 
 // ConvertClaudeResponseToOpenAI 将 Claude 响应转换为 OpenAI 格式
-func ConvertClaudeResponseToOpenAI(claudeResp *ClaudeResponse) *OpenAIResponse {
-	var textContent strings.Builder
-	var toolCalls []map[string]interface{}
 
-	for _, block := range claudeResp.Content {
-		switch block.Type {
-		case "text":
-			textContent.WriteString(block.Text)
-		case "tool_use":
-			toolCall := map[string]interface{}{
-				"id":   block.ID,
-				"type": "function",
-				"function": map[string]interface{}{
-					"name":      block.Name,
-					"arguments": string(block.Input),
-				},
-			}
-			toolCalls = append(toolCalls, toolCall)
-		}
-	}
-
-	message := Message{
-		Role:    "assistant",
-		Content: textContent.String(),
-	}
-	if len(toolCalls) > 0 {
-		for _, toolCall := range toolCalls {
-			function, _ := toolCall["function"].(map[string]interface{})
-			message.ToolCalls = append(message.ToolCalls, OpenAIToolCall{
-				ID:   stringFromMap(toolCall, "id"),
-				Type: stringFromMap(toolCall, "type"),
-				Function: OpenAIToolFunction{
-					Name:      stringFromMap(function, "name"),
-					Arguments: stringFromMap(function, "arguments"),
-				},
-			})
-		}
-	}
-
-	finishReason := claudeStopReasonToOpenAI(claudeResp.StopReason)
-
-	return &OpenAIResponse{
-		ID:      claudeResp.ID,
-		Object:  "chat.completion",
-		Created: 0,
-		Model:   claudeResp.Model,
-		Choices: []Choice{
-			{
-				Index:        0,
-				Message:      message,
-				FinishReason: finishReason,
-			},
-		},
-		Usage: Usage{
-			PromptTokens:     claudeResp.Usage.InputTokens,
-			CompletionTokens: claudeResp.Usage.OutputTokens,
-			TotalTokens:      claudeResp.Usage.InputTokens + claudeResp.Usage.OutputTokens,
-		},
-	}
-}
-
-func stringFromMap(m map[string]interface{}, key string) string {
-	if m == nil {
-		return ""
-	}
-	value, _ := m[key].(string)
-	return value
-}
 
 // ConvertOpenAIResponseToClaude 将 OpenAI 响应转换为 Claude 原生格式
-func ConvertOpenAIResponseToClaude(oaiResp *OpenAIResponse) *ClaudeResponse {
-	var content []ClaudeContent
-	stopReason := "end_turn"
-
-	if len(oaiResp.Choices) > 0 {
-		choice := oaiResp.Choices[0]
-		stopReason = openAIFinishReasonToClaude(choice.FinishReason)
-
-		if text, ok := choice.Message.Content.(string); ok && text != "" {
-			content = append(content, ClaudeContent{Type: "text", Text: text})
-		}
-
-		if len(choice.Message.ToolCalls) > 0 {
-			stopReason = "tool_use"
-			for _, toolCall := range choice.Message.ToolCalls {
-				input := json.RawMessage([]byte("{}"))
-				if strings.TrimSpace(toolCall.Function.Arguments) != "" {
-					input = json.RawMessage(toolCall.Function.Arguments)
-				}
-				content = append(content, ClaudeContent{
-					Type:  "tool_use",
-					ID:    toolCall.ID,
-					Name:  toolCall.Function.Name,
-					Input: input,
-				})
-			}
-		}
-	}
-
-	if len(content) == 0 {
-		content = []ClaudeContent{{Type: "text", Text: ""}}
-	}
-
-	return &ClaudeResponse{
-		ID:         oaiResp.ID,
-		Type:       "message",
-		Role:       "assistant",
-		Content:    content,
-		Model:      oaiResp.Model,
-		StopReason: stopReason,
-		Usage: ClaudeUsage{
-			InputTokens:  oaiResp.Usage.PromptTokens,
-			OutputTokens: oaiResp.Usage.CompletionTokens,
-		},
-	}
-}

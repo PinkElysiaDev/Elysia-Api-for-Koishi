@@ -37,8 +37,8 @@ func TestFetchClaudeModelsViaV1Models(t *testing.T) {
 
 	s := newRefreshTestServer(t)
 	models, err := s.fetchClaudeModels(context.Background(), storage.ModelSource{
-		Name: "claude-relay", BaseURL: srv.URL, Platform: "claude", APIKey: "sk-ant-xxx", Enabled: true,
-	})
+		Name: "claude-relay", BaseURL: srv.URL, Platform: "claude", Enabled: true,
+	}, "sk-ant-xxx")
 	if err != nil {
 		t.Fatalf("fetchClaudeModels error: %v", err)
 	}
@@ -68,8 +68,8 @@ func TestFetchClaudeModelsBearerFallback(t *testing.T) {
 
 	s := newRefreshTestServer(t)
 	models, err := s.fetchClaudeModels(context.Background(), storage.ModelSource{
-		Name: "relay", BaseURL: srv.URL, Platform: "claude", APIKey: "sk-relay", Enabled: true,
-	})
+		Name: "relay", BaseURL: srv.URL, Platform: "claude", Enabled: true,
+	}, "sk-relay")
 	if err != nil {
 		t.Fatalf("expected bearer fallback to succeed, got: %v", err)
 	}
@@ -97,8 +97,8 @@ func TestFetchGeminiModelsViaV1BetaModels(t *testing.T) {
 
 	s := newRefreshTestServer(t)
 	models, err := s.fetchGeminiModels(context.Background(), storage.ModelSource{
-		Name: "gemini-relay", BaseURL: srv.URL, Platform: "gemini", APIKey: "gem-key", Enabled: true,
-	})
+		Name: "gemini-relay", BaseURL: srv.URL, Platform: "gemini", Enabled: true,
+	}, "gem-key")
 	if err != nil {
 		t.Fatalf("fetchGeminiModels error: %v", err)
 	}
@@ -122,7 +122,8 @@ func TestFetchGeminiModelsViaV1BetaModels(t *testing.T) {
 	}
 }
 
-// #1: 全量刷新时单源失败不阻塞其他源，错误被收集返回。
+// #1: 后台拉取任务互不阻塞：一个源上游 500 失败，不影响另一个源成功合并，
+// 各自结果落在 refreshState 上。
 func TestRefreshAllSourcesFaultTolerant(t *testing.T) {
 	ctx := context.Background()
 	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -144,15 +145,24 @@ func TestRefreshAllSourcesFaultTolerant(t *testing.T) {
 		t.Fatalf("upsert bad: %v", err)
 	}
 
-	count, failures, err := s.refreshAllSources(ctx)
-	if err != nil {
-		t.Fatalf("refreshAllSources should not hard-error: %v", err)
+	if started, _, err := s.startSourceRefreshByID(ctx, "good"); !started || err != nil {
+		t.Fatalf("good job should start: %v %v", started, err)
 	}
-	if count != 2 {
-		t.Fatalf("expected 2 models from good source, got %d", count)
+	if started, _, err := s.startSourceRefreshByID(ctx, "bad"); !started || err != nil {
+		t.Fatalf("bad job should start: %v %v", started, err)
 	}
-	if len(failures) != 1 || failures[0].SourceID != "bad" {
-		t.Fatalf("expected exactly the bad source to fail, got %+v", failures)
+	waitForSourceRefreshDone(t, s, "good")
+	waitForSourceRefreshDone(t, s, "bad")
+
+	models, err := s.store.ListModels(ctx)
+	if err != nil || len(models) != 2 {
+		t.Fatalf("expected 2 models from good source, got %d (%v)", len(models), err)
+	}
+	if state := s.sourceRefreshStateOf("good"); state.LastCount != 2 || state.LastError != "" {
+		t.Fatalf("good source state wrong: %+v", state)
+	}
+	if state := s.sourceRefreshStateOf("bad"); state.LastError == "" {
+		t.Fatalf("bad source must record its error: %+v", state)
 	}
 }
 
@@ -176,7 +186,7 @@ func TestRefreshEmptyModelListKeepsExistingModels(t *testing.T) {
 		t.Fatalf("seed models: %v", err)
 	}
 
-	if _, err := s.refreshSource(ctx, "s-empty"); err == nil {
+	if _, err := s.refreshSourceByValue(ctx, source); err == nil {
 		t.Fatal("refresh with an empty model list must surface an error")
 	}
 	models, err := s.store.ListModels(ctx)

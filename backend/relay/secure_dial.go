@@ -48,6 +48,13 @@ func secureControl(network, address string, _ syscall.RawConn) error {
 	return nil
 }
 
+// NewSecureTransport 导出带连接时 SSRF 校验的 http.Transport，供 server 层
+// 非转发出站路径（健康探测等）复用同一份拨号防护——裸 http.Client 跟随
+// 重定向时无连接级校验，可能被引到内网/元数据地址。
+func NewSecureTransport() *http.Transport {
+	return newSecureTransport()
+}
+
 // newSecureTransport 构造带连接时 SSRF 校验的 http.Transport。
 // 所有上游适配器（OpenAI/Claude/Gemini）共用，确保出站连接的目标 IP
 // 在 connect 时被校验，杜绝 rebinding 绕过。
@@ -118,6 +125,21 @@ func IsPrivateOrRestrictedIP(ip net.IP) bool {
 			return true
 		}
 		if ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 { // fe80::/10 link local
+			return true
+		}
+		// IPv6 过渡范围会在 IPv6 报文里内嵌一个 IPv4 地址，To4() 对它们返回
+		// nil（非 v4 映射形式），从而绕过上面的 v4 限制表——解包内嵌地址后
+		// 递归走一遍 v4 判定（例如 2002:a9fe:a9fe:: 内嵌 169.254.169.254
+		// 云元数据地址）。
+		var embedded net.IP
+		if ip[0] == 0x20 && ip[1] == 0x02 { // 2002::/16 6to4：字节 2-5
+			embedded = net.IPv4(ip[2], ip[3], ip[4], ip[5])
+		} else if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b { // 64:ff9b::/96 NAT64：字节 12-15
+			embedded = net.IPv4(ip[12], ip[13], ip[14], ip[15])
+		} else if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00 { // 2001::/32 Teredo：字节 12-15 取反
+			embedded = net.IPv4(^ip[12], ^ip[13], ^ip[14], ^ip[15])
+		}
+		if embedded != nil && IsPrivateOrRestrictedIP(embedded) {
 			return true
 		}
 	}

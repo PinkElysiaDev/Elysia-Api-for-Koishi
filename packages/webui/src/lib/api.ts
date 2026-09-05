@@ -1,6 +1,10 @@
 import { clearToken, getToken } from './auth'
 import type {
   ApiResult,
+  UsageTrendPoint,
+  UsageModelStat,
+  UsagePulseResult,
+  UsageModelDailyPoint,
   ApiToken,
   Health,
   Model,
@@ -132,15 +136,64 @@ export const api = {
   createSource: (body: ModelSource) => request<ModelSource>('/model-sources', { method: 'POST', body }),
   updateSource: (id: string, body: ModelSource) =>
     request<ModelSource>(`/model-sources/${encodeURIComponent(id)}`, { method: 'PUT', body }),
+  /** 仅切换源启停：轻量端点，不触发整源保存附带的模型自动同步。 */
+  setSourceEnabled: (id: string, enabled: boolean) =>
+    request<{ updated: boolean; enabled: boolean }>(`/model-sources/${encodeURIComponent(id)}/enabled`, {
+      method: 'PATCH',
+      body: { enabled },
+    }),
   deleteSource: (id: string) =>
     request<{ deleted: boolean }>(`/model-sources/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** 发起源的后台模型拉取：立即返回，进度与结果经源列表的 refreshState 轮询。 */
   fetchSource: (id: string) =>
-    request<{ refreshed: boolean; count: number }>(`/model-sources/${encodeURIComponent(id)}/fetch`, {
-      method: 'POST',
-    }),
+    request<{ started: boolean; alreadyRunning?: boolean }>(
+      `/model-sources/${encodeURIComponent(id)}/fetch`,
+      { method: 'POST' },
+    ),
 
-  listModels: () => request<ListEnvelope<Model>>('/models').then((r) => r.items ?? []),
-  refreshModels: () => request<{ refreshed: boolean; count: number }>('/models/refresh', { method: 'POST' }),
+  modelCatalogStatus: () =>
+    request<{
+      enabled: boolean
+      url: string
+      entries: number
+      syncIntervalMinutes?: number
+      /** 数据来源：snapshot（内置快照）/ cache（落盘缓存）/ network（在线更新）。 */
+      source?: string
+      sourceURL?: string
+      lastSync?: string
+      lastError?: string
+    }>('/model-catalog/status'),
+  modelCatalogRefresh: () =>
+    request<{
+      refreshed: boolean
+      status: {
+        enabled: boolean
+        url: string
+        entries: number
+        syncIntervalMinutes?: number
+        source?: string
+        sourceURL?: string
+        lastSync?: string | null
+        lastError?: string
+      }
+    }>('/model-catalog/refresh', { method: 'POST' }),
+
+  listModels: (params?: { sourceId?: string; search?: string }) =>
+    request<ListEnvelope<Model>>('/models', {
+      query: params && { sourceId: params.sourceId, search: params.search },
+    }).then((r) => r.items ?? []),
+  /** 为所有启用源发起后台拉取：立即返回启动数量，进度见各源 refreshState。 */
+  refreshModels: () =>
+    request<{ started: number; total: number }>('/models/refresh', { method: 'POST' }),
+  updateModel: (sourceId: string, modelId: string, body: Partial<Omit<Model, 'id' | 'sourceId'>>) =>
+    request<{ updated: boolean }>(
+      `/models/${encodeURIComponent(sourceId)}/${encodeURIComponent(modelId)}`,
+      { method: 'PATCH', body },
+    ),
+  deleteModel: (sourceId: string, modelId: string) =>
+    request<{ deleted: boolean }>(`/models/${encodeURIComponent(sourceId)}/${encodeURIComponent(modelId)}`, {
+      method: 'DELETE',
+    }),
 
   listGroups: () =>
     request<ListEnvelope<ModelGroup>>('/model-groups').then((r) =>
@@ -151,6 +204,16 @@ export const api = {
     request<ModelGroup>(`/model-groups/${encodeURIComponent(id)}`, { method: 'PUT', body }),
   deleteGroup: (id: string) =>
     request<{ deleted: boolean }>(`/model-groups/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  addGroupMembers: (id: string, models: string[]) =>
+    request<{ added: number }>(`/model-groups/${encodeURIComponent(id)}/models`, {
+      method: 'POST',
+      body: { models },
+    }),
+  removeGroupMembers: (id: string, models: string[]) =>
+    request<{ removed: number }>(`/model-groups/${encodeURIComponent(id)}/models`, {
+      method: 'DELETE',
+      body: { models },
+    }),
 
   listTokens: () => request<ListEnvelope<ApiToken>>('/api-tokens').then((r) => r.items ?? []),
   revealToken: (name: string) =>
@@ -162,8 +225,27 @@ export const api = {
     request<{ deleted: boolean }>(`/api-tokens/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 
   usageStats: (params: UsageQueryParams) => request<UsageStats>('/usage/stats', { query: serializeUsage(params) }),
+  usageTrend: (params: UsageQueryParams & { utcOffsetMinutes: number }) =>
+    request<UsageTrendPoint[]>('/usage/trend', {
+      query: { ...serializeUsage(params), utcOffsetMinutes: params.utcOffsetMinutes },
+    }),
+  usageByModel: (params: UsageQueryParams) =>
+    request<UsageModelStat[]>('/usage/by-model', { query: serializeUsage(params) }),
+  usagePulse: (params: UsageQueryParams & { utcOffsetMinutes: number; bucketMinutes: number }) =>
+    request<UsagePulseResult>('/usage/pulse', {
+      query: {
+        ...serializeUsage(params),
+        utcOffsetMinutes: params.utcOffsetMinutes,
+        bucketMinutes: params.bucketMinutes,
+      },
+    }),
+  usageByModelDaily: (params: UsageQueryParams & { utcOffsetMinutes: number; top?: number }) =>
+    request<UsageModelDailyPoint[]>('/usage/by-model-daily', {
+      query: { ...serializeUsage(params), utcOffsetMinutes: params.utcOffsetMinutes, top: params.top },
+    }),
   usageLogs: (params: UsageQueryParams) => request<UsageLogsResult>('/usage/logs', { query: serializeUsage(params) }),
   usageLogDetail: (id: string) => request<UsageLogDetail>(`/usage/logs/${encodeURIComponent(id)}`),
+  usageSeq: () => request<{ seq: number }>('/usage/seq'),
   usageReset: () => request<unknown>('/usage/reset', { method: 'POST' }),
 
   systemLogs: (params: { limit?: number; offset?: number; level?: string }) =>
@@ -180,11 +262,13 @@ function serializeUsage(params: UsageQueryParams): Record<string, QueryValue> {
     keyHash: params.keyHash,
     groupName: params.groupName,
     modelName: params.modelName,
+    status: params.status,
     statusCode: params.statusCode || undefined,
     // 多选数组按重复参数发送（keyName/groupName/modelName），后端用 QueryArray 读取。
     ...(params.keyNames?.length ? { keyName: params.keyNames } : {}),
     ...(params.groupNames?.length ? { groupName: params.groupNames } : {}),
     ...(params.modelNames?.length ? { modelName: params.modelNames } : {}),
+    ...(params.sourceIds?.length ? { sourceId: params.sourceIds } : {}),
   }
 }
 

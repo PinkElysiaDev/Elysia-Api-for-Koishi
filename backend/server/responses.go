@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -34,19 +35,19 @@ func (s *Server) responses(c *gin.Context) {
 		return
 	}
 
-	canonicalReq, originalResponsesReq, err := relay.ResponsesRequestToCanonical(bodyBytes)
+	maheshvaraReq, originalResponsesReq, err := relay.OpenAIResponsesToMaheshvara(bodyBytes)
 	if err != nil {
 		s.failRequestTyped(c, record, startTime, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
 	// 模型组级访问权限：先于 validateModelGroup 校验，越权即使目标组为空也返回 403。
-	if !s.tokenAllowsGroup(c, canonicalReq.Model) {
-		s.failRequestTyped(c, record, startTime, http.StatusForbidden, "permission_error", fmt.Sprintf("api key is not allowed to access model group '%s'", canonicalReq.Model))
+	if !s.tokenAllowsGroup(c, maheshvaraReq.Model) {
+		s.failRequestTyped(c, record, startTime, http.StatusForbidden, "permission_error", fmt.Sprintf("api key is not allowed to access model group '%s'", maheshvaraReq.Model))
 		return
 	}
 
-	group, err := s.validateModelGroup(canonicalReq.Model)
+	group, err := s.validateModelGroup(maheshvaraReq.Model)
 	if err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -70,15 +71,27 @@ func (s *Server) responses(c *gin.Context) {
 	if sticky := s.affinity.get(record.KeyHash, group.ID, startTime); sticky != "" {
 		candidates = applyAffinity(candidates, sticky)
 	}
-	filteredVision, filteredVisionParts := filterCanonicalVisionInputsIfNeeded(group, canonicalReq)
+	// 组内候选软过滤（方向2）：与 chatCompletions 入口对齐。
+	candidates = reorderCandidatesByRequestNeeds(candidates,
+		maheshvaraRequestHasMultimodalInput(maheshvaraReq), maheshvaraRequestUsesTools(maheshvaraReq))
+	// 多 key 展开（方向6）：与 chatCompletions 入口对齐。
+	candidates = s.expandCandidatesByKeyStrategy(candidates)
+	// 组级 tools 能力落地（方向2）：携带工具的请求对不支持工具的组直接 400。
+	if rejectToolRequestsIfNeeded(group, maheshvaraReq) {
+		s.failRequestTyped(c, record, startTime, http.StatusBadRequest, "invalid_request_error",
+			fmt.Sprintf("model group '%s' does not support tool calling, but the request contains tools or tool messages", group.Name))
+		return
+	}
+	filteredVision, filteredVisionParts, filteredModalities := filterMaheshvaraMultimodalInputsIfNeeded(group, maheshvaraReq)
 	if filteredVision {
-		s.logVerbose("[Maheshvara Vision Filter] group=%s filteredImageParts=%d", group.Name, filteredVisionParts)
+		s.logVerbose("[Maheshvara Multimodal Filter] group=%s filteredParts=%d modalities=%v", group.Name, filteredVisionParts, filteredModalities)
+		c.Writer.Header().Set("X-Elysia-Filtered-Modalities", strings.Join(filteredModalities, ","))
 	}
 
-	estimatedUsage := estimateCanonicalRequestUsage(canonicalReq, s.config.GetUsageConfig())
+	estimatedUsage := estimateMaheshvaraRequestUsage(maheshvaraReq, s.config.GetUsageConfig())
 	estimatedTokens := estimatedUsage.EstimatedTotalTokens
-	record.Usage = usageTokenUsageFromCanonical(estimatedUsage)
-	record.UsageDetail = usageDetailFromCanonical(estimatedUsage)
+	record.Usage = usageTokenUsageFromMaheshvara(estimatedUsage)
+	record.UsageDetail = usageDetailFromMaheshvara(estimatedUsage)
 	record.UsageSource = estimatedUsage.Source
 
 	releaseLimiter, err := s.acquireRateLimit(group, estimatedTokens)
@@ -116,7 +129,7 @@ func (s *Server) responses(c *gin.Context) {
 
 		targetPlatform := relay.DetectPlatform(selectedModel.BaseURL, selectedModel.Platform)
 		setRecordModel(record, selectedModel, targetPlatform)
-		canonicalReq.Model = selectedModel.Name
+		maheshvaraReq.Model = selectedModel.Name
 
 		targetFormat, responsesMode, err := selectResponsesTargetFormat(selectedModel, targetPlatform, responsesCfg)
 		if err != nil {
@@ -140,7 +153,7 @@ func (s *Server) responses(c *gin.Context) {
 			transformedFormat, ok := transformedResponsesTargetFormat(selectedModel, targetPlatform)
 			if !ok || transformedFormat == relay.FormatResponses {
 				lastStatus = http.StatusBadRequest
-				lastErr = "Responses target cannot represent the filtered canonical vision input"
+				lastErr = "Responses target cannot represent the filtered maheshvara vision input"
 				s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
 				if isLast {
 					record.StatusCode = lastStatus
@@ -154,7 +167,7 @@ func (s *Server) responses(c *gin.Context) {
 				continue
 			}
 			targetFormat = transformedFormat
-			responsesMode = "transformed_responses"
+			responsesMode = ResponsesModeTransformed
 		}
 
 		if relay.IsCustomPlatform(targetPlatform) {
@@ -168,26 +181,26 @@ func (s *Server) responses(c *gin.Context) {
 		}
 		record.RelayMode = responsesMode
 		record.ResponsesMode = responsesMode
-		record.ConversionChain = []string{"openai_responses_request", "canonical_request", string(targetFormat) + "_request"}
+		record.ConversionChain = []string{"openai_responses_request", "maheshvara_request", string(targetFormat) + "_request"}
 
 		// 上游原生支持 Responses API（targetFormat == responses，即同协议）且未发生
 		// 视觉过滤时，以原始请求体为基底零转换透传，保留 reasoning/function_call 等富字段。
 		var targetBody []byte
 		var customRequest *relay.CustomProtocolRequestResult
 		if relay.IsCustomPlatform(targetPlatform) {
-			customRequest, err = relay.RenderRegisteredCustomProtocolRequest(canonicalReq, relay.CustomProtocolID(targetPlatform))
+			customRequest, err = relay.RenderRegisteredCustomProtocolRequest(maheshvaraReq, relay.CustomProtocolID(targetPlatform))
 			if customRequest != nil {
 				targetBody = customRequest.Body
 			}
 		} else if targetFormat == relay.FormatResponses && !filteredVision {
 			targetBody, err = relay.ResponsesPassthroughBody(bodyBytes, selectedModel.Name)
 			if err == nil {
-				record.RelayMode = "passthrough"
+				record.RelayMode = RelayModePassthrough
 			}
 		} else {
-			targetBody, err = relay.CanonicalToTargetRequest(canonicalReq, targetFormat, originalResponsesReq)
+			targetBody, err = relay.MaheshvaraToTargetRequest(maheshvaraReq, targetFormat, originalResponsesReq)
 			if err == nil {
-				record.RelayMode = "transform"
+				record.RelayMode = RelayModeTransform
 			}
 		}
 		if err != nil {
@@ -208,7 +221,7 @@ func (s *Server) responses(c *gin.Context) {
 		record.OutgoingBody = sanitizeUsageBody(targetBody)
 
 		var outcome relayOutcome
-		if canonicalReq.Stream {
+		if maheshvaraReq.Stream {
 			record.Stream = true
 			outcome = s.handleResponsesStream(c, group, selectedModel, targetBody, customRequest, targetPlatform, targetFormat, startTime, estimatedTokens, record, isLast)
 		} else {
@@ -227,7 +240,13 @@ func (s *Server) responses(c *gin.Context) {
 		lastErr = outcome.errMsg
 		s.appendRetryEvent(record, attempt, selectedModel.Name, outcome.errMsg)
 		if !isLast && group.RetryInterval > 0 {
-			time.Sleep(time.Duration(group.RetryInterval) * time.Millisecond)
+			// 尊重客户端取消：被放弃的请求不再空耗等待 + 对剩余候选扇出。
+			select {
+			case <-c.Request.Context().Done():
+				committed = true
+				return
+			case <-time.After(time.Duration(group.RetryInterval) * time.Millisecond):
+			}
 		}
 	}
 
@@ -278,7 +297,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 		s.recordUsage(record)
 	}()
 
-	var canonicalResp *relay.CanonicalResponse
+	var maheshvaraResp *relay.MaheshvaraResponse
 
 	switch targetFormat {
 	case relay.FormatResponses:
@@ -292,14 +311,14 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 			result = failResult(status, err.Error(), respBody)
 			return result
 		}
-		canonicalResp, err = relay.ResponsesResponseToCanonical(responsesResp)
+		maheshvaraResp, err = relay.OpenAIResponsesResponseToMaheshvara(responsesResp)
 		if err != nil {
 			result = failResult(http.StatusInternalServerError, err.Error(), nil)
 			return result
 		}
 		record.ConversionChain = append(record.ConversionChain, "openai_responses_response")
-		updateRecordUsageFromCanonical(record, canonicalResp.Usage)
-		applyLocalResponseEstimate(record, extractOutputTextFromCanonicalResponse(canonicalResp), s.config.GetUsageConfig())
+		updateRecordUsageFromMaheshvara(record, maheshvaraResp.Usage)
+		applyLocalResponseEstimate(record, extractOutputTextFromMaheshvaraResponse(maheshvaraResp), s.config.GetUsageConfig())
 		actualTokens := getInt(record.Usage.TotalTokens)
 		s.adjustTokenUsage(group.ID, actualTokens)
 		record.StatusCode = http.StatusOK
@@ -326,7 +345,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 			result = failResult(http.StatusInternalServerError, err.Error(), nil)
 			return result
 		}
-		canonicalResp, err = relay.ClaudeResponseToCanonical(&claudeResp)
+		maheshvaraResp, err = relay.AnthropicResponseToMaheshvara(&claudeResp)
 		if err != nil {
 			result = failResult(http.StatusInternalServerError, err.Error(), nil)
 			return result
@@ -351,7 +370,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 			result = failResult(http.StatusInternalServerError, err.Error(), nil)
 			return result
 		}
-		canonicalResp, err = relay.GeminiResponseToCanonical(&geminiResp)
+		maheshvaraResp, err = relay.GeminiResponseToMaheshvara(&geminiResp)
 		if err != nil {
 			result = failResult(http.StatusInternalServerError, err.Error(), nil)
 			return result
@@ -367,23 +386,23 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 			result = failResult(statusCode, err.Error(), respBody)
 			return result
 		}
-		canonicalResp, err = relay.OpenAIChatResponseToCanonical(openAIResp)
+		maheshvaraResp, err = relay.OpenAIChatResponseToMaheshvara(openAIResp)
 		if err != nil {
 			result = failResult(http.StatusInternalServerError, err.Error(), nil)
 			return result
 		}
 	}
 
-	if canonicalResp.Model == "" {
-		canonicalResp.Model = selectedModel.Name
+	if maheshvaraResp.Model == "" {
+		maheshvaraResp.Model = selectedModel.Name
 	}
-	record.ConversionChain = append(record.ConversionChain, string(targetFormat)+"_response", "canonical_response", "openai_responses_response")
-	updateRecordUsageFromCanonical(record, canonicalResp.Usage)
-	applyLocalResponseEstimate(record, extractOutputTextFromCanonicalResponse(canonicalResp), s.config.GetUsageConfig())
+	record.ConversionChain = append(record.ConversionChain, string(targetFormat)+"_response", "maheshvara_response", "openai_responses_response")
+	updateRecordUsageFromMaheshvara(record, maheshvaraResp.Usage)
+	applyLocalResponseEstimate(record, extractOutputTextFromMaheshvaraResponse(maheshvaraResp), s.config.GetUsageConfig())
 	actualTokens := getInt(record.Usage.TotalTokens)
 	s.adjustTokenUsage(group.ID, actualTokens)
 
-	responsesResp, err := relay.CanonicalToResponsesResponse(canonicalResp)
+	responsesResp, err := relay.MaheshvaraToOpenAIResponsesResponse(maheshvaraResp)
 	if err != nil {
 		result = failResult(http.StatusInternalServerError, err.Error(), nil)
 		return result
@@ -408,6 +427,16 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 		record.DurationMs = time.Since(startTime).Milliseconds()
 		s.recordUsage(record)
 	}()
+
+	// upstreamErrorStatus 从错误中提取上游真实状态码：永久错误（401/403/400）
+	// 不得洗白成 502 触发全候选扇出重试。
+	upstreamErrorStatus := func(err error, fallback int) int {
+		var statusErr *relay.UpstreamStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode > 0 {
+			return statusErr.StatusCode
+		}
+		return fallback
+	}
 
 	// connFail 处理「SSE 尚未开始」的上游建连失败：可重试且非最后一次 →
 	// committed=false 让上层换下一个候选；否则写出 JSON 错误并提交。
@@ -465,12 +494,12 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 	case relay.FormatResponses:
 		resp, err := s.openaiAdapter.SendResponsesStream(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
 		if err != nil {
-			result = connFail(http.StatusBadGateway, err.Error(), nil)
+			result = connFail(upstreamErrorStatus(err, http.StatusBadGateway), err.Error(), nil)
 			return result
 		}
 		startSSE()
 		observeUpstreamUsage(resp, record, targetPlatform, targetFormat)
-		if record.RelayMode == "passthrough" {
+		if record.RelayMode == RelayModePassthrough {
 			// 同协议透传：原样转发上游 SSE，保留 reasoning_text 等
 			// provider 私有事件，不再经 Maheshvara 解码重渲染。
 			streamErr = relay.ForwardResponsesStream(c.Request.Context(), resp, writer)
@@ -512,7 +541,7 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 	default:
 		resp, err := s.openaiAdapter.SendRequestStream(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
 		if err != nil {
-			result = connFail(http.StatusBadGateway, err.Error(), nil)
+			result = connFail(upstreamErrorStatus(err, http.StatusBadGateway), err.Error(), nil)
 			return result
 		}
 		startSSE()
@@ -572,14 +601,14 @@ func selectResponsesTargetFormat(model config.ModelRef, platform relay.Platform,
 	}
 
 	if endpointSupportsResponses(model, platform) {
-		return relay.FormatResponses, "native_responses", nil
+		return relay.FormatResponses, ResponsesModeNative, nil
 	}
 
 	if mode == "native" {
-		return "", "native_responses", fmt.Errorf("selected upstream model %q does not declare Responses API support", model.Name)
+		return "", ResponsesModeNative, fmt.Errorf("selected upstream model %q does not declare Responses API support", model.Name)
 	}
 
-	if mode != "auto" && mode != "transform" {
+	if mode != "auto" && mode != RelayModeTransform {
 		return "", mode + "_responses", fmt.Errorf("unsupported Responses upstreamMode %q", responsesCfg.UpstreamMode)
 	}
 
@@ -587,7 +616,7 @@ func selectResponsesTargetFormat(model config.ModelRef, platform relay.Platform,
 	if !ok {
 		return "", mode + "_responses", fmt.Errorf("selected upstream model %q does not declare a transformable endpoint for Responses API", model.Name)
 	}
-	return targetFormat, "transformed_responses", nil
+	return targetFormat, ResponsesModeTransformed, nil
 }
 
 func transformedResponsesTargetFormat(model config.ModelRef, platform relay.Platform) (relay.FormatType, bool) {

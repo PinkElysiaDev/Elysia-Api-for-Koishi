@@ -14,7 +14,7 @@ import (
 // openAIEndpoint 用用户配置的 base URL 直接拼接端点 path。
 // 用户负责配置正确的 base URL（如 https://api.openai.com/v1），后端不做任何规范化。
 func openAIEndpoint(baseUrl, path string) string {
-	return strings.TrimRight(strings.TrimSpace(baseUrl), "/") + path
+	return joinBasePath(baseUrl, path)
 }
 
 type OpenAIAdapter struct {
@@ -123,9 +123,12 @@ type ContentPrediction struct {
 }
 
 type Message struct {
-	Role             string           `json:"role"`
-	Content          interface{}      `json:"content"`
-	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	Role             string      `json:"role"`
+	Content          interface{} `json:"content"`
+	ReasoningContent string      `json:"reasoning_content,omitempty"`
+	// ReasoningDetails 是 OpenRouter 风格的推理明细数组（reasoning.text /
+	// reasoning.encrypted 逐条成项），往返保真优于标量 reasoning_content。
+	ReasoningDetails []map[string]any `json:"reasoning_details,omitempty"`
 	Refusal          string           `json:"refusal,omitempty"`
 	Audio            interface{}      `json:"audio,omitempty"`
 	Name             string           `json:"name,omitempty"`
@@ -197,8 +200,10 @@ type OpenAIResponse struct {
 	Object  string   `json:"object"`
 	Created int64    `json:"created"`
 	Model   string   `json:"model"`
-	Choices []Choice `json:"choices"`
-	Usage   Usage    `json:"usage"`
+	// SystemFingerprint：上游的版本指纹（模型权重/配置版本标识），往返保真。
+	SystemFingerprint string   `json:"system_fingerprint,omitempty"`
+	Choices           []Choice `json:"choices"`
+	Usage             Usage    `json:"usage"`
 }
 
 type Choice struct {
@@ -216,11 +221,40 @@ type Usage struct {
 	UsageSemantic        string `json:"usage_semantic,omitempty"`
 	UsageSource          string `json:"usage_source,omitempty"`
 
-	PromptTokensDetails     PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
-	InputTokensDetails      PromptTokensDetails     `json:"input_tokens_details,omitempty"`
-	CompletionTokensDetails CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+	// details 用指针：值结构体的 omitempty 不生效（永远序列化成 {}），
+	// 会覆盖 RawFields 透传的同键子对象。
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	InputTokensDetails      *PromptTokensDetails     `json:"input_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 	InputTokens             int                     `json:"input_tokens,omitempty"`
 	OutputTokens            int                     `json:"output_tokens,omitempty"`
+
+	// RawFields：usage 的完整原始对象（UnmarshalJSON 捕获）。上游新增的
+	// 计数键在跨协议中转时不丢失——MarshalJSON 以原始对象为底、类型化
+	// 字段覆盖其上（XF5b：不重释、不丢弃）。
+	RawFields map[string]any `json:"-"`
+}
+
+// UnmarshalJSON 在类型化解码之外捕获完整原始 usage 对象。
+func (u *Usage) UnmarshalJSON(data []byte) error {
+	type alias Usage
+	var typed alias
+	if err := json.Unmarshal(data, &typed); err != nil {
+		return err
+	}
+	*u = Usage(typed)
+	var raw map[string]any
+	if json.Unmarshal(data, &raw) == nil {
+		u.RawFields = raw
+	}
+	return nil
+}
+
+// MarshalJSON 以 RawFields 为底、非空类型化字段覆盖其上：上游新增计数键
+// 原样透传；常规路径退化为普通结构体序列化。
+func (u Usage) MarshalJSON() ([]byte, error) {
+	type alias Usage
+	return mergeRawOverTyped(u.RawFields, alias(u))
 }
 
 type PromptTokensDetails struct {
@@ -401,7 +435,7 @@ func (a *OpenAIAdapter) SendRequestStream(ctx context.Context, baseUrl, apiKey s
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error: %s", string(respBody))
+		return nil, &UpstreamStatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 
 	return resp, nil
@@ -425,10 +459,22 @@ func (a *OpenAIAdapter) SendResponsesStream(ctx context.Context, baseUrl, apiKey
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error: %s", string(respBody))
+		return nil, &UpstreamStatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 
 	return resp, nil
+}
+
+// UpstreamStatusError 携带上游真实状态码：调用方据此决定对客户端的响应码
+// 与重试分类——401/403/400 等永久错误不得洗白成 502 后被当作可重试错误
+// 对全部候选扇出。
+type UpstreamStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *UpstreamStatusError) Error() string {
+	return fmt.Sprintf("API error (%d): %s", e.StatusCode, e.Body)
 }
 
 // StreamResponseWriter 流式响应写入接口

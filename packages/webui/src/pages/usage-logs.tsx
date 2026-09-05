@@ -1,38 +1,38 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import {
   AlertTriangle,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Download,
-  Eye,
+  MoveRight,
   RotateCcw,
   ScrollText,
 } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
-import { Card } from '@/components/ui/card'
+import { RoleWatermark } from '@/components/role-watermark'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { MultiSelect } from '@/components/ui/multi-select'
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Seg } from '@/components/ui/seg'
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+  Sheet,
+  SheetBody,
+  SheetContent,
+  SheetHeader,
+  SheetSectionTitle,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import { AsyncState } from '@/components/ui/states'
-import { PlatformBadge, StatusCodeBadge } from '@/components/badges'
+import { CodePill, StreamIcon } from '@/components/badges'
+import { protocolLabel } from '@/lib/protocol'
 import { CopyButton } from '@/components/copy-button'
-import { RangeSelect, type RangeKey } from '@/components/range-select'
+import { UsageFilterBar, type RangeKey } from '@/components/usage-filter-bar'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { useToast } from '@/components/ui/use-toast'
-import { useUsageLogs, useGroups, useModels, useTokens, useMinuteTick, revalidate } from '@/lib/hooks'
+import { useUsageLogs, useUsageFilterOptions, useMinuteTick, useSources, revalidate } from '@/lib/hooks'
 import { api } from '@/lib/api'
+import { colorize } from '@/lib/json-highlight'
 import type { UsageBody, UsageLogDetail } from '@/lib/types'
 import {
   cn,
@@ -40,58 +40,99 @@ import {
   formatDateTime,
   formatDuration,
   formatNumber,
-  normalizedNow,
   startOfRange,
+  bucketedTimeISO,
   tryParseJSON,
-  uniqueSorted,
 } from '@/lib/utils'
 
 const PAGE_SIZE = 20
 
+type StatusView = 'all' | 'ok' | 'fail'
+
 export function UsageLogsPage() {
   const toast = useToast()
   const { confirm, dialog } = useConfirm()
+  const location = useLocation()
+  const navigate = useNavigate()
   const [range, setRange] = useState<RangeKey>('7d')
   const [groupNames, setGroupNames] = useState<string[]>([])
   const [modelNames, setModelNames] = useState<string[]>([])
+  const [sourceIds, setSourceIds] = useState<string[]>([])
   const [keyNames, setKeyNames] = useState<string[]>([])
   const [statusCode, setStatusCode] = useState('')
+  const [statusView, setStatusView] = useState<StatusView>('all')
   const [page, setPage] = useState(0)
   const [detailId, setDetailId] = useState<string | null>(null)
   const minuteTick = useMinuteTick()
 
-  const { data: groups } = useGroups()
-  const { data: models } = useModels()
-  const { data: tokens } = useTokens()
+  // 总览「最近失败」跳转：带 openDetail 状态直接打开抽屉（一次性消费，
+  // 否则刷新页面会因 history.state 仍在而重开抽屉）。
+  useEffect(() => {
+    const open = (location.state as { openDetail?: string } | null)?.openDetail
+    if (!open) return
+    setDetailId(open)
+    navigate(location.pathname, { replace: true, state: {} })
+  }, [location.state, location.pathname, navigate])
 
-  const groupOptions = useMemo(() => uniqueSorted((groups ?? []).map((g) => g.name)), [groups])
-  const modelOptions = useMemo(() => uniqueSorted((models ?? []).map((m) => m.name)), [models])
-  const keyOptions = useMemo(() => uniqueSorted((tokens ?? []).map((t) => t.name)), [tokens])
+  const { groupOptions, modelOptions, keyOptions } = useUsageFilterOptions()
+  const { data: sources } = useSources()
+  const sourceOptions = useMemo(
+    () => (sources ?? []).filter((s) => s.enabled).map((s) => ({ value: s.id, label: s.name || s.id })),
+    [sources],
+  )
+  const sourceLabelById = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const source of sources ?? []) map.set(source.id, source.name || source.id)
+    return map
+  }, [sources])
 
   const params = useMemo(() => {
-    const to = normalizedNow()
+    // to 取下一 5 分钟边界：缓存键稳定，且当前桶内新记录能进半开区间。
+    // 相对窗起点用 now，避免临近午夜把 from 推到次日。
+    const nowMs = minuteTick * 60_000
+    const to = bucketedTimeISO(nowMs, 5 * 60_000)
     return {
-      from: startOfRange(range, to),
+      from: startOfRange(range, new Date(nowMs).toISOString()),
       to,
       groupNames: groupNames.length ? groupNames : undefined,
       modelNames: modelNames.length ? modelNames : undefined,
+      sourceIds: sourceIds.length ? sourceIds : undefined,
       keyNames: keyNames.length ? keyNames : undefined,
+      status: statusView === 'ok' ? ('success' as const) : statusView === 'fail' ? ('failed' as const) : undefined,
       statusCode: statusCode.trim() ? Number(statusCode) : undefined,
       limit: PAGE_SIZE,
       offset: page * PAGE_SIZE,
     }
-    // minuteTick 让 to 随时间推进，避免查询窗口冻结在挂载时刻。
- // eslint-disable-next-line react-hooks/exhaustive-deps -- minuteTick 驱动查询窗口随时间推进，不在回调体内使用是有意的
-  }, [range, groupNames, modelNames, keyNames, statusCode, page, minuteTick])
+  }, [range, groupNames, modelNames, sourceIds, keyNames, statusView, statusCode, page, minuteTick])
 
   const { data, isLoading, error, mutate } = useUsageLogs(params)
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
-  // total 收缩（重置/裁剪）后把超界的页码收敛回最后一页。
   useEffect(() => {
     setPage((p) => Math.min(p, totalPages - 1))
   }, [totalPages])
+
+  const items = data?.items ?? []
+
+  const summary = useMemo(() => {
+    const all = data?.items ?? []
+    const totals = all.reduce(
+      (acc, item) => {
+        if (item.statusCode >= 200 && item.statusCode < 400) acc.ok += 1
+        else acc.failed += 1
+        acc.duration += item.durationMs || 0
+        return acc
+      },
+      { ok: 0, failed: 0, duration: 0 },
+    )
+    return {
+      ok: totals.ok,
+      failed: totals.failed,
+      avg: all.length ? totals.duration / all.length : 0,
+      count: all.length,
+    }
+  }, [data])
 
   async function handleReset() {
     const okToReset = await confirm({
@@ -110,179 +151,224 @@ export function UsageLogsPage() {
     }
   }
 
-  function resetFilters() {
-    setPage(0)
+  function handleExport() {
+    if (!data?.items?.length) {
+      toast.error('没有可导出的记录')
+      return
+    }
+    downloadJSON(`usage-logs-${range}.json`, data.items)
+    toast.success('已导出当前页', `${data.items.length} 条记录`)
   }
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Usage 日志"
-        description="逐条请求记录。请求/响应体可能被截断，仅供排查参考"
-        actions={
-          <Button variant="destructive" onClick={handleReset}>
-            <RotateCcw className="h-4 w-4" /> 重置 Usage
-          </Button>
-        }
-      />
+    <>
+      <RoleWatermark className="-right-8 top-0 opacity-[0.05] dark:opacity-[0.08]" />
 
-      <Card className="p-4">
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
-          <div className="space-y-1.5">
-            <Label className="text-xs">时间范围</Label>
-            <RangeSelect
-              value={range}
-              onChange={(v) => {
-                setRange(v)
-                resetFilters()
-              }}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">模型组</Label>
-            <MultiSelect
-              options={groupOptions}
-              value={groupNames}
-              onChange={(v) => {
-                setGroupNames(v)
-                resetFilters()
-              }}
-              placeholder="全部模型组"
-              searchPlaceholder="搜索模型组"
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">模型</Label>
-            <MultiSelect
-              options={modelOptions}
-              value={modelNames}
-              onChange={(v) => {
-                setModelNames(v)
-                resetFilters()
-              }}
-              placeholder="全部模型"
-              searchPlaceholder="搜索模型"
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">调用方 API Key</Label>
-            <MultiSelect
-              options={keyOptions}
-              value={keyNames}
-              onChange={(v) => {
-                setKeyNames(v)
-                resetFilters()
-              }}
-              placeholder="全部调用方"
-              searchPlaceholder="搜索调用方"
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">状态码</Label>
-            <Input
-              value={statusCode}
-              placeholder="200 / 500"
-              onChange={(e) => {
-                setStatusCode(e.target.value.replace(/[^0-9]/g, ''))
-                resetFilters()
-              }}
-            />
-          </div>
-        </div>
-      </Card>
+      <div className="relative z-[1] space-y-6">
+        <PageHeader
+          title="调用日志"
+          actions={
+            <>
+              <Button onClick={handleExport}>
+                <Download className="h-4 w-4" /> 导出日志
+              </Button>
+              <Button variant="danger" onClick={handleReset}>
+                <RotateCcw className="h-4 w-4" /> 重置用量
+              </Button>
+            </>
+          }
+        />
 
-      <Card>
+        {/* 共用筛选条（含模型源维度）+ 页面专属状态筛选 + 汇总图例 */}
+        <UsageFilterBar
+          range={range}
+          onRangeChange={(v) => {
+            setRange(v)
+            setPage(0)
+          }}
+          groupOptions={groupOptions}
+          modelOptions={modelOptions}
+          keyOptions={keyOptions}
+          sourceOptions={sourceOptions}
+          groupNames={groupNames}
+          onGroupNamesChange={(v) => {
+            setGroupNames(v)
+            setPage(0)
+          }}
+          modelNames={modelNames}
+          onModelNamesChange={(v) => {
+            setModelNames(v)
+            setPage(0)
+          }}
+          sourceIds={sourceIds}
+          onSourceIdsChange={(v) => {
+            setSourceIds(v)
+            setPage(0)
+          }}
+          keyNames={keyNames}
+          onKeyNamesChange={(v) => {
+            setKeyNames(v)
+            setPage(0)
+          }}
+          right={
+            <div className="flex items-center gap-3 text-xs font-mono">
+              <span className="tnum flex flex-wrap items-center gap-3 text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-jade" />
+                  <b className="font-semibold text-foreground">{summary.ok}</b> 成功
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-ember" />
+                  <b className="font-semibold text-foreground">{summary.failed}</b> 失败
+                </span>
+                <span>
+                  平均时延 <b className="font-semibold text-foreground">{formatDuration(summary.avg)}</b>
+                </span>
+              </span>
+              <span className="text-muted-foreground/70">（当前 {summary.count} 条）</span>
+            </div>
+          }
+        >
+          <Seg
+            aria-label="状态"
+            options={[
+              { value: 'all', label: '全部' },
+              { value: 'ok', label: '成功' },
+              { value: 'fail', label: '失败' },
+            ]}
+            value={statusView}
+            onChange={(value) => {
+              setStatusView(value)
+              setStatusCode('')
+              setPage(0)
+            }}
+          />
+          <Input
+            aria-label="状态码"
+            className="w-[84px] text-xs font-mono"
+            value={statusCode}
+            placeholder="HTTP码"
+            title="精确状态码过滤（如 429、500）"
+            onChange={(e) => {
+              const value = e.target.value.replace(/[^0-9]/g, '')
+              setStatusCode(value)
+              if (value) setStatusView('all')
+              setPage(0)
+            }}
+          />
+        </UsageFilterBar>
+
         <AsyncState
           isLoading={isLoading}
           error={error}
           data={data?.items}
           onRetry={() => mutate()}
-          loadingColumns={6}
+          loadingColumns={8}
           emptyIcon={<ScrollText className="h-7 w-7" />}
-          emptyTitle="暂无 Usage 日志"
-          emptyDescription="该时间范围内还没有请求记录。"
+          emptyTitle="暂无匹配日志记录"
+          emptyDescription="当前筛选时间与过滤条件范围内未查询到任何请求。"
         >
-          {(items) => (
-            <>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>时间</TableHead>
-                    <TableHead>模型组 / 模型</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>Token</TableHead>
-                    <TableHead>耗时</TableHead>
-                    <TableHead className="text-right">详情</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
+          {() => (
+            <div className="space-y-3">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <TableHeader className="bg-secondary/20">
+                    <TableRow className="border-b border-border/60 hover:bg-transparent">
+                      <TableHead className="py-3.5 pl-4 font-semibold text-2xs uppercase tracking-wider text-muted-foreground">请求时间</TableHead>
+                      <TableHead className="py-3.5 font-semibold text-2xs uppercase tracking-wider text-muted-foreground">调用凭证</TableHead>
+                      <TableHead className="py-3.5 font-semibold text-2xs uppercase tracking-wider text-muted-foreground">实际模型 / 路由组</TableHead>
+                      <TableHead className="py-3.5 text-center font-semibold text-2xs uppercase tracking-wider text-muted-foreground">流式</TableHead>
+                      <TableHead className="py-3.5 text-center font-semibold text-2xs uppercase tracking-wider text-muted-foreground">状态码</TableHead>
+                      <TableHead className="py-3.5 num font-semibold text-2xs uppercase tracking-wider text-muted-foreground">首字耗时</TableHead>
+                      <TableHead className="py-3.5 num font-semibold text-2xs uppercase tracking-wider text-muted-foreground">总耗时</TableHead>
+                      <TableHead className="py-3.5 pr-4 num font-semibold text-2xs uppercase tracking-wider text-muted-foreground">Tokens 输入 / 输出</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody className="divide-y divide-border/30">
                   {items.map((log) => (
-                    <TableRow key={log.requestId}>
-                      <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                    <TableRow
+                      key={log.requestId}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`查看请求 ${log.requestId} 详情`}
+                      className="cursor-pointer transition-colors hover:bg-secondary/30 focus-visible:bg-secondary/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-rose/50"
+                      onClick={() => setDetailId(log.requestId)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          setDetailId(log.requestId)
+                        }
+                      }}
+                    >
+                      <TableCell className="py-3 pl-4 whitespace-nowrap font-mono text-xs text-muted-foreground">
                         {formatDateTime(log.startedAt)}
                       </TableCell>
-                      <TableCell>
-                        <div className="font-medium">{log.groupName || '—'}</div>
-                        <div className="font-mono text-xs text-muted-foreground">{log.modelName || '—'}</div>
+                      <TableCell className="py-3 max-w-[120px] truncate text-xs font-mono text-foreground">{log.keyName || '—'}</TableCell>
+                      <TableCell className="py-3">
+                        <span className="block truncate text-xs font-semibold text-foreground">{log.modelName || '—'}</span>
+                        <span className="sub font-mono">
+                          {log.groupName || '—'}
+                          {log.sourceId ? ` · ${sourceLabelById.get(log.sourceId) || log.sourceId}` : ''}
+                        </span>
                       </TableCell>
-                      <TableCell>
-                        <div className="flex items-center gap-1.5">
-                          <StatusCodeBadge code={log.statusCode} />
-                          {log.stream && <Badge variant="outline">流式</Badge>}
-                        </div>
+                      <TableCell className="py-3 text-center">
+                        <StreamIcon streaming={log.stream} />
                       </TableCell>
-                      <TableCell className="text-sm">
-                        {formatNumber(log.totalTokens)}
-                        <div className="text-xs text-muted-foreground">
-                          ↑{formatNumber(log.inputTokens)} ↓{formatNumber(log.outputTokens)}
-                        </div>
+                      <TableCell className="py-3 text-center">
+                        <CodePill code={log.statusCode} />
                       </TableCell>
-                      <TableCell className="text-sm">{formatDuration(log.durationMs)}</TableCell>
-                      <TableCell className="text-right">
-                        <Button variant="ghost" size="iconSm" onClick={() => setDetailId(log.requestId)}>
-                          <Eye className="h-4 w-4" />
-                        </Button>
+                      <TableCell className="py-3 num">
+                        {log.firstByteMs > 0 ? formatDuration(log.firstByteMs) : '—'}
+                      </TableCell>
+                      <TableCell className="py-3 num font-medium text-foreground">{formatDuration(log.durationMs)}</TableCell>
+                      <TableCell className="py-3 pr-4 num">
+                        <span className="font-mono">↑{formatNumber(log.inputTokens)}</span>{' '}
+                        <span className="text-muted-foreground font-mono">↓{formatNumber(log.outputTokens)}</span>
                       </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
-              </Table>
+              </table>
+            </div>
 
-              <div className="flex items-center justify-between border-t border-border px-4 py-3 text-sm">
-                <span className="text-muted-foreground">
-                  共 {formatNumber(total)} 条 · 第 {page + 1}/{totalPages} 页
-                </span>
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={page === 0}
-                    onClick={() => setPage((p) => Math.max(0, p - 1))}
-                  >
-                    <ChevronLeft className="h-4 w-4" /> 上一页
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={page >= totalPages - 1}
-                    onClick={() => setPage((p) => p + 1)}
-                  >
-                    下一页 <ChevronRight className="h-4 w-4" />
-                  </Button>
-                </div>
+            {/* 分页栏 */}
+            <div className="flex items-center justify-between pt-3 text-xs text-muted-foreground border-t border-border/40">
+              <span className="tnum font-mono">
+                共 <b className="font-semibold text-foreground">{formatNumber(total)}</b> 条记录 · 第 {page + 1}/{totalPages} 页
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={page === 0}
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                >
+                  <ChevronLeft className="h-3.5 w-3.5" /> 上一页
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={page >= totalPages - 1}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  下一页 <ChevronRight className="h-3.5 w-3.5" />
+                </Button>
               </div>
-            </>
-          )}
-        </AsyncState>
-      </Card>
+            </div>
+          </div>
+        )}
+      </AsyncState>
 
-      <LogDetailDialog id={detailId} onClose={() => setDetailId(null)} />
+      <LogDetailSheet id={detailId} onClose={() => setDetailId(null)} />
       {dialog}
     </div>
+    </>
   )
 }
 
-function LogDetailDialog({ id, onClose }: { id: string | null; onClose: () => void }) {
+/* ---------------- 详情抽屉 ---------------- */
+
+function LogDetailSheet({ id, onClose }: { id: string | null; onClose: () => void }) {
   const [detail, setDetail] = useState<UsageLogDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -317,165 +403,256 @@ function LogDetailDialog({ id, onClose }: { id: string | null; onClose: () => vo
     downloadJSON(`usage-log-${detail.requestId}.json`, buildExportPayload(detail))
   }
 
-  return (
-    <Dialog open={!!id} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-3xl">
-        <DialogHeader>
-          <DialogTitle>Usage 详情</DialogTitle>
-          <DialogDescription className="flex items-center gap-1.5">
-            <AlertTriangle className="h-3.5 w-3.5 text-primary" />
-            请求 / 响应体可能被截断，并非完整内容
-          </DialogDescription>
-        </DialogHeader>
+  const usage = detail?.usage
+  // tokbar 三段：缓存命中 rose-soft / 未命中输入 rose / 输出 jade
+  const cacheHit = usage?.cacheHitTokens ?? 0
+  const inputMiss = Math.max((usage?.inputTokens ?? 0) - cacheHit, 0)
+  const output = usage?.outputTokens ?? 0
+  const tokTotal = cacheHit + inputMiss + output
+  const outputRate =
+    detail && output > 0 && detail.durationMs > 0 ? (output / (detail.durationMs / 1000)).toFixed(1) : null
 
-        {loading && <div className="skeleton h-64 rounded-xl" />}
-        {err && <p className="text-sm text-destructive">{err}</p>}
-        {!loading && !err && detail && (
-          <div className="max-h-[64vh] space-y-4 overflow-auto pr-1">
-            <LogOverview detail={detail} />
-            <LogChainSection detail={detail} />
+  return (
+    <Sheet open={!!id} onOpenChange={(open) => !open && onClose()}>
+      <SheetContent className="w-[min(640px,94vw)]">
+        <SheetHeader>
+          <div className="min-w-0 pr-8">
+            <SheetTitle>调用详情</SheetTitle>
+            <p className="mt-0.5 break-all font-mono text-xs text-muted-foreground">
+              {detail?.requestId ?? id}
+              {detail && (
+                <span className="ml-2">
+                  · {formatDateTime(detail.startedAt)}
+                </span>
+              )}
+            </p>
           </div>
-        )}
+        </SheetHeader>
+        <SheetBody>
+          {loading && <div className="skeleton h-64 rounded-md" />}
+          {err && <p className="text-sm text-ember">{err}</p>}
+          {!loading && !err && detail && (
+            <>
+              {detail.error && (
+                <div className="mb-5 flex items-start gap-2 rounded-[7px] border border-[color-mix(in_srgb,var(--ember)_35%,transparent)] bg-[color-mix(in_srgb,var(--ember)_7%,transparent)] p-3 text-sm text-ember">
+                  <AlertTriangle className="mt-0.5 h-[15px] w-[15px] shrink-0" />
+                  <span className="min-w-0 break-all">
+                    HTTP {detail.statusCode} · {detail.error}
+                  </span>
+                </div>
+              )}
 
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            关闭
-          </Button>
-          <Button onClick={handleExport} disabled={!detail}>
-            <Download className="h-4 w-4" /> 导出完整日志
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+              <section className="mb-5">
+                <SheetSectionTitle>协议链路</SheetSectionTitle>
+                <div className="flex flex-wrap items-center gap-[7px]">
+                  <span className="max-w-full break-all rounded-[5px] border border-input bg-card px-2 py-[3px] font-mono text-2xs text-muted-foreground">
+                    {protocolLabel(detail.sourceFormat || detail.inputFormat || '', 'long') || '—'}
+                  </span>
+                  <MoveRight className="h-3 w-3 text-muted-foreground" aria-hidden />
+                  <span
+                    className={cn(
+                      'max-w-full break-all rounded-[5px] border px-2 py-[3px] font-mono text-2xs',
+                      detail.sourceFormat && detail.targetFormat && detail.sourceFormat !== detail.targetFormat
+                        ? 'border-rose bg-wash text-rose'
+                        : 'border-input bg-card text-muted-foreground',
+                    )}
+                  >
+                    {protocolLabel(detail.targetFormat || detail.platform, 'long') || '—'}
+                  </span>
+                  <span className="ml-2 inline-flex items-center gap-1 font-mono text-2xs text-muted-foreground">
+                    <CopyButton value={detail.requestId} />
+                  </span>
+                </div>
+                <dl className="mt-3 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-[7px] text-xs">
+                  <dt className="whitespace-nowrap text-muted-foreground">调用方</dt>
+                  <dd className="tnum min-w-0 break-all">{detail.keyName || '—'}</dd>
+                  <dt className="whitespace-nowrap text-muted-foreground">模型组 → 命中</dt>
+                  <dd className="tnum min-w-0 break-all">
+                    {detail.groupName || '—'} → <span className="font-mono">{detail.modelName || '—'}</span>
+                  </dd>
+                  <dt className="whitespace-nowrap text-muted-foreground">平台协议</dt>
+                  <dd className="min-w-0 break-all font-mono text-xs">
+                    {protocolLabel(detail.platform || '', 'long') || '—'}
+                  </dd>
+                  <dt className="whitespace-nowrap text-muted-foreground">传输方式</dt>
+                  <dd className="tnum">{detail.stream ? '流式' : '缓冲'}</dd>
+                  <dt className="whitespace-nowrap text-muted-foreground">用量来源</dt>
+                  <dd className="min-w-0 break-all font-mono text-xs">{detail.usageSource || '—'}</dd>
+                  <dt className="whitespace-nowrap text-muted-foreground">重试次数</dt>
+                  <dd className="tnum">{detail.retryCount > 0 ? `${detail.retryCount} 次` : '无'}</dd>
+                </dl>
+              </section>
+
+              <section className="mb-5">
+                <SheetSectionTitle>耗时与用量</SheetSectionTitle>
+                <p className="tnum mb-2 flex flex-wrap gap-x-4 text-xs text-muted-foreground">
+                  <span>
+                    首字 <b className="font-semibold text-foreground">{formatDuration(detail.firstByteMs)}</b>
+                  </span>
+                  <span>
+                    总耗时 <b className="font-semibold text-foreground">{formatDuration(detail.durationMs)}</b>
+                  </span>
+                  {outputRate && (
+                    <span>
+                      输出速率 <b className="font-semibold text-foreground">{outputRate} tok/s</b>
+                    </span>
+                  )}
+                </p>
+                {tokTotal > 0 ? (
+                  <>
+                    <div className="my-2 flex h-2 overflow-hidden rounded-[5px] bg-border">
+                      {cacheHit > 0 && <i className="h-full" style={{ width: `${(cacheHit / tokTotal) * 100}%`, background: 'var(--rose-soft)' }} />}
+                      {inputMiss > 0 && <i className="h-full" style={{ width: `${(inputMiss / tokTotal) * 100}%`, background: 'var(--rose)' }} />}
+                      {output > 0 && <i className="h-full" style={{ width: `${(output / tokTotal) * 100}%`, background: 'var(--jade)' }} />}
+                    </div>
+                    <p className="tnum flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                      <span>
+                        <i className="mr-[5px] inline-block h-2 w-2 rounded-[2px] align-[-1px]" style={{ background: 'var(--rose-soft)' }} />
+                        缓存命中 {formatNumber(cacheHit)}
+                      </span>
+                      <span>
+                        <i className="mr-[5px] inline-block h-2 w-2 rounded-[2px] align-[-1px]" style={{ background: 'var(--rose)' }} />
+                        未命中输入 {formatNumber(inputMiss)}
+                      </span>
+                      <span>
+                        <i className="mr-[5px] inline-block h-2 w-2 rounded-[2px] align-[-1px]" style={{ background: 'var(--jade)' }} />
+                        输出 {formatNumber(output)}
+                      </span>
+                      <span>
+                        合计 <b className="font-semibold text-foreground">{formatNumber(tokTotal)}</b>
+                      </span>
+                      {usage?.estimated && <span className="text-amber">（估算）</span>}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    无 token 用量（embedding / 请求未完成或上游未返回 usage）。
+                  </p>
+                )}
+              </section>
+
+              {detail.retryCount > 0 && detail.retryEvents && detail.retryEvents.length > 0 && (
+                <section className="mb-5">
+                  <SheetSectionTitle>重试事件</SheetSectionTitle>
+                  <div className="flex flex-col gap-[7px] text-xs">
+                    {detail.retryEvents.map((ev, i) => (
+                      <div key={i} className="flex items-baseline gap-2.5">
+                        <span className="tnum flex h-[18px] w-[18px] shrink-0 translate-y-[3px] items-center justify-center rounded-full border border-ember font-mono text-2xs text-ember">
+                          {ev.attempt}
+                        </span>
+                        <span className="min-w-0 break-all">
+                          <span className="font-mono text-xs">{ev.model}</span>
+                          {ev.error && <span className="text-ember"> — {ev.error}</span>}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              <section className="mb-5">
+                <SheetSectionTitle>链路原文</SheetSectionTitle>
+                <ChainBodies key={detail.requestId} detail={detail} />
+                <p className="mt-2 flex items-center gap-1.5 text-2xs text-muted-foreground">
+                  <AlertTriangle className="h-3 w-3" aria-hidden />
+                  请求 / 响应体可能被截断，并非完整内容
+                </p>
+              </section>
+
+              <div className="flex justify-end gap-2.5 border-t border-border pt-4">
+                <Button variant="outline" onClick={onClose}>
+                  关闭
+                </Button>
+                <Button onClick={handleExport}>
+                  <Download /> 导出完整日志
+                </Button>
+              </div>
+            </>
+          )}
+        </SheetBody>
+      </SheetContent>
+    </Sheet>
   )
 }
 
-/** 总览字段：键值对小项。 */
-function Field({ label, children, className }: { label: string; children: React.ReactNode; className?: string }) {
-  return (
-    <div className={cn('space-y-0.5', className)}>
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="text-sm">{children}</div>
-    </div>
-  )
-}
-
-function LogOverview({ detail }: { detail: UsageLogDetail }) {
-  const u = detail.usage ?? {}
-  const sourceFmt = detail.sourceFormat || detail.inputFormat || ''
-  const targetFmt = detail.targetFormat || detail.platform || ''
-  // 透传模式：后端未做格式转换（relay_mode = "passthrough"）
-  const passthrough = detail.relayMode === 'passthrough'
-  return (
-    <div className="rounded-xl border border-border bg-background/60 p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <span className="text-sm font-medium">总览</span>
-        <StatusCodeBadge code={detail.statusCode} />
-        {detail.stream && <Badge variant="outline">流式</Badge>}
-        {passthrough && <Badge variant="outline">透传</Badge>}
-      </div>
-
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        <Field label="请求 ID">
-          <span className="inline-flex items-center gap-1">
-            <span className="font-mono text-xs">{detail.requestId}</span>
-            <CopyButton value={detail.requestId} />
-          </span>
-        </Field>
-        <Field label="协议转换" className="lg:col-span-2">
-          <span className="inline-flex flex-wrap items-center gap-1.5">
-            <PlatformBadge platform={sourceFmt || '—'} />
-            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <PlatformBadge platform={targetFmt || '—'} />
-          </span>
-        </Field>
-        <Field label="模型组">{detail.groupName || '—'}</Field>
-        <Field label="模型">
-          <span className="font-mono text-xs">{detail.modelName || '—'}</span>
-        </Field>
-        <Field label="重试次数">
-          {detail.retryCount > 0 ? `${detail.retryCount} 次` : '无'}
-        </Field>
-        <Field label="首字延迟">{formatDuration(detail.firstByteMs)}</Field>
-        <Field label="总耗时">{formatDuration(detail.durationMs)}</Field>
-        <Field label="开始时间">
-          <span className="text-xs">{formatDateTime(detail.startedAt)}</span>
-        </Field>
-        <Field label="Token 总量">{formatNumber(u.totalTokens ?? 0)}</Field>
-        <Field label="输入 / 输出">
-          ↑{formatNumber(u.inputTokens ?? 0)} ↓{formatNumber(u.outputTokens ?? 0)}
-        </Field>
-        <Field label="缓存命中">
-          {formatNumber(u.cacheHitTokens ?? 0)}
-          {u.estimated && <span className="ml-1 text-xs text-muted-foreground">(估算)</span>}
-        </Field>
-      </div>
-
-      {detail.error && (
-        <div className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
-          {detail.error}
-        </div>
-      )}
-
-      {detail.retryCount > 0 && detail.retryEvents && detail.retryEvents.length > 0 && (
-        <div className="mt-3 space-y-1">
-          <div className="text-xs text-muted-foreground">重试历史</div>
-          {detail.retryEvents.map((ev, i) => (
-            <div key={i} className="rounded-md bg-muted/40 px-2 py-1 text-xs">
-              <span className="font-medium">#{ev.attempt}</span>{' '}
-              <span className="font-mono">{ev.model}</span>
-              {ev.error && <span className="text-destructive"> — {ev.error}</span>}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** 四段链路：下游请求 → 后端转发 → 上游回传 → 返回下游，默认折叠。 */
-function LogChainSection({ detail }: { detail: UsageLogDetail }) {
-  const segments: { key: string; title: string; body: UsageBody }[] = [
+/** 四段链路原文：受控折叠动画 + JSON/SSE 着色，头部字节数 + 截断标记。 */
+function ChainBodies({ detail }: { detail: UsageLogDetail }) {
+  const [openSegments, setOpenSegments] = useState<Set<string>>(() => new Set(['incoming']))
+  const segments: { key: string; title: string; body: UsageBody | undefined }[] = [
     { key: 'incoming', title: '① 下游请求', body: detail.incomingBody },
     { key: 'outgoing', title: '② 后端转发', body: detail.outgoingBody },
     { key: 'provider', title: '③ 上游回传', body: detail.providerResponse },
     { key: 'downstream', title: '④ 返回下游', body: detail.downstreamResponse },
   ]
   return (
-    <div className="space-y-2">
-      <div className="text-sm font-medium">完整链路</div>
-      {segments.map((seg) => (
-        <ChainBlock key={seg.key} title={seg.title} body={seg.body} />
-      ))}
-    </div>
-  )
-}
-
-function ChainBlock({ title, body }: { title: string; body: UsageBody | undefined }) {
-  const [open, setOpen] = useState(false)
-  const content = body?.content ?? ''
-  const pretty = useMemo(() => prettyPrintBody(content), [content])
-
-  return (
-    <div className="rounded-xl border border-border bg-background/60">
-      <button
-        type="button"
-        className="flex w-full items-center justify-between px-4 py-2.5 text-left text-sm"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span className="flex items-center gap-2">
-          {title}
-          {body?.truncated && <Badge variant="outline">已截断</Badge>}
-          {!content && <span className="text-xs text-muted-foreground">（空）</span>}
-        </span>
-        <ChevronDown className={cn('h-4 w-4 transition-transform', open && 'rotate-180')} />
-      </button>
-      {open && content && (
-        <pre className="max-h-[40vh] overflow-auto whitespace-pre-wrap break-words border-t border-border px-4 py-3 font-mono text-xs leading-relaxed">
-          {pretty}
-        </pre>
-      )}
-    </div>
+    <>
+      {segments.map((seg) => {
+        const content = seg.body?.content ?? ''
+        const pretty = prettyPrintBody(content)
+        const open = content.length > 0 && openSegments.has(seg.key)
+        const panelId = `chain-body-${seg.key}`
+        const triggerId = `chain-trigger-${seg.key}`
+        return (
+          <div key={seg.key} className="border-t border-border first:border-t-0">
+            <button
+              type="button"
+              id={triggerId}
+              disabled={!content}
+              aria-expanded={open}
+              aria-controls={panelId}
+              className="flex w-full items-center gap-2 px-0.5 py-2.5 text-left text-sm font-medium transition-colors hover:text-rose disabled:cursor-default disabled:hover:text-inherit"
+              onClick={() => {
+                setOpenSegments((current) => {
+                  const next = new Set(current)
+                  if (next.has(seg.key)) next.delete(seg.key)
+                  else next.add(seg.key)
+                  return next
+                })
+              }}
+            >
+              <ChevronRight
+                className={cn(
+                  'h-3 w-3 shrink-0 transition-transform duration-300 ease-smooth motion-reduce:transition-none',
+                  open && 'rotate-90',
+                  !content && 'opacity-35',
+                )}
+                aria-hidden
+              />
+              {seg.title}
+              <span className="ml-auto inline-flex items-center gap-1.5 font-normal text-muted-foreground">
+                <span className="tnum font-mono text-2xs">
+                  {content ? `${(new Blob([content]).size / 1024).toFixed(1)} KB` : '空'}
+                </span>
+                {seg.body?.truncated && (
+                  <span className="rounded border border-[color-mix(in_srgb,var(--amber)_35%,transparent)] px-[5px] font-mono text-2xs text-amber">
+                    已截断
+                  </span>
+                )}
+              </span>
+            </button>
+            <div
+              id={panelId}
+              role="region"
+              aria-labelledby={triggerId}
+              aria-hidden={!open}
+              className={cn(
+                'grid transition-[grid-template-rows,opacity] duration-300 ease-smooth motion-reduce:transition-none',
+                open ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+              )}
+            >
+              <div className="min-h-0 overflow-hidden">
+                {content && (
+                  <pre
+                    className="mb-3.5 max-h-[clamp(300px,42vh,560px)] overflow-auto whitespace-pre rounded-[7px] border border-border bg-code px-3.5 py-3 font-mono text-xs leading-[1.7]"
+                    dangerouslySetInnerHTML={{ __html: colorize(pretty) }}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+        )
+      })}
+    </>
   )
 }
 
@@ -491,7 +668,6 @@ function prettyPrintBody(content: string): string {
   if (typeof parsed !== 'string') {
     return JSON.stringify(parsed, null, 2)
   }
-  // 不是整体 JSON：尝试按 SSE 事件逐条美化
   if (content.includes('data:')) {
     const blocks: string[] = []
     for (const rawLine of content.split('\n')) {
