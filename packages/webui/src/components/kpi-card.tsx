@@ -11,27 +11,20 @@ export function KpiGrid({
   children: ReactNode
   className?: string
 }) {
-  const lgCols =
-    cols === 4
-      ? 'lg:grid-cols-4'
-      : cols === 5
-        ? 'lg:grid-cols-5'
-        : cols === 6
-          ? 'lg:grid-cols-3 xl:grid-cols-6'
-          : cols === 8
-            ? 'lg:max-xl:grid-cols-4 xl:grid-cols-8'
-            : 'lg:grid-cols-5'
-  // divide-x 只跳过第一个子元素，换行后每行行首仍会留下一条竖线。
-  const rowStart =
-    cols === 4
-      ? 'lg:[&>:nth-child(4n+1)]:border-l-0 lg:[&>:nth-child(4n+1)]:pl-0'
-      : cols === 5
-        ? 'lg:[&>:nth-child(5n+1)]:border-l-0 lg:[&>:nth-child(5n+1)]:pl-0'
-        : cols === 6
-          ? 'lg:max-xl:[&>:nth-child(3n+1)]:border-l-0 lg:max-xl:[&>:nth-child(3n+1)]:pl-0 xl:[&>:nth-child(6n+1)]:border-l-0 xl:[&>:nth-child(6n+1)]:pl-0'
-          : cols === 8
-            ? 'lg:max-xl:[&>:nth-child(4n+1)]:border-l-0 lg:max-xl:[&>:nth-child(4n+1)]:pl-0 xl:[&>:nth-child(8n+1)]:border-l-0 xl:[&>:nth-child(8n+1)]:pl-0'
-            : 'lg:[&>:nth-child(5n+1)]:border-l-0 lg:[&>:nth-child(5n+1)]:pl-0'
+  // 支持的列数档位（5/8 档随旧历史页删除；divide-x 只跳过第一个子元素，
+  // 换行后每行行首仍会留一条竖线，rowStart 按档位消除行首线）。
+  const layouts: Record<number, { lgCols: string; rowStart: string }> = {
+    4: {
+      lgCols: 'lg:grid-cols-4',
+      rowStart: 'lg:[&>:nth-child(4n+1)]:border-l-0 lg:[&>:nth-child(4n+1)]:pl-0',
+    },
+    6: {
+      lgCols: 'lg:grid-cols-3 xl:grid-cols-6',
+      rowStart:
+        'lg:max-xl:[&>:nth-child(3n+1)]:border-l-0 lg:max-xl:[&>:nth-child(3n+1)]:pl-0 xl:[&>:nth-child(6n+1)]:border-l-0 xl:[&>:nth-child(6n+1)]:pl-0',
+    },
+  }
+  const { lgCols, rowStart } = layouts[cols ?? 4] ?? layouts[4]
   return (
     <div
       className={cn(
@@ -81,7 +74,7 @@ export function KpiCard({
   const isHero = variant === 'hero'
   const frame = cn(
     'group relative flex flex-col justify-between py-1.5 px-4 sm:px-6 text-left transition-all duration-200',
-    onClick && 'cursor-pointer rounded-lg hover:bg-wash/50 active:scale-[0.98]',
+    onClick && 'cursor-pointer rounded-lg hover:bg-[color-mix(in_srgb,var(--wash)_50%,transparent)] active:scale-[0.98]',
     className,
   )
   const body = (

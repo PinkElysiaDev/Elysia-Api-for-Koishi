@@ -30,6 +30,11 @@ func (s *Server) appendRetryEvent(record *usageRecord, attempt int, model, errMs
 	if attempt > record.RetryCount {
 		record.RetryCount = attempt
 	}
+	// 上限与流事件一致：保尾不保头（最后的错误最接近根因）。多 key priority
+	// 展开可让候选数远超预期，不加限会让记录随候选数线性膨胀。
+	if len(record.RetryEvents) >= RetryEventsCacheMax {
+		record.RetryEvents = append(record.RetryEvents[:0], record.RetryEvents[1:]...)
+	}
 	record.RetryEvents = append(record.RetryEvents, retryEvent{
 		Attempt: attempt,
 		Model:   model,
@@ -72,9 +77,8 @@ func orderedCandidates(group *config.ModelGroupConfig, rrStart int) []config.Mod
 	var start int
 	switch group.Strategy {
 	case "round-robin":
-		// rrStart 已由调用方按 len(models) 取模，这里再兜底 clamp，
-		// 防止外部传入越界值（高危1：索引与模型列表快照不一致）。
-		start = ((rrStart % n) + n) % n
+		// rrStart 由 nextRoundRobinIndex 产出，恒在 [0, n) 内（见其实现）。
+		start = rrStart % n
 	case "random":
 		start = rand.Intn(n)
 	default: // sequential / 未知策略
@@ -97,10 +101,8 @@ func (s *Server) nextRoundRobinIndex(groupID string, modelCount int) int {
 	}
 	s.roundRobinMutex.Lock()
 	defer s.roundRobinMutex.Unlock()
+	// map 零值 0、写入值 (idx+1)%modelCount 恒非负，无需负数钳制。
 	idx := s.roundRobinIndex[groupID] % modelCount
-	if idx < 0 {
-		idx = 0
-	}
 	s.roundRobinIndex[groupID] = (idx + 1) % modelCount
 	return idx
 }
@@ -177,10 +179,11 @@ func maheshvaraRequestHasMultimodalInput(request *relay.MaheshvaraRequest) bool 
 // 在既有故障转移循环之前把「候选 × key」展开成逐次尝试的序列，循环体无需感知 key 维度：
 //   - single（默认）        → 原样（ModelRef.APIKey，兼容旧单 key 行为）；
 //   - priority             → 每个候选按 key 列表顺序展开为多次连续尝试——失败时
-//                             先轮换同候选的下一个 key（至多 len(keys) 次），耗尽再切候选；
+//     先轮换同候选的下一个 key（至多 len(keys) 次），耗尽再切候选；
 //   - round-robin          → 每候选一次，key 取源级原子游标（同源多候选在请求内错开、
-//                             跨请求轮转；内存态，重启归零）；
+//     跨请求轮转；内存态，重启归零）；
 //   - random               → 每候选一次，key 随机选取。
+//
 // 展开后 maxAttempts 语义不变：重试预算封顶总尝试次数。
 func (s *Server) expandCandidatesByKeyStrategy(candidates []config.ModelRef) []config.ModelRef {
 	multi := false
@@ -229,10 +232,8 @@ func (s *Server) nextSourceKeyIndex(sourceID string, count int) int {
 	if s.keyRRIndex == nil {
 		s.keyRRIndex = make(map[string]int)
 	}
+	// map 零值 0、写入值 idx+1 恒非负，无需负数钳制。
 	idx := s.keyRRIndex[sourceID] % count
-	if idx < 0 {
-		idx = 0
-	}
 	s.keyRRIndex[sourceID] = idx + 1
 	return idx
 }

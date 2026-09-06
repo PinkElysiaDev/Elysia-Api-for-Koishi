@@ -1,6 +1,10 @@
 - id: bc0pa1
   name: yakumo
   config:
+    # WebUI 由 scripts/build-backend.sh 单独用 vite 构建（无 main 入口，
+    # 不能交给 yakumo-esbuild），这里显式排除，保证 yarn build 只处理插件包。
+    exclude:
+      - packages/webui
     pipeline:
       build:
         - esbuild

@@ -1,0 +1,6 @@
+import{c as s,y as i,j as o,a as n}from"./index-WNX4vMSV.js";import{r as y}from"./vendor-BYNNL6vj.js";import{C as p}from"./check-DRr3VQ5N.js";/**
+ * @license lucide-react v0.395.0 - ISC
+ *
+ * This source code is licensed under the ISC license.
+ * See the LICENSE file in the root directory of this source tree.
+ */const u=s("Copy",[["rect",{width:"14",height:"14",x:"8",y:"8",rx:"2",ry:"2",key:"17jyea"}],["path",{d:"M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2",key:"zix9uf"}]]);async function l(e){var a;if((a=navigator.clipboard)!=null&&a.writeText)try{await navigator.clipboard.writeText(e);return}catch{}const t=document.createElement("textarea");t.value=e,t.setAttribute("readonly",""),t.style.position="fixed",t.style.opacity="0",document.body.appendChild(t),t.focus(),t.select();try{if(!document.execCommand("copy"))throw new Error("execCommand copy returned false")}finally{t.remove()}}function f({value:e,...t}){const[a,r]=y.useState(!1),c=i();return o.jsx(n,{variant:"ghost",size:"iconSm",onClick:async()=>{try{await l(e),r(!0),setTimeout(()=>r(!1),1500)}catch{c.error("复制失败","当前环境剪贴板不可用，请手动选中复制")}},"aria-label":"复制",...t,children:a?o.jsx(p,{className:"h-3.5 w-3.5 text-success"}):o.jsx(u,{className:"h-3.5 w-3.5"})})}export{u as C,f as a,l as c};

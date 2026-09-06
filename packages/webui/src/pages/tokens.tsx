@@ -23,6 +23,7 @@ import { useConfirm } from '@/components/ui/confirm-dialog'
 import { useToast } from '@/components/ui/use-toast'
 import { useTokens, useGroups, revalidate } from '@/lib/hooks'
 import { api } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import { cn, formatDateTime } from '@/lib/utils'
 import type { ApiToken } from '@/lib/types'
 
@@ -126,7 +127,7 @@ export function TokensPage() {
                 </TableHeader>
                 <TableBody className="divide-y divide-border/30">
                 {tokens.map((token) => (
-                  <TableRow key={token.name} className="border-b-0 transition-colors hover:bg-secondary/30">
+                  <TableRow key={token.name} className="border-b-0">
                     <TableCell className="py-3.5 pl-4 font-medium text-foreground">{token.name}</TableCell>
                     <TableCell className="py-3.5 font-mono text-xs text-muted-foreground">
                       <span className="flex items-center gap-1.5">
@@ -218,7 +219,7 @@ function RevealCopyButton({ name, maskedToken }: { name: string; maskedToken: st
     setBusy(true)
     try {
       const token = revealed ? revealedToken : (await api.revealToken(name)).token
-      await navigator.clipboard.writeText(token)
+      await copyText(token)
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch (err) {
@@ -267,16 +268,19 @@ function TokenFormDialog({
   const [allowedGroups, setAllowedGroups] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
 
+  // 打开时初始化一次表单。deps 刻意不含 groups：对话框开着时任何
+  // model-groups 重验证（别的页面触发全局 mutate 等）都会重置表单，
+  // 清掉用户输到一半的 secret。悬空组过滤在初始化时刻快照即可。
   useEffect(() => {
     if (open) {
       setName(token?.name ?? '')
       setSecret('')
       setEnabled(token?.enabled ?? true)
-      // 过滤掉已不存在的组名（历史悬空引用），保存时不写回脏数据。
       const validNames = new Set((groups ?? []).map((g) => g.name))
       setAllowedGroups((token?.allowedGroups ?? []).filter((g) => validNames.has(g)))
     }
-  }, [open, token, groups])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, token])
 
   function toggleGroup(groupName: string) {
     setAllowedGroups((prev) =>

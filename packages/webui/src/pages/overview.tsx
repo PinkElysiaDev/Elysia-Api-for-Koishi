@@ -29,7 +29,7 @@ import {
   useMinuteTick,
 } from '@/lib/hooks'
 import type { ModelSource } from '@/lib/types'
-import { bucketedTimeISO, compactNumber, cn, formatHitRate, formatNumber, percent, startOfRange } from '@/lib/utils'
+import { bucketedTimeISO, cn, compactNumber, formatHitRate, formatNumber, percent, startOfRange, USAGE_BUCKET_MS } from '@/lib/utils'
 import type { RangeKey } from '@/components/usage-filter-bar'
 import { TemporalTrendSection } from './overview-trends'
 import { PulseSection } from './overview-pulse'
@@ -131,7 +131,7 @@ function SourceHealthScroller({
         key={`${keyPrefix}-${source.id}`}
         onClick={() => navigate('/sources', { state: { openSource: source.id } })}
         title={`查看「${source.name}」配置`}
-        className="cursor-pointer border-b border-border/30 last:border-b-0 hover:bg-wash/30 transition-colors"
+        className="cursor-pointer border-b border-border/30 last:border-b-0 hover:bg-wash transition-colors"
       >
         <td className="overflow-hidden py-3 pr-2">
           <span className="block truncate font-medium text-foreground" title={source.id}>
@@ -147,8 +147,8 @@ function SourceHealthScroller({
         <td className="overflow-hidden py-3 pl-2 text-right">
           <span
             className={cn(
-              'inline-flex min-w-[3.5rem] items-center justify-center gap-1 rounded-[5px] border px-[7px] py-0.5 text-2xs font-medium',
-              refreshing ? 'border-rose/30 bg-wash text-rose' : HEALTH_TONE[health.state],
+              'inline-flex min-w-[3.5rem] items-center justify-center gap-1 rounded-full border px-[7px] py-0.5 text-2xs font-medium',
+              refreshing ? 'border-[color:color-mix(in_srgb,var(--rose)_30%,transparent)] bg-wash text-rose' : HEALTH_TONE[health.state],
             )}
           >
             {refreshing && <RefreshCcw className="h-2.5 w-2.5 animate-spin" aria-hidden />}
@@ -219,7 +219,7 @@ export function OverviewPage() {
   // from 必须用当前时刻算本地日，不能用 ceiled to：临近午夜 to 会落到次日 00:00。
   const todayParams = useMemo(() => {
     const nowMs = minuteTick * 60_000
-    const to = bucketedTimeISO(nowMs, 5 * 60_000)
+    const to = bucketedTimeISO(nowMs, USAGE_BUCKET_MS)
     return { from: localMidnight(0, new Date(nowMs)).toISOString(), to }
   }, [minuteTick])
 
@@ -276,8 +276,9 @@ export function OverviewPage() {
   const [topRange, setTopRange] = useState<RangeKey>('24h')
   const topModelsParams = useMemo(() => {
     const nowMs = minuteTick * 60_000
-    const to = bucketedTimeISO(nowMs, 5 * 60_000)
-    return { from: startOfRange(topRange, new Date(nowMs).toISOString()), to }
+    const to = bucketedTimeISO(nowMs, USAGE_BUCKET_MS)
+    // 热门模型只反映成功请求，失败调用不计入排名。
+    return { from: startOfRange(topRange, new Date(nowMs).toISOString()), to, status: 'success' as const }
   }, [topRange, minuteTick])
   const {
     data: byModel,
@@ -298,7 +299,7 @@ export function OverviewPage() {
   // 最近失败（最新 3 条，今日窗口；to 取下一 5 分钟边界）
   const failuresParams = useMemo(() => {
     const nowMs = minuteTick * 60_000
-    const to = bucketedTimeISO(nowMs, 5 * 60_000)
+    const to = bucketedTimeISO(nowMs, USAGE_BUCKET_MS)
     return {
       from: localMidnight(0, new Date(nowMs)).toISOString(),
       to,
@@ -441,14 +442,14 @@ export function OverviewPage() {
         <section aria-label="服务状态与热点" className="grid grid-cols-1 gap-8 md:grid-cols-2 lg:grid-cols-3 pt-2">
           {/* Bento 1: 热门模型 */}
           <div className="space-y-4">
-            <div className="flex min-h-[42px] items-center justify-between border-b border-border/50 pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border/50 pb-3">
               <div className="flex items-center gap-2">
                 <Cpu className="h-4 w-4 text-primary" />
                 <h3 className="text-sm font-semibold text-foreground">热门模型分布</h3>
               </div>
               <Seg
                 aria-label="热门模型时间窗"
-                className="h-7"
+                size="sm"
                 options={RANGE_OPTIONS}
                 value={topRange}
                 onChange={setTopRange}
@@ -493,7 +494,7 @@ export function OverviewPage() {
 
           {/* Bento 2: 模型源健康状态 */}
           <div className="flex h-full flex-col space-y-4">
-            <div className="flex min-h-[42px] items-center justify-between border-b border-border/50 pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border/50 pb-3">
               <div className="flex items-center gap-2">
                 <Boxes className="h-4 w-4 text-jade" />
                 <h3 className="text-sm font-semibold text-foreground">模型源健康</h3>
@@ -530,7 +531,7 @@ export function OverviewPage() {
 
           {/* Bento 3: 最近失败调用 */}
           <div className="space-y-4 md:col-span-2 lg:col-span-1">
-            <div className="flex min-h-[42px] items-center justify-between border-b border-border/50 pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border/50 pb-3">
               <div className="flex items-center gap-2">
                 <ShieldAlert className="h-4 w-4 text-ember" />
                 <h3 className="text-sm font-semibold text-foreground">最近异常调用</h3>
@@ -549,7 +550,7 @@ export function OverviewPage() {
                 <div className="skeleton h-36 rounded-md" />
               ) : recentFailures.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-8 text-center text-xs text-muted-foreground">
-                  <CheckCircle2 className="h-8 w-8 text-jade/70 mb-2" />
+                  <CheckCircle2 className="h-8 w-8 mb-2 text-[color:color-mix(in_srgb,var(--jade)_70%,transparent)]" />
                   <span>近期无任何调用异常记录</span>
                 </div>
               ) : (
@@ -558,7 +559,7 @@ export function OverviewPage() {
                     <button
                       key={item.requestId}
                       onClick={() => navigate('/usage-logs', { state: { openDetail: item.requestId } })}
-                      className="group flex w-full flex-col justify-between gap-1.5 border-b border-border/30 pb-2.5 last:border-b-0 text-left hover:bg-wash/30 p-1.5 rounded transition-colors"
+                      className="group flex w-full flex-col justify-between gap-1.5 border-b border-border/30 pb-2.5 last:border-b-0 text-left hover:bg-wash p-1.5 rounded-md transition-colors"
                     >
                       <div className="flex items-center justify-between gap-2 text-xs">
                         <div className="flex items-center gap-1.5 truncate">
@@ -572,7 +573,7 @@ export function OverviewPage() {
                         </span>
                       </div>
                       {item.error && (
-                        <p className="text-2xs text-ember/90 truncate font-mono" title={item.error}>
+                        <p className="text-2xs truncate font-mono text-[color:color-mix(in_srgb,var(--ember)_90%,transparent)]" title={item.error}>
                           {item.error}
                         </p>
                       )}

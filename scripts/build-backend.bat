@@ -20,15 +20,28 @@ echo WebUI assets synced to backend/webui/dist
 
 cd backend
 
+REM modernc.org/sqlite 纯 Go 无 CGO，直接交叉编译即可。
+set CGO_ENABLED=0
+
 echo Building Windows amd64...
 set GOOS=windows
 set GOARCH=amd64
 go build -ldflags "-s -w" -o ..\packages\elysia-api\assets\bin\elysia-backend.exe .
 
+echo Building Windows arm64...
+set GOOS=windows
+set GOARCH=arm64
+go build -ldflags "-s -w" -o ..\packages\elysia-api\assets\bin\elysia-backend-windows-arm64.exe .
+
 echo Building Linux amd64...
 set GOOS=linux
 set GOARCH=amd64
 go build -ldflags "-s -w" -o ..\packages\elysia-api\assets\bin\elysia-backend-linux .
+
+echo Building Linux arm64...
+set GOOS=linux
+set GOARCH=arm64
+go build -ldflags "-s -w" -o ..\packages\elysia-api\assets\bin\elysia-backend-linux-arm64 .
 
 echo Building macOS amd64 (Intel)...
 set GOOS=darwin

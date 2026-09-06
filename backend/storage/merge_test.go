@@ -20,8 +20,7 @@ func mergeTestSource() ModelSource {
 	return ModelSource{ID: "src1", Name: "Relay One", BaseURL: "https://old.example.com", APIKey: "sk-old", Platform: "openai", Enabled: true, AutoFetchModels: true}
 }
 
-// seedSource 落库模型源行（MergeSourceModels 只写 models 行，不建源行；
-// ListGroups 的成员查询按源 enabled 过滤，测试需先建源）。
+// seedSource 落库模型源行（MergeSourceModels 只写 models 行，不建源行）。
 func seedSource(t *testing.T, store *Store, source ModelSource) {
 	t.Helper()
 	if err := store.UpsertSource(context.Background(), source); err != nil {
@@ -290,7 +289,7 @@ func TestListModelsFiltered(t *testing.T) {
 	}
 }
 
-func boolPtrFalse() *bool { v := false; return &v }
-func boolPtrTrue() *bool  { v := true; return &v }
-func intPtr(v int) *int   { return &v }
+func boolPtrFalse() *bool     { v := false; return &v }
+func boolPtrTrue() *bool      { v := true; return &v }
+func intPtr(v int) *int       { return &v }
 func strPtr(v string) *string { return &v }

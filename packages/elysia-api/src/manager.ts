@@ -198,9 +198,9 @@ export class StandaloneBackendManager {
   }
 
   private getBinaryName() {
-    if (process.platform === 'win32') return 'elysia-backend.exe'
+    if (process.platform === 'win32') return process.arch === 'arm64' ? 'elysia-backend-windows-arm64.exe' : 'elysia-backend.exe'
     if (process.platform === 'darwin') return process.arch === 'arm64' ? 'elysia-backend-darwin-arm64' : 'elysia-backend-darwin-amd64'
-    if (process.platform === 'linux') return 'elysia-backend-linux'
+    if (process.platform === 'linux') return process.arch === 'arm64' ? 'elysia-backend-linux-arm64' : 'elysia-backend-linux'
     return 'elysia-backend'
   }
 

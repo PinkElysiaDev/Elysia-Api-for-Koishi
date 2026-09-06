@@ -17,6 +17,11 @@ import (
 const modelColumns = `m.id, m.source_id, m.name, m.source_name, m.base_url, m.api_key, m.platform, m.type, m.max_tokens, m.vision_capable, m.tools_capable, m.structured_output, m.thinking_mode, m.available, m.enabled, m.origin, m.capability_source, m.last_checked_at`
 
 const (
+	// 查询分页的默认/上限（管理端列表与系统日志各自独立口径）。
+	usageLogPageDefault = 50
+	usageLogPageMax     = 500
+	systemLogPageMax    = 500
+
 	usageSuccessPredicate = "status_code >= 200 AND status_code < 400"
 	usageFailedPredicate  = "status_code < 200 OR status_code >= 400"
 )
@@ -29,17 +34,13 @@ func (s *Store) scanModel(scanner interface{ Scan(dest ...any) error }) (Model, 
 	if err := scanner.Scan(&item.ID, &item.SourceID, &item.Name, &item.SourceName, &item.BaseURL, &item.APIKey, &item.Platform, &item.Type, &item.MaxTokens, &vision, &tools, &structured, &item.ThinkingMode, &available, &enabled, &item.Origin, &item.CapabilitySource, &checked); err != nil {
 		return Model{}, err
 	}
-	item.VisionCapable = intBool(vision)
-	item.ToolsCapable = intBool(tools)
-	item.StructuredOutput = intBool(structured)
-	item.Available = intBool(available)
-	item.Enabled = intBool(enabled)
+	item.VisionCapable = sqlIntToBool(vision)
+	item.ToolsCapable = sqlIntToBool(tools)
+	item.StructuredOutput = sqlIntToBool(structured)
+	item.Available = sqlIntToBool(available)
+	item.Enabled = sqlIntToBool(enabled)
 	item.LastCheckedAt = parseTime(checked)
-	if plain, err := s.codec.decrypt(item.APIKey); err == nil {
-		item.APIKey = plain
-	} else {
-		return Model{}, err
-	}
+	item.APIKey = s.decryptOrClear("model api_key", item.ID+"/"+item.SourceID, item.APIKey)
 	return item, nil
 }
 
@@ -124,9 +125,9 @@ func (s *Store) ListGroups(ctx context.Context) ([]ModelGroup, error) {
 			rows.Close()
 			return nil, err
 		}
-		item.Enabled = intBool(enabled)
-		item.VisionCapable = intBool(vision)
-		item.ToolsCapable = intBool(tools)
+		item.Enabled = sqlIntToBool(enabled)
+		item.VisionCapable = sqlIntToBool(vision)
+		item.ToolsCapable = sqlIntToBool(tools)
 		// Models 必须以空数组而非 nil 序列化：前端 groups 列表直接调用
 		// group.models.slice(...)，nil 会被 JSON 编码为 null 并导致整页崩溃。
 		item.Models = []string{}
@@ -140,7 +141,11 @@ func (s *Store) ListGroups(ctx context.Context) ([]ModelGroup, error) {
 	}
 
 	for i := range items {
-		modelRows, err := s.db.QueryContext(ctx, `SELECT mgm.model_id, mgm.source_id FROM model_group_models mgm LEFT JOIN model_sources ms ON ms.id = mgm.source_id WHERE mgm.group_id = ? AND (mgm.source_id = '' OR (ms.id IS NOT NULL AND ms.enabled = 1)) ORDER BY mgm.position`, items[i].ID)
+		// 组成员引用完整返回，即使所属模型源已停用。编辑页打开后无修改保存
+		// 会走 UpsertGroup 的「先删后写」；若此处按源 enabled 过滤，停用源下的
+		// 成员会从 payload 消失并被永久删除。调度热路径仍通过 ListModels 过滤
+		// 停用源，不会把请求打到已停用源。
+		modelRows, err := s.db.QueryContext(ctx, `SELECT mgm.model_id, mgm.source_id FROM model_group_models mgm WHERE mgm.group_id = ? ORDER BY mgm.position`, items[i].ID)
 		if err != nil {
 			return nil, err
 		}
@@ -201,7 +206,7 @@ func (s *Store) UpsertGroup(ctx context.Context, item ModelGroup) error {
 	}
 
 	now := nowString()
-	_, err = tx.ExecContext(ctx, `INSERT INTO model_groups(id, name, enabled, strategy, max_retries, retry_interval, max_concurrency, daily_limit_max_requests, daily_limit_max_tokens, type, max_tokens, vision_capable, tools_capable, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, enabled=excluded.enabled, strategy=excluded.strategy, max_retries=excluded.max_retries, retry_interval=excluded.retry_interval, max_concurrency=excluded.max_concurrency, daily_limit_max_requests=excluded.daily_limit_max_requests, daily_limit_max_tokens=excluded.daily_limit_max_tokens, type=excluded.type, max_tokens=excluded.max_tokens, vision_capable=excluded.vision_capable, tools_capable=excluded.tools_capable, updated_at=excluded.updated_at`, item.ID, item.Name, boolInt(item.Enabled), item.Strategy, item.MaxRetries, item.RetryInterval, item.MaxConcurrency, item.DailyLimitMaxRequests, item.DailyLimitMaxTokens, item.Type, item.MaxTokens, boolInt(item.VisionCapable), boolInt(item.ToolsCapable), now, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO model_groups(id, name, enabled, strategy, max_retries, retry_interval, max_concurrency, daily_limit_max_requests, daily_limit_max_tokens, type, max_tokens, vision_capable, tools_capable, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, enabled=excluded.enabled, strategy=excluded.strategy, max_retries=excluded.max_retries, retry_interval=excluded.retry_interval, max_concurrency=excluded.max_concurrency, daily_limit_max_requests=excluded.daily_limit_max_requests, daily_limit_max_tokens=excluded.daily_limit_max_tokens, type=excluded.type, max_tokens=excluded.max_tokens, vision_capable=excluded.vision_capable, tools_capable=excluded.tools_capable, updated_at=excluded.updated_at`, item.ID, item.Name, sqlBoolToInt(item.Enabled), item.Strategy, item.MaxRetries, item.RetryInterval, item.MaxConcurrency, item.DailyLimitMaxRequests, item.DailyLimitMaxTokens, item.Type, item.MaxTokens, sqlBoolToInt(item.VisionCapable), sqlBoolToInt(item.ToolsCapable), now, now)
 	if err != nil {
 		return err
 	}
@@ -214,20 +219,11 @@ func (s *Store) UpsertGroup(ctx context.Context, item ModelGroup) error {
 		return err
 	}
 	for i, ref := range item.Models {
-		// ref 形如 "sourceId:modelId"（新）或裸 "modelId"（旧/兼容）。
-		// 复合键直接拆出 source_id + model_id，精确定位同名不同源的模型；
-		// 裸 id 回退到 findModel 猜一个源（保持旧行为）。
-		var modelID, sourceID string
-		if idx := strings.Index(ref, ":"); idx >= 0 {
-			sourceID = ref[:idx]
-			modelID = ref[idx+1:]
-		} else {
-			modelID = ref
-			if model, ok, err := s.findModel(ctx, tx, modelID); err != nil {
-				return err
-			} else if ok {
-				sourceID = model.SourceID
-			}
+		// "sourceId:modelId"（复合键）或裸 "modelId"（旧/兼容），统一走
+		// resolveModelRef 解析（裸 id 回退 findModel 猜源，保持旧行为）。
+		modelID, sourceID, err := s.resolveModelRef(ctx, tx, ref)
+		if err != nil {
+			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO model_group_models(group_id, model_id, source_id, position) VALUES(?, ?, ?, ?)`, item.ID, modelID, sourceID, i); err != nil {
 			return err
@@ -477,17 +473,22 @@ func removeGroupName(groups []string, groupName string) ([]string, bool) {
 // SetModelAvailability 更新某个模型（按 id+source_id 唯一）的可用状态，
 // 供后台健康检测自动禁用/恢复使用。返回受影响行数。
 func (s *Store) SetModelAvailability(ctx context.Context, modelID, sourceID string, available bool) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE models SET available = ? WHERE id = ? AND source_id = ?`, boolInt(available), modelID, sourceID)
+	res, err := s.db.ExecContext(ctx, `UPDATE models SET available = ? WHERE id = ? AND source_id = ?`, sqlBoolToInt(available), modelID, sourceID)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-// ListAllModelsForProbe 返回所有模型（含不可用的），供健康检测遍历。
-// 与 ListModels 不同，这里不过滤 available，以便对已禁用模型做恢复探测。
+// ListAllModelsForProbe 返回适合健康检测的模型：不过滤 available（已自动
+// 禁用的模型要持续探测以便恢复），但排除用户手动停用的模型（enabled=0）
+// 与所属源已停用的模型——探测是真实的计费请求，打向管理员明确关掉的
+// 模型既浪费钱也毫无意义（路由装配本就不会把流量派过去）。
 func (s *Store) ListAllModelsForProbe(ctx context.Context) ([]Model, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+modelColumns+` FROM models m ORDER BY m.source_name, m.name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+modelColumns+` FROM models m
+		LEFT JOIN model_sources ms ON m.source_id = ms.id
+		WHERE m.enabled = 1 AND (m.source_id = '' OR ms.enabled = 1 OR ms.id IS NULL)
+		ORDER BY m.source_name, m.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -538,17 +539,17 @@ func (s *Store) UpdateModel(ctx context.Context, modelID, sourceID string, patch
 	}
 	if patch.VisionCapable != nil {
 		sets = append(sets, "vision_capable = ?")
-		args = append(args, boolInt(*patch.VisionCapable))
+		args = append(args, sqlBoolToInt(*patch.VisionCapable))
 		capabilityTouched = true
 	}
 	if patch.ToolsCapable != nil {
 		sets = append(sets, "tools_capable = ?")
-		args = append(args, boolInt(*patch.ToolsCapable))
+		args = append(args, sqlBoolToInt(*patch.ToolsCapable))
 		capabilityTouched = true
 	}
 	if patch.StructuredOutput != nil {
 		sets = append(sets, "structured_output = ?")
-		args = append(args, boolInt(*patch.StructuredOutput))
+		args = append(args, sqlBoolToInt(*patch.StructuredOutput))
 		capabilityTouched = true
 	}
 	if patch.ThinkingMode != nil {
@@ -558,7 +559,7 @@ func (s *Store) UpdateModel(ctx context.Context, modelID, sourceID string, patch
 	}
 	if patch.Enabled != nil {
 		sets = append(sets, "enabled = ?")
-		args = append(args, boolInt(*patch.Enabled))
+		args = append(args, sqlBoolToInt(*patch.Enabled))
 	}
 	if len(sets) == 0 {
 		// 无字段更新：探测行是否存在即可。
@@ -616,17 +617,13 @@ func (s *Store) SaveUsageRecordJSON(ctx context.Context, payload []byte, summary
 		summary.StartedAt = endedAt
 	}
 	// 原始行与 rollup 增量同事务：任一失败整体回滚，两表保持一致。
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	res, err := tx.ExecContext(ctx, `INSERT INTO usage_records(request_id, started_at, started_ms, ended_at, key_name, key_hash, group_name, model_name, source_id, platform, source_format, target_format, relay_mode, responses_mode, usage_source, stream, status_code, error, first_byte_ms, duration_ms, input_tokens, output_tokens, total_tokens, cache_hit_tokens, request_truncated, response_truncated, record_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_id) DO NOTHING`, summary.RequestID, summary.StartedAt.UTC().Format(time.RFC3339Nano), summary.StartedAt.UnixMilli(), endedAt.UTC().Format(time.RFC3339Nano), summary.KeyName, summary.KeyHash, summary.GroupName, summary.ModelName, summary.SourceID, summary.Platform, summary.SourceFormat, summary.TargetFormat, summary.RelayMode, summary.ResponsesMode, summary.UsageSource, boolInt(summary.Stream), summary.StatusCode, summary.Error, summary.FirstByteMs, summary.DurationMs, summary.InputTokens, summary.OutputTokens, summary.TotalTokens, summary.CacheHitTokens, boolInt(summary.RequestTruncated), boolInt(summary.ResponseTruncated), string(payload))
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		return saveUsageRecordTx(ctx, tx, payload, summary, endedAt)
+	})
+}
+
+func saveUsageRecordTx(ctx context.Context, tx *sql.Tx, payload []byte, summary UsageLogItem, endedAt time.Time) error {
+	res, err := tx.ExecContext(ctx, `INSERT INTO usage_records(request_id, started_at, started_ms, ended_at, key_name, key_hash, group_name, model_name, source_id, platform, source_format, target_format, relay_mode, responses_mode, usage_source, stream, status_code, error, first_byte_ms, duration_ms, input_tokens, output_tokens, total_tokens, cache_hit_tokens, request_truncated, response_truncated, record_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_id) DO NOTHING`, summary.RequestID, summary.StartedAt.UTC().Format(time.RFC3339Nano), summary.StartedAt.UnixMilli(), endedAt.UTC().Format(time.RFC3339Nano), summary.KeyName, summary.KeyHash, summary.GroupName, summary.ModelName, summary.SourceID, summary.Platform, summary.SourceFormat, summary.TargetFormat, summary.RelayMode, summary.ResponsesMode, summary.UsageSource, sqlBoolToInt(summary.Stream), summary.StatusCode, summary.Error, summary.FirstByteMs, summary.DurationMs, summary.InputTokens, summary.OutputTokens, summary.TotalTokens, summary.CacheHitTokens, sqlBoolToInt(summary.RequestTruncated), sqlBoolToInt(summary.ResponseTruncated), string(payload))
 	if err != nil {
 		return err
 	}
@@ -638,11 +635,7 @@ func (s *Store) SaveUsageRecordJSON(ctx context.Context, payload []byte, summary
 		// 同 request_id 已落库：禁止覆盖。覆盖会让 rollup 再 +1 而旧桶不回退。
 		return nil
 	}
-	if err := upsertUsageRollupTx(ctx, tx, summary); err != nil {
-		return err
-	}
-	committed = true
-	return tx.Commit()
+	return upsertUsageRollupTx(ctx, tx, summary)
 }
 
 func (s *Store) QueryUsageLogs(ctx context.Context, q UsageQuery) (int, []UsageLogItem, error) {
@@ -650,14 +643,7 @@ func (s *Store) QueryUsageLogs(ctx context.Context, q UsageQuery) (int, []UsageL
 	if err != nil {
 		return 0, nil, err
 	}
-	limit := q.Limit
-	if limit <= 0 || limit > 500 {
-		limit = 50
-	}
-	offset := q.Offset
-	if offset < 0 {
-		offset = 0
-	}
+	limit, offset := clampPage(q.Limit, q.Offset, usageLogPageDefault, usageLogPageMax)
 	where, args := usageWhere(q)
 	args = append(args, limit, offset)
 	// 排序只用 started_ms：索引可直接反向游走取前 offset+limit 条窄索引项、
@@ -677,9 +663,9 @@ func (s *Store) QueryUsageLogs(ctx context.Context, q UsageQuery) (int, []UsageL
 			return 0, nil, err
 		}
 		item.StartedAt = parseTime(started)
-		item.Stream = intBool(stream)
-		item.RequestTruncated = intBool(reqTrunc)
-		item.ResponseTruncated = intBool(respTrunc)
+		item.Stream = sqlIntToBool(stream)
+		item.RequestTruncated = sqlIntToBool(reqTrunc)
+		item.ResponseTruncated = sqlIntToBool(respTrunc)
 		items = append(items, item)
 	}
 	return total, items, rows.Err()
@@ -759,7 +745,7 @@ func usageWhere(q UsageQuery) (string, []any) {
 // （单次 (日, 模型) 粒度 GROUP BY 扫描 + Go 内按日归并，IO 相比旧版两次全窗
 // 口扫描减半）。输出结构（含日期格式、未知模型归并）与旧版一致。
 func (s *Store) UsageDaily(ctx context.Context, q UsageQuery, utcOffsetMinutes int) ([]UsageDailyBucket, error) {
-	offsetMs := int64(utcOffsetMinutes) * 60_000
+	offsetMs := int64(utcOffsetMinutes) * msPerMinute
 	rows, err := s.usageDailyRows(ctx, q, offsetMs)
 	if err != nil {
 		return nil, err
@@ -795,7 +781,7 @@ func (s *Store) UsageDaily(ctx context.Context, q UsageQuery, utcOffsetMinutes i
 }
 
 func (s *Store) usageDailyRows(ctx context.Context, q UsageQuery, offsetMs int64) ([]usageDayRow, error) {
-	if fromHour, toHour, ok := s.rollupSplit(q, offsetMs%3_600_000 == 0); ok {
+	if fromHour, toHour, ok := s.rollupSplit(q, offsetMs%msPerHour == 0); ok {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return nil, err
@@ -850,9 +836,14 @@ func scanUsageDailyRows(ctx context.Context, qe sqlQueryer, q UsageQuery, offset
 		// rollup 未就绪 / keyHash / sourceId / 非整小时 offset 都会走这条 raw 路径。
 		where += " AND started_ms > 0"
 	}
+	// 模型维度统计排除未路由记录（model_name 为空）：组不存在 / 组内无可用模型
+	// 等前置失败没有产生模型调用，属网关级错误——审计走调用日志，不进模型统计。
+	where += " AND model_name != ''"
 	fullArgs := append([]any{offsetMs}, args...)
+	// token 列只累计成功记录（口径与 UsageTotals 一致，失败调用不计成本）。
+	succOnly := "CASE WHEN " + usageSuccessPredicate + " THEN "
 	rows, err := qe.QueryContext(ctx,
-		`SELECT (started_ms + ?) / 86400000, model_name, COUNT(*), COALESCE(SUM(CASE WHEN `+usageSuccessPredicate+` THEN 1 ELSE 0 END),0), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(total_tokens),0) FROM usage_records `+where+` GROUP BY 1, 2 ORDER BY 1`, fullArgs...)
+		`SELECT (started_ms + ?) / 86400000, model_name, COUNT(*), COALESCE(SUM(CASE WHEN `+usageSuccessPredicate+` THEN 1 ELSE 0 END),0), COALESCE(SUM(`+succOnly+`input_tokens ELSE 0 END),0), COALESCE(SUM(`+succOnly+`output_tokens ELSE 0 END),0), COALESCE(SUM(`+succOnly+`cache_hit_tokens ELSE 0 END),0), COALESCE(SUM(`+succOnly+`total_tokens ELSE 0 END),0) FROM usage_records `+where+` GROUP BY 1, 2 ORDER BY 1`, fullArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -981,11 +972,13 @@ func (s *Store) UsagePulse(ctx context.Context, q UsageQuery, utcOffsetMinutes, 
 		return UsagePulseResult{}, err
 	}
 	where, args := usageWhere(q)
-	offsetMs := int64(utcOffsetMinutes) * 60_000
-	bucketMs := int64(bucketMinutes) * 60_000
+	offsetMs := int64(utcOffsetMinutes) * msPerMinute
+	bucketMs := int64(bucketMinutes) * msPerMinute
 	args = append([]any{offsetMs, bucketMs}, args...)
+	// 口径：Requests（RPM）计全部记录；时延与 token 只累计成功记录——
+	// 失败调用的时延无性能意义，token 存在断流部分估算等非 0 例外。
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ((started_ms + ?) / ?) AS bucket, duration_ms, total_tokens FROM usage_records `+where+` ORDER BY 1, 2`, args...)
+		`SELECT ((started_ms + ?) / ?) AS bucket, duration_ms, total_tokens, CASE WHEN `+usageSuccessPredicate+` THEN 1 ELSE 0 END FROM usage_records `+where+` ORDER BY 1, 2`, args...)
 	if err != nil {
 		return UsagePulseResult{}, err
 	}
@@ -996,11 +989,13 @@ func (s *Store) UsagePulse(ctx context.Context, q UsageQuery, utcOffsetMinutes, 
 		curBucket    int64
 		have         bool
 		n            int
+		succN        int
 		sum          int64
 		tokenSum     int64
 		bucketSample int64Reservoir
 		windowSample int64Reservoir
 		windowN      int
+		windowSuccN  int
 		windowSum    int64
 		windowTok    int64
 	)
@@ -1010,20 +1005,25 @@ func (s *Store) UsagePulse(ctx context.Context, q UsageQuery, utcOffsetMinutes, 
 		if !have || n == 0 {
 			return
 		}
+		avg := 0.0
+		if succN > 0 {
+			avg = float64(sum) / float64(succN)
+		}
 		out = append(out, UsagePulsePoint{
 			T:             curBucket*bucketMs - offsetMs,
 			Requests:      n,
-			AvgDurationMs: float64(sum) / float64(n),
+			AvgDurationMs: avg,
 			P95DurationMs: percentileInt64(append([]int64(nil), bucketSample.samples...), 0.95),
 			TotalTokens:   tokenSum,
 		})
 		windowN += n
+		windowSuccN += succN
 		windowSum += sum
 		windowTok += tokenSum
 	}
 	for rows.Next() {
-		var bucket, durationMs, tokens int64
-		if err := rows.Scan(&bucket, &durationMs, &tokens); err != nil {
+		var bucket, durationMs, tokens, success int64
+		if err := rows.Scan(&bucket, &durationMs, &tokens, &success); err != nil {
 			return UsagePulseResult{}, err
 		}
 		if !have || bucket != curBucket {
@@ -1031,23 +1031,27 @@ func (s *Store) UsagePulse(ctx context.Context, q UsageQuery, utcOffsetMinutes, 
 			curBucket = bucket
 			have = true
 			n = 0
+			succN = 0
 			sum = 0
 			tokenSum = 0
 			bucketSample.reset()
 		}
 		n++
-		sum += durationMs
-		tokenSum += tokens
-		bucketSample.add(durationMs)
-		windowSample.add(durationMs)
+		if success == 1 {
+			succN++
+			sum += durationMs
+			tokenSum += tokens
+			bucketSample.add(durationMs)
+			windowSample.add(durationMs)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return UsagePulseResult{}, err
 	}
 	flush()
 	window := UsagePulseWindow{Requests: windowN, TotalTokens: windowTok}
-	if windowN > 0 {
-		window.AvgDurationMs = float64(windowSum) / float64(windowN)
+	if windowSuccN > 0 {
+		window.AvgDurationMs = float64(windowSum) / float64(windowSuccN)
 		window.P95DurationMs = percentileInt64(windowSample.samples, 0.95)
 	}
 	return UsagePulseResult{Points: out, Window: window}, nil
@@ -1099,7 +1103,7 @@ func (s *Store) UsageByModelDaily(ctx context.Context, q UsageQuery, utcOffsetMi
 	if top <= 0 {
 		top = 8
 	}
-	offsetMs := int64(utcOffsetMinutes) * 60_000
+	offsetMs := int64(utcOffsetMinutes) * msPerMinute
 	dayRows, err := s.usageDailyRows(ctx, q, offsetMs)
 	if err != nil {
 		return nil, err
@@ -1207,41 +1211,347 @@ func (s *Store) GetUsageRecordJSON(ctx context.Context, id string) ([]byte, bool
 	return []byte(payload), true, nil
 }
 
+// ErrRollupBackfillInProgress 表示小时聚合后台回填正在运行，ClearUsage 抢
+// 互斥锁失败。调用方（resetUsage）持有 usage writer/persist 锁期间不能排队
+// 等待——大库首次回填可能持锁数分钟，排队会把所有请求的 usage 落库一并卡住。
+var ErrRollupBackfillInProgress = errors.New("rollup backfill in progress")
+
 // ClearUsage 清空全部 usage 数据。rollup 表与状态一并重置（through=until=now、
 // ready 保持），后续记录继续由写入侧增量累积，无需重跑回填。
 func (s *Store) ClearUsage(ctx context.Context) error {
 	// 与后台回填互斥：ClearUsage 重置水位期间若回填循环在跑，其随后的
 	// setRollupStateInt 会把水位写回旧值（状态卫生问题，数据本身无损）。
-	s.rollupMu.Lock()
+	// 抢不到锁立即失败（见 ErrRollupBackfillInProgress），绝不排队阻塞。
+	if !s.rollupMu.TryLock() {
+		return ErrRollupBackfillInProgress
+	}
 	defer s.rollupMu.Unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	if err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM usage_records`); err != nil {
+			return err
 		}
-	}()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_records`); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM usage_rollup_hour`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM usage_asset_refs`); err != nil {
+			return err
+		}
+		now := time.Now().UnixMilli()
+		_, err := tx.ExecContext(ctx, `INSERT INTO usage_rollup_state(key, int_value) VALUES(?, ?), (?, ?), (?, 1)
+			ON CONFLICT(key) DO UPDATE SET int_value = excluded.int_value`,
+			rollupStateUntil, now, rollupStateThrough, now, rollupStateReady)
 		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_rollup_hour`); err != nil {
-		return err
-	}
-	now := time.Now().UnixMilli()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO usage_rollup_state(key, int_value) VALUES(?, ?), (?, ?), (?, 1)
-		ON CONFLICT(key) DO UPDATE SET int_value = excluded.int_value`,
-		rollupStateUntil, now, rollupStateThrough, now, rollupStateReady); err != nil {
-		return err
-	}
-	committed = true
-	if err := tx.Commit(); err != nil {
+	}); err != nil {
 		return err
 	}
 	s.rollupReady.Store(true)
 	return nil
+}
+
+// InsertUsageAssetRef 登记一条「记录 → 资产文件」引用（幂等）。文件按内容
+// 哈希全局去重，多个记录可引用同一文件；能否删文件由引用计数决定。
+func (s *Store) InsertUsageAssetRef(ctx context.Context, requestID, assetFile string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO usage_asset_refs(asset_file, request_id) VALUES(?, ?)`, assetFile, requestID)
+	return err
+}
+
+// DeleteUsageAssetRefs 删除一组记录的资产引用，返回因此不再被任何记录
+// 引用（可安全删除文件）的资产文件名。仍在被其他记录引用的不返回。
+func (s *Store) DeleteUsageAssetRefs(ctx context.Context, requestIDs []string) ([]string, error) {
+	if len(requestIDs) == 0 {
+		return nil, nil
+	}
+	var orphans []string
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		for start := 0; start < len(requestIDs); start += 500 {
+			end := start + 500
+			if end > len(requestIDs) {
+				end = len(requestIDs)
+			}
+			batch := requestIDs[start:end]
+			placeholders := make([]string, len(batch))
+			args := make([]any, len(batch))
+			for i, id := range batch {
+				placeholders[i] = "?"
+				args[i] = id
+			}
+			in := strings.Join(placeholders, ",")
+			// 先收集这批请求涉及的文件，删引用后再筛出零引用的。
+			rows, err := tx.QueryContext(ctx,
+				`SELECT DISTINCT asset_file FROM usage_asset_refs WHERE request_id IN (`+in+`)`, args...)
+			if err != nil {
+				return err
+			}
+			var touched []string
+			for rows.Next() {
+				var file string
+				if err := rows.Scan(&file); err != nil {
+					rows.Close()
+					return err
+				}
+				touched = append(touched, file)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			rows.Close()
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM usage_asset_refs WHERE request_id IN (`+in+`)`, args...); err != nil {
+				return err
+			}
+			for _, file := range touched {
+				var remaining int
+				if err := tx.QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM usage_asset_refs WHERE asset_file = ?`, file).Scan(&remaining); err != nil {
+					return err
+				}
+				if remaining == 0 {
+					orphans = append(orphans, file)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return orphans, nil
+}
+
+// ReferencedAssetFiles 返回当前仍被引用的全部资产文件名（孤儿清扫用）。
+func (s *Store) ReferencedAssetFiles(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT asset_file FROM usage_asset_refs`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string]bool{}
+	for rows.Next() {
+		var file string
+		if err := rows.Scan(&file); err != nil {
+			return nil, err
+		}
+		result[file] = true
+	}
+	return result, rows.Err()
+}
+
+// clampPage 归一化分页参数：非法/超限 limit 回落 def，负 offset 归零。
+func clampPage(limit, offset, def, max int) (int, int) {
+	if limit <= 0 || limit > max {
+		limit = def
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// withTx 是写事务的统一脚手架：fn 返回 nil 即提交、返回错误即回滚。
+// 取代此前并存的三种手写 Begin/defer-Rollback/Commit 风格。
+func (s *Store) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// ---- 日志留存清理（usage_retention.go 使用）----
+//
+// 与 ClearUsage 的全清不同：以下删除只动 usage_records 原始行，不触
+// usage_rollup_hour/水位表——小时聚合在写入时已累加进 rollup，清理原始
+// 记录不影响历史统计口径（仅查询窗口边界小时的 raw 补扫可能少算，可接受）。
+// 每批删除返回被删 request_id，供调用方联动删除外置媒体目录。
+
+// retentionDeleteBatchLimit 是单批删除的默认行数上限。
+const retentionDeleteBatchLimit = 500
+
+func deleteUsageByIDsTx(ctx context.Context, tx *sql.Tx, ids []string) error {
+	where := usageInClause("request_id", len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM usage_records WHERE `+where, args...)
+	return err
+}
+
+func deleteUsageSelectTx(ctx context.Context, tx *sql.Tx, selectSQL string, args ...interface{}) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, selectSQL, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// DeleteUsageOlderThan 删除 started_ms 早于 cutoffMs 的最旧一批记录（至多
+// limit 条），返回被删 request_id；空切片表示已无可删。
+func (s *Store) DeleteUsageOlderThan(ctx context.Context, cutoffMs int64, limit int) ([]string, error) {
+	return s.deleteUsageOldest(ctx, cutoffMs, limit)
+}
+
+// DeleteUsageOldest 删除全局最旧的一批记录（至多 limit 条），超量清理用。
+func (s *Store) DeleteUsageOldest(ctx context.Context, limit int) ([]string, error) {
+	return s.deleteUsageOldest(ctx, 0, limit)
+}
+
+// deleteUsageOldest 按 started_ms 升序删除一批最旧记录：cutoffMs>0 时仅删
+// 早于该时间戳的行（过期清理），0 表示不限（超量清理）。空切片表示无可删。
+func (s *Store) deleteUsageOldest(ctx context.Context, cutoffMs int64, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = retentionDeleteBatchLimit
+	}
+	var ids []string
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		query := `SELECT request_id FROM usage_records`
+		args := []any{}
+		if cutoffMs > 0 {
+			query += ` WHERE started_ms > 0 AND started_ms < ?`
+			args = append(args, cutoffMs)
+		}
+		query += ` ORDER BY started_ms ASC LIMIT ?`
+		args = append(args, limit)
+		selected, err := deleteUsageSelectTx(ctx, tx, query, args...)
+		if err != nil {
+			return err
+		}
+		if len(selected) == 0 {
+			return nil
+		}
+		if err := deleteUsageByIDsTx(ctx, tx, selected); err != nil {
+			return err
+		}
+		ids = selected
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// retentionBeyondCountBatch 是条数清理单次选择的上限：有界选择避免大表
+// 一次性把数百万 id 读进内存、并在单个事务里持长写锁。
+const retentionBeyondCountBatch = 2000
+
+func (s *Store) DeleteUsageBeyondCount(ctx context.Context, keep int64) ([]string, error) {
+	var ids []string
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		selected, err := deleteUsageSelectTx(ctx, tx,
+			`SELECT request_id FROM usage_records ORDER BY started_ms DESC LIMIT ? OFFSET ?`, retentionBeyondCountBatch, keep)
+		if err != nil {
+			return err
+		}
+		if len(selected) == 0 {
+			return nil
+		}
+		// 事务内按 500 一块删除，避免超长 IN 列表。
+		for start := 0; start < len(selected); start += retentionDeleteBatchLimit {
+			end := start + retentionDeleteBatchLimit
+			if end > len(selected) {
+				end = len(selected)
+			}
+			if err := deleteUsageByIDsTx(ctx, tx, selected[start:end]); err != nil {
+				return err
+			}
+		}
+		ids = selected
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// CountUsageRecords 返回当前日志记录总数。
+func (s *Store) CountUsageRecords(ctx context.Context) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_records`).Scan(&count)
+	return count, err
+}
+
+// UsageDBStats 是数据库页面统计：LogicalBytes = (PageCount-FreePages)*PageSize，
+// 近似「扣掉空闲页后的实际占用」，超量清理按它收敛（删除会释放整页进空闲
+// 链表，页总数要等 VACUUM 才下降）。
+type UsageDBStats struct {
+	PageCount int64 `json:"pageCount"`
+	PageSize  int64 `json:"pageSize"`
+	FreePages int64 `json:"freePages"`
+}
+
+func (st UsageDBStats) TotalBytes() int64 {
+	return st.PageCount * st.PageSize
+}
+
+func (st UsageDBStats) LogicalBytes() int64 {
+	return (st.PageCount - st.FreePages) * st.PageSize
+}
+
+// UsageDBPageStats 单条语句原子读取 page_count/page_size/freelist_count：
+// 三次独立 PRAGMA 之间夹着并发写入时，(page_count - freelist_count) 可能
+// 基于两个不同快照计算（理论上可为负），超量清理据此会误判收敛。
+func (s *Store) UsageDBPageStats(ctx context.Context) (UsageDBStats, error) {
+	var st UsageDBStats
+	err := s.db.QueryRowContext(ctx,
+		`SELECT (SELECT page_count FROM pragma_page_count),
+			(SELECT page_size FROM pragma_page_size),
+			(SELECT freelist_count FROM pragma_freelist_count)`).
+		Scan(&st.PageCount, &st.PageSize, &st.FreePages)
+	return st, err
+}
+
+// UsageRecordIDsExist 批量判断 request_id 是否仍存在于日志表（孤儿资产清扫用）。
+func (s *Store) UsageRecordIDsExist(ctx context.Context, ids []string) (map[string]bool, error) {
+	result := make(map[string]bool, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	where := usageInClause("request_id", len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT request_id FROM usage_records WHERE `+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		result[id] = true
+	}
+	return result, rows.Err()
+}
+
+// VacuumUsageDB 执行 VACUUM 回收空闲页并截断 WAL。需要短暂独占写锁、
+// 约双倍磁盘空间，调用方必须自行限频（见 usageRetention.maybeVacuum）。
+func (s *Store) VacuumUsageDB(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
 }
 
 func (s *Store) UsageTotals(ctx context.Context, q UsageQuery) (map[string]any, error) {
@@ -1251,9 +1561,10 @@ func (s *Store) UsageTotals(ctx context.Context, q UsageQuery) (map[string]any, 
 	}
 	// avg_first_byte 仅对 first_byte_ms > 0 的记录求平均（未记录首字的请求为 0）。
 	// firstUsedAt / lastUsedAt 仍返回，给旧 /__usage 面板算跨度（毫秒精度）。
+	// durationSum 是成功口径（见 usageTotalsRawInto），分母用 acc.success。
 	var avgDuration, avgFirstByte float64
-	if acc.requests > 0 {
-		avgDuration = float64(acc.durationSum) / float64(acc.requests)
+	if acc.success > 0 {
+		avgDuration = float64(acc.durationSum) / float64(acc.success)
 	}
 	if acc.firstByteCnt > 0 {
 		avgFirstByte = float64(acc.firstByteSum) / float64(acc.firstByteCnt)
@@ -1336,12 +1647,7 @@ func (s *Store) InsertSystemLog(ctx context.Context, level, message string, fiel
 }
 
 func (s *Store) QuerySystemLogs(ctx context.Context, limit, offset int, level string) (int, []SystemLog, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-	if offset < 0 {
-		offset = 0
-	}
+	limit, offset = clampPage(limit, offset, 100, systemLogPageMax)
 	where := "WHERE 1=1"
 	args := []any{}
 	if level != "" {
@@ -1392,4 +1698,17 @@ func (s *Store) ImportLegacyConfig(ctx context.Context, tokens []APIToken, group
 		}
 	}
 	return nil
+}
+
+// ExecRaw 执行裸 SQL（仅限测试与一次性迁移使用）。
+func (s *Store) ExecRaw(ctx context.Context, query string) error {
+	_, err := s.db.ExecContext(ctx, query)
+	return err
+}
+
+// QueryRecordBodiesWithAssets 流式返回 (request_id, record_json)，仅取
+// 含资产占位符的记录（LIKE 预过滤）。资产布局迁移重建引用表用。
+func (s *Store) QueryRecordBodiesWithAssets(ctx context.Context) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx,
+		`SELECT request_id, record_json FROM usage_records WHERE record_json LIKE '%__ELYSIA_ASSET__%'`)
 }

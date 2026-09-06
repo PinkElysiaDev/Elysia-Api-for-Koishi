@@ -1,20 +1,23 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   AlertTriangle,
   Database,
   Eye,
   EyeOff,
+  HardDrive,
   Layers,
   RefreshCw,
   RotateCcw,
   Save,
   Server,
   ShieldCheck,
+  Trash2,
 } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { RoleWatermark } from '@/components/role-watermark'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { NumberField } from '@/components/number-field'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { SettingSection, SettingRow } from '@/components/ui/setting-card'
@@ -22,8 +25,8 @@ import { ErrorState, LoadingState } from '@/components/ui/states'
 import { useToast } from '@/components/ui/use-toast'
 import { useRuntimeConfig, useModelCatalogStatus, revalidate } from '@/lib/hooks'
 import { api } from '@/lib/api'
-import { formatRelative } from '@/lib/utils'
-import type { LogLevel, RuntimeConfig } from '@/lib/types'
+import { formatRelative, formatBytes } from '@/lib/utils'
+import type { LogLevel, RuntimeConfig, UsageLogRuntimeConfig, UsageStorageStatus } from '@/lib/types'
 
 // 目录数据来源的展示名。
 function catalogSourceLabel(source: string): string {
@@ -39,6 +42,22 @@ function catalogSourceLabel(source: string): string {
   }
 }
 
+// 日志管理表单缺省值（后端 GET 返回生效值，老版本无该块时兜底）。
+/** 目录同步周期的表单默认（与后端 ResolveModelCatalogInterval 默认一致）。 */
+const defaultCatalogSyncMinutes = 1440
+
+const defaultUsageLog: UsageLogRuntimeConfig = {
+  persistEnabled: true,
+  retentionDays: 0,
+  maxStorageMB: 0,
+  maxRecords: 0,
+  bodyMaxKB: 1024,
+  bodyOnErrorOnly: false,
+  externalizeMedia: true,
+  cleanupIntervalMinutes: 60,
+}
+
+
 export function RuntimeConfigPage() {
   const toast = useToast()
   const { data, isLoading, error, mutate } = useRuntimeConfig()
@@ -48,9 +67,39 @@ export function RuntimeConfigPage() {
   const [restartNotice, setRestartNotice] = useState(false)
   const [showToken, setShowToken] = useState(false)
   const [catalogRefreshing, setCatalogRefreshing] = useState(false)
+  const [storage, setStorage] = useState<UsageStorageStatus | null>(null)
+  const [cleaning, setCleaning] = useState(false)
+
+  const refreshStorage = useCallback(async () => {
+    try {
+      setStorage(await api.usageStorage())
+    } catch {
+      // 占用状态展示尽力而为：失败保持旧值，不打断设置页。
+    }
+  }, [])
 
   useEffect(() => {
-    if (data) setForm(data)
+    refreshStorage()
+  }, [refreshStorage])
+
+  function updateUsageLog<K extends keyof UsageLogRuntimeConfig>(key: K, value: UsageLogRuntimeConfig[K]) {
+    setForm((prev) => (prev && prev.usageLog ? { ...prev, usageLog: { ...prev.usageLog, [key]: value } } : prev))
+  }
+
+  useEffect(() => {
+    // 数据入口一次性补默认块：后端省略 usageLog/modelCatalog 时就地归一化，
+    // 表达式与保存路径都不再需要 ?? 兜底（旧实现三处兜底口径不一致：
+    // 显示 1440、保存写 0，UI 与落盘会分叉）。
+    if (data)
+      setForm({
+        ...data,
+        usageLog: data.usageLog ?? defaultUsageLog,
+        modelCatalog: data.modelCatalog ?? {
+          enabled: true,
+          url: '',
+          syncIntervalMinutes: defaultCatalogSyncMinutes,
+        },
+      })
   }, [data])
 
   function update<K extends keyof RuntimeConfig>(key: K, value: RuntimeConfig[K]) {
@@ -59,12 +108,9 @@ export function RuntimeConfigPage() {
 
   async function handleSave() {
     if (!form) return
-    if (form.port < 1 || form.port > 65535) {
-      toast.error('端口非法', 'port 必须在 1-65535 之间')
-      return
-    }
-    if (form.httpTimeout < 0) {
-      toast.error('超时非法', 'httpTimeout 必须为非负整数')
+    // 下界由 NumberField 的 min 钳制保证，这里只校验上界。
+    if (form.port > 65535) {
+      toast.error('端口非法', 'port 不能超过 65535')
       return
     }
     setSaving(true)
@@ -79,10 +125,13 @@ export function RuntimeConfigPage() {
         databasePath: form.databasePath,
         enablePprof: form.enablePprof,
         allowFakeIPOutbound: form.allowFakeIPOutbound,
+        // 日志管理：数值字段整体回写（GET 返回生效值，保存即显式化当前口径）。
+        usageLog: form.usageLog ?? defaultUsageLog,
         // 目录刷新周期：0 = 默认 24h；保存即生效（后台周期动态读取配置）。
-        modelCatalog: { syncIntervalMinutes: form.modelCatalog?.syncIntervalMinutes ?? 0 },
+        modelCatalog: { syncIntervalMinutes: form.modelCatalog?.syncIntervalMinutes ?? defaultCatalogSyncMinutes },
       })
       await revalidate.runtimeConfig()
+      refreshStorage()
       setRestartNotice(result.restartRequired)
       toast.success(
         '运行配置已更新',
@@ -124,6 +173,7 @@ export function RuntimeConfigPage() {
           title="运行配置"        actions={
           <>
             <Button
+              variant="ghost"
               onClick={async () => {
                 try {
                   await api.reload()
@@ -143,7 +193,7 @@ export function RuntimeConfigPage() {
       />
 
       {restartNotice && (
-        <div className="flex items-center gap-3 rounded-xl border border-amber/40 bg-amber/10 px-4 py-3 text-sm text-amber shadow-sm">
+        <div className="flex items-center gap-3 rounded-xl border border-[color:color-mix(in_srgb,var(--amber)_40%,transparent)] bg-[color-mix(in_srgb,var(--amber)_10%,transparent)] px-4 py-3 text-sm text-amber shadow-sm">
           <AlertTriangle className="h-5 w-5 shrink-0" />
           <span>部分基础配置已变更，需要手动重启或通过服务管理器重启后端进程方可生效。</span>
         </div>
@@ -173,13 +223,11 @@ export function RuntimeConfigPage() {
               label="监听 Port"
               description="服务监听端口（1 ~ 65535，需重启生效）"
             >
-              <Input
-                type="number"
-                min={1}
-                max={65535}
-                className="w-full sm:w-56 font-mono text-xs"
+              <NumberField
                 value={form.port}
-                onChange={(e) => update('port', Number(e.target.value) || 0)}
+                min={1}
+                className="w-full sm:w-56 font-mono text-xs"
+                onCommit={(v) => update('port', v)}
               />
             </SettingRow>
 
@@ -207,12 +255,11 @@ export function RuntimeConfigPage() {
               description="上游请求超时时间（秒，0 表示不设硬性超时）"
             >
               <div className="flex w-full items-center gap-2 sm:w-56">
-                <Input
-                  type="number"
+                <NumberField
+                  value={form.httpTimeout}
                   min={0}
                   className="font-mono text-xs"
-                  value={form.httpTimeout}
-                  onChange={(e) => update('httpTimeout', Math.max(0, Number(e.target.value) || 0))}
+                  onCommit={(v) => update('httpTimeout', v)}
                 />
                 <span className="shrink-0 text-xs text-muted-foreground">秒</span>
               </div>
@@ -261,7 +308,7 @@ export function RuntimeConfigPage() {
               />
             </SettingRow>
             {form.allowFakeIPOutbound && (
-              <div className="rounded-lg bg-amber/10 p-2.5 text-2xs text-amber flex items-center gap-2">
+              <div className="rounded-lg bg-[color-mix(in_srgb,var(--amber)_10%,transparent)] p-2.5 text-2xs text-amber flex items-center gap-2">
                 <AlertTriangle className="h-4 w-4 shrink-0" />
                 <span>已放宽 fake-ip SSRF 出站校验，真实内网与 169.254 元数据仍处于拦截保护中。</span>
               </div>
@@ -347,19 +394,18 @@ export function RuntimeConfigPage() {
               description="定期后台同步周期（分钟，0 表示不启用该功能）"
             >
               <div className="flex w-full items-center gap-2 sm:w-48">
-                <Input
-                  type="number"
+                <NumberField
+                  value={form.modelCatalog?.syncIntervalMinutes ?? defaultCatalogSyncMinutes}
                   min={0}
                   className="font-mono text-xs"
-                  value={form.modelCatalog?.syncIntervalMinutes ?? 1440}
-                  onChange={(e) =>
+                  onCommit={(v) =>
                     setForm((prev) =>
                       prev
                         ? {
                             ...prev,
                             modelCatalog: {
                               ...(prev.modelCatalog ?? { enabled: true, url: '', syncIntervalMinutes: 1440 }),
-                              syncIntervalMinutes: Math.max(0, Number(e.target.value) || 0),
+                              syncIntervalMinutes: v,
                             },
                           }
                         : prev,
@@ -392,6 +438,193 @@ export function RuntimeConfigPage() {
                   <AlertTriangle className="h-3 w-3 shrink-0" /> 在线拉取异常：{catalogStatus.lastError}
                 </p>
               )}
+            </div>
+          </div>
+        </SettingSection>
+
+        {/* 章节 5: 日志管理 */}
+        <SettingSection
+          icon={HardDrive}
+          title="日志管理"
+          description="请求日志的留存策略、请求体保存上限与媒体外置"
+          action={
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={cleaning}
+              onClick={async () => {
+                setCleaning(true)
+                try {
+                  const result = await api.usageCleanup()
+                  if (result.accepted) {
+                    toast.success('清理已触发', '后台正在执行一轮清理巡检，稍后刷新查看结果')
+                    // 巡检是异步的，稍等后再拉取状态。
+                    setTimeout(refreshStorage, 3000)
+                  } else {
+                    toast.success('清理已在进行中', '上一轮清理尚未结束，请稍后再试')
+                  }
+                } catch (err) {
+                  toast.error('触发清理失败', (err as Error).message)
+                } finally {
+                  setCleaning(false)
+                }
+              }}
+            >
+              <Trash2 className="h-3.5 w-3.5" /> 立即清理
+            </Button>
+          }
+        >
+          <div className="space-y-4">
+            <SettingRow
+              label="启用日志持久化"
+              description="关闭后新请求完全不落库（统计与日志面板不再更新）"
+            >
+              <Switch
+                checked={form.usageLog?.persistEnabled}
+                onCheckedChange={(v) => updateUsageLog('persistEnabled', v)}
+              />
+            </SettingRow>
+
+            <SettingRow
+              label="过期清理天数"
+              description="自动删除早于该天数的日志记录（0 = 不启用过期清理）"
+            >
+              <div className="flex w-full items-center gap-2 sm:w-48">
+                <NumberField
+                  value={form.usageLog?.retentionDays ?? defaultUsageLog.retentionDays}
+                  min={0}
+                  className="font-mono text-xs"
+                  onCommit={(v) => updateUsageLog('retentionDays', v)}
+                />
+                <span className="shrink-0 text-xs text-muted-foreground">天</span>
+              </div>
+            </SettingRow>
+
+            <SettingRow
+              label="最大占用"
+              description="数据库体积超限时按最旧优先自动清理（0 = 不限）"
+            >
+              <div className="flex w-full items-center gap-2 sm:w-48">
+                <NumberField
+                  value={form.usageLog?.maxStorageMB ?? defaultUsageLog.maxStorageMB}
+                  min={0}
+                  className="font-mono text-xs"
+                  onCommit={(v) => updateUsageLog('maxStorageMB', v)}
+                />
+                <span className="shrink-0 text-xs text-muted-foreground">MB</span>
+              </div>
+            </SettingRow>
+
+            <SettingRow
+              label="最大保留条数"
+              description="超出该条数时自动删除最旧的日志（0 = 不限）"
+            >
+              <div className="flex w-full items-center gap-2 sm:w-48">
+                <NumberField
+                  value={form.usageLog?.maxRecords ?? defaultUsageLog.maxRecords}
+                  min={0}
+                  className="font-mono text-xs"
+                  onCommit={(v) => updateUsageLog('maxRecords', v)}
+                />
+                <span className="shrink-0 text-xs text-muted-foreground">条</span>
+              </div>
+            </SettingRow>
+
+            <SettingRow
+              label="请求体保存上限"
+              description="每段链路（请求/转发/回传）落库的最大体积（0 = 不保存任何请求体）"
+            >
+              <div className="flex w-full items-center gap-2 sm:w-48">
+                <NumberField
+                  value={form.usageLog?.bodyMaxKB ?? defaultUsageLog.bodyMaxKB}
+                  min={0}
+                  className="font-mono text-xs"
+                  onCommit={(v) => updateUsageLog('bodyMaxKB', v)}
+                />
+                <span className="shrink-0 text-xs text-muted-foreground">KB</span>
+              </div>
+            </SettingRow>
+
+            <SettingRow
+              label="仅保存出错请求体"
+              description="开启后成功请求不保留请求体（仅元数据），失败请求完整保留以便排查"
+            >
+              <Switch
+                checked={form.usageLog?.bodyOnErrorOnly}
+                onCheckedChange={(v) => updateUsageLog('bodyOnErrorOnly', v)}
+              />
+            </SettingRow>
+
+            <SettingRow
+              label="媒体外置保存"
+              description="请求体中的 base64 媒体（图片/音频/视频/文件）存为独立文件，正文以占位符替代"
+            >
+              <Switch
+                checked={form.usageLog?.externalizeMedia}
+                onCheckedChange={(v) => updateUsageLog('externalizeMedia', v)}
+              />
+            </SettingRow>
+
+            <SettingRow
+              label="清理巡检周期"
+              description="后台自动清理的执行周期（分钟，最小 5）"
+            >
+              <div className="flex w-full items-center gap-2 sm:w-48">
+                <Input
+                  type="number"
+                  min={5}
+                  className="font-mono text-xs"
+                  value={form.usageLog?.cleanupIntervalMinutes ?? defaultUsageLog.cleanupIntervalMinutes}
+                  onChange={(e) =>
+                    updateUsageLog('cleanupIntervalMinutes', Math.max(0, Number(e.target.value) || 0))
+                  }
+                />
+                <span className="shrink-0 text-xs text-muted-foreground">分钟</span>
+              </div>
+            </SettingRow>
+
+            {/* 当前占用与最近清理结果 */}
+            <div className="border-t border-border/40 pt-3 text-xs space-y-2">
+              <div className="flex items-center justify-between text-muted-foreground">
+                <span>数据库占用</span>
+                <span className="font-semibold text-foreground">
+                  {storage ? `${formatBytes(storage.db.totalBytes)}（逻辑 ${formatBytes(storage.db.logicalBytes)}）` : '—'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-muted-foreground">
+                <span>日志记录</span>
+                <span className="font-semibold text-foreground">
+                  {storage ? `${storage.recordCount.toLocaleString()} 条` : '—'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-muted-foreground">
+                <span>外置媒体</span>
+                <span className="font-semibold text-foreground">
+                  {storage ? `${storage.assets.files.toLocaleString()} 个 · ${formatBytes(storage.assets.bytes)}` : '—'}
+                </span>
+              </div>
+              {storage?.lastCleanup?.lastRunAt && (
+                <div className="flex items-center justify-between text-muted-foreground">
+                  <span>最近清理</span>
+                  <span className="font-mono text-2xs">
+                    {formatRelative(storage.lastCleanup.lastRunAt)}
+                    {storage.lastCleanup.deletedByTTL +
+                      storage.lastCleanup.deletedByRecords +
+                      storage.lastCleanup.deletedBySize >
+                    0
+                      ? ` · 删 ${storage.lastCleanup.deletedByTTL + storage.lastCleanup.deletedByRecords + storage.lastCleanup.deletedBySize} 条`
+                      : ' · 无删除'}
+                  </span>
+                </div>
+              )}
+              {storage?.lastCleanup?.lastError && (
+                <p className="mt-2 text-2xs text-ember flex items-center gap-1">
+                  <AlertTriangle className="h-3 w-3 shrink-0" /> 清理异常：{storage.lastCleanup.lastError}
+                </p>
+              )}
+              <p className="pt-1 text-2xs text-muted-foreground/70">
+                统计聚合（小时/日汇总）在日志清理后仍完整保留，历史用量报表不受影响。
+              </p>
             </div>
           </div>
         </SettingSection>

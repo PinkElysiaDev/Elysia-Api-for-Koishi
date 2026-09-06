@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -79,6 +78,15 @@ type Server struct {
 	// 可选的后台健康检测器（config.HealthCheck.Enabled 控制）。
 	healthChecker *healthChecker
 
+	// 后台日志清理器（usageLog.retentionDays/maxStorageMB/maxRecords 控制，
+	// 默认全关；孤儿资产清扫作为卫生活常开）。
+	usageRetention *usageRetention
+
+	// 资产目录体积统计的短 TTL 缓存（WalkDir 全量遍历，设置页会轮询）。
+	assetsUsageMu sync.Mutex
+	assetsUsage   usageAssetsUsage
+	assetsUsageAt time.Time
+
 	// httpServer 持有底层 http.Server 引用，供 /__shutdown 优雅关停使用。
 	httpServer *http.Server
 
@@ -116,11 +124,8 @@ func New(cfg *config.Config) *Server {
 		engine.Use(gin.Logger())
 	}
 
-	// 获取 HTTP 超时配置，默认 120 秒
+	// HTTP 超时（秒）；0 表示不限制（time.Duration(0) 本身即 0，无需特判）。
 	httpTimeout := time.Duration(cfg.HTTPTimeout) * time.Second
-	if cfg.HTTPTimeout == 0 {
-		httpTimeout = 0 // 0 表示不限制
-	}
 
 	server := &Server{
 		config:           cfg,
@@ -149,6 +154,24 @@ func New(cfg *config.Config) *Server {
 		log.Printf("failed to open sqlite store: %v", err)
 	} else {
 		server.store = store
+		// 密钥完整性探测：master-key 丢失/更换会让全部密文行解不开——路由
+		// 装配失败导致所有请求 401、管理面板 500。与其静默砖死，启动时把
+		// 原因与恢复手段喊出来（恢复 .master-key 文件或设置环境变量）。
+		if hasEncrypted, decryptOK, perr := store.SecretIntegrityProbe(context.Background()); perr != nil {
+			log.Printf("secret integrity probe failed: %v", perr)
+		} else if hasEncrypted && !decryptOK {
+			log.Printf("========================================================================")
+			log.Printf("FATAL-WARNING: encrypted secrets exist but the current master key cannot decrypt them.")
+			log.Printf("All upstream keys / API tokens are unreadable: routing will fail with 401")
+			log.Printf("and the admin panel cannot list sources/tokens until this is fixed.")
+			log.Printf("Recovery: restore the original .master-key file next to the database, or set")
+			log.Printf("ELYSIA_API_MASTER_KEY to the previous value. Rows are kept (secrets cleared)")
+			log.Printf("so they can be re-entered from the panel once the key is restored.")
+			log.Printf("========================================================================")
+		}
+		// 一次性资产布局迁移：旧的按请求分目录 → 扁平内容寻址 + 引用重建。
+		// 幂等（无子目录即跳过）；失败只告警，交给孤儿清扫兜底。
+		server.migrateUsageAssetsLayout()
 		// 历史数据回填进小时级 rollup 预聚合表（后台、幂等、可断点续跑）；
 		// 完成前聚合查询自动走 raw 路径，功能不受影响。
 		store.StartRollupBackfill()
@@ -196,9 +219,9 @@ func compactLogJSON(data []byte) string {
 }
 
 func (s *Server) setupRoutes() {
-	if s.config.MaxBodyBytes > 0 {
+	if s.config.GetMaxBodyBytes() > 0 {
 		s.engine.Use(func(c *gin.Context) {
-			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, s.config.MaxBodyBytes)
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, s.config.GetMaxBodyBytes())
 			c.Next()
 		})
 	}
@@ -472,7 +495,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		inputFormat = relay.FormatOpenAI
 	}
 	record := s.initUsageRecord(c, startTime, bodyBytes, inputFormat)
-	installDownstreamCapture(c, record)
+	installDownstreamCapture(c, record, downstreamCaptureLimit(s.usageLogConfig()))
 	s.logVerbose("[Input Format] %s", inputFormat)
 
 	// 转换为 Maheshvara 核心请求。
@@ -483,93 +506,28 @@ func (s *Server) chatCompletions(c *gin.Context) {
 	maheshvaraReq, _, maheshvaraErr := relay.ConvertRequestToMaheshvara(bodyBytes, inputFormat, urlModel)
 	if maheshvaraErr != nil {
 		log.Printf("Error converting request to Maheshvara: %v", maheshvaraErr)
-		c.JSON(400, gin.H{"error": fmt.Sprintf("Failed to convert request to Maheshvara: %v", maheshvaraErr)})
+		// 转换失败同样落 usage 记录（与 /v1/responses 路径对齐）：bodyOnErrorOnly
+		// 模式下这类记录恰恰是唯一保留请求体的排查样本。
+		s.failRequestKind(c, record, startTime, http.StatusBadRequest, ErrorKindConversion,
+			fmt.Sprintf("Failed to convert request to Maheshvara: %v", maheshvaraErr))
 		return
 	}
 
-	// Gemini 原生路径 /v1beta/models/MODEL:generateContent 中模型名在 URL 里
-	// 若请求体没有 model 字段，从路径参数提取
-	if maheshvaraReq.Model == "" {
-		if action := c.Param("action"); action != "" {
-			// action 形如 /gemini-2.0-flash:generateContent（geminiModelFromAction
-			// 内部已剥离 :action 后缀，无需二次处理）。
-			maheshvaraReq.Model = geminiModelFromAction(action)
-		}
-	}
+	// Gemini 原生路径的模型名提取已由 ConvertRequestToMaheshvara 内部完成
+	//（body 无 model 时回填 urlModel），此处无需重复推导。
 	if maheshvaraJSON, err := json.Marshal(maheshvaraReq); err == nil {
 		s.logVerbose("[Maheshvara Request] %s", compactLogJSON(maheshvaraJSON))
 	}
 
-	// 模型组级访问权限：先于 validateModelGroup 校验请求的模型组名，
-	// 这样即使目标组为空/未配置，越权访问也返回 403（而非泄露组的存在性/状态）。
-	if !s.tokenAllowsGroup(c, maheshvaraReq.Model) {
-		s.failRequest(c, record, startTime, http.StatusForbidden, fmt.Sprintf("api key is not allowed to access model group '%s'", maheshvaraReq.Model))
+	// 共用前置阶段：鉴权 → 组校验 → 候选 → 能力约束 → 预估 → 限流。
+	plan, ok := s.prepareRelayPlan(c, record, startTime, maheshvaraReq, relayFailer{s: s, c: c, record: record, startTime: startTime}, true)
+	if !ok {
 		return
 	}
-
-	// 验证并获取模型组
-	group, err := s.validateModelGroup(maheshvaraReq.Model)
-	if err != nil {
-		statusCode := 500
-		if errMsg := err.Error(); strings.Contains(errMsg, "not found") {
-			statusCode = 404
-		} else if strings.Contains(errMsg, "disabled") {
-			statusCode = 403
-		}
-		s.failRequest(c, record, startTime, statusCode, err.Error())
-		return
-	}
-	setRecordGroup(record, group)
-
-	// 构建有序候选模型列表，按模型组策略排列。失败时逐个故障转移。
-	candidates := s.buildCandidates(group)
-	if len(candidates) == 0 {
-		s.failRequest(c, record, startTime, http.StatusInternalServerError, fmt.Sprintf("no available models in group '%s'", group.Name))
-		return
-	}
-	// 渠道亲和性：把该 key+group 上次成功的模型提到候选最前（短 TTL 粘连），
-	// 提升上游 prompt 缓存命中率。不改变候选集合，故障转移逻辑不受影响。
-	if sticky := s.affinity.get(record.KeyHash, group.ID, startTime); sticky != "" {
-		candidates = applyAffinity(candidates, sticky)
-	}
-	// 组内候选软过滤（方向2）：按请求内容把不支持所需能力的候选移到末尾。
-	candidates = reorderCandidatesByRequestNeeds(candidates,
-		maheshvaraRequestHasMultimodalInput(maheshvaraReq), maheshvaraRequestUsesTools(maheshvaraReq))
-	// 多 key 展开（方向6）：按源策略把候选解析为逐次尝试序列（single 时原样）。
-	candidates = s.expandCandidatesByKeyStrategy(candidates)
-
-	// 如果模型组配置了 MaxTokens，覆盖客户端发来的值
-	if group.MaxTokens > 0 {
-		maheshvaraReq.MaxOutputTokens = group.MaxTokens
-	}
-	// 组级 tools 能力落地（方向2）：组声明不支持工具而请求携带工具定义/工具消息时，
-	// 400 拒绝并明确报错——静默剥离会破坏 agent 循环语义（已确认的产品决策）。
-	if rejectToolRequestsIfNeeded(group, maheshvaraReq) {
-		s.failRequest(c, record, startTime, http.StatusBadRequest,
-			fmt.Sprintf("model group '%s' does not support tool calling, but the request contains tools or tool messages", group.Name))
-		return
-	}
-	filtered, filteredParts, filteredModalities := filterMaheshvaraMultimodalInputsIfNeeded(group, maheshvaraReq)
-	if filtered {
-		s.logVerbose("[Maheshvara Multimodal Filter] group=%s filteredParts=%d modalities=%v", group.Name, filteredParts, filteredModalities)
-		if maheshvaraJSON, err := json.Marshal(maheshvaraReq); err == nil {
-			s.logVerbose("[Maheshvara Request After Multimodal Filter] %s", compactLogJSON(maheshvaraJSON))
-		}
-		// 让客户端可感知剥离行为（非纯静默）：形如 "image,audio"。
-		c.Writer.Header().Set("X-Elysia-Filtered-Modalities", strings.Join(filteredModalities, ","))
-	}
-
-	estimatedUsage := estimateMaheshvaraRequestUsage(maheshvaraReq, s.config.GetUsageConfig())
-	estimatedTokens := estimatedUsage.EstimatedTotalTokens
-	record.Usage = usageTokenUsageFromMaheshvara(estimatedUsage)
-	record.UsageDetail = usageDetailFromMaheshvara(estimatedUsage)
-	record.UsageSource = estimatedUsage.Source
-	releaseLimiter, err := s.acquireRateLimit(group, estimatedTokens)
-	if err != nil {
-		s.failRequest(c, record, startTime, http.StatusTooManyRequests, err.Error())
-		return
-	}
-	defer releaseLimiter()
+	group, candidates := plan.group, plan.candidates
+	filtered := plan.filtered
+	estimatedTokens := plan.estimatedTokens
+	defer plan.releaseLimiter()
 
 	attempts := maxAttempts(group.MaxRetries, len(candidates))
 	var lastStatus int
@@ -577,6 +535,12 @@ func (s *Server) chatCompletions(c *gin.Context) {
 	committed := false
 
 	for attempt := 0; attempt < attempts; attempt++ {
+		// 循环顶部拦截客户端取消：interval=0 时无等待期可拦截，断连后
+		// 仍会向剩余候选逐个扇出空耗上游配额。
+		if attempt > 0 && s.abortRetryOnClientCancel(c, record, startTime) {
+			committed = true
+			return
+		}
 		selectedModel := candidates[attempt]
 		isLast := attempt == attempts-1
 
@@ -587,12 +551,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 			lastErr = fmt.Sprintf("target baseUrl rejected: %v", err)
 			s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
 			if isLast {
-				record.StatusCode = lastStatus
-				record.Error = lastErr
-				record.EndedAt = time.Now()
-				record.DurationMs = time.Since(startTime).Milliseconds()
-				s.recordUsage(record)
-				c.JSON(http.StatusForbidden, gin.H{"error": lastErr})
+				s.commitLastAttemptFailure(c, record, startTime, lastStatus, "", lastErr, gin.H{"error": lastErr})
 				committed = true
 			}
 			continue
@@ -633,14 +592,14 @@ func (s *Server) chatCompletions(c *gin.Context) {
 				passModelName = ""
 			} else {
 				ensureStream = isStream
-				addStreamOptions = targetPlatform == relay.PlatformOpenAI || targetPlatform == relay.PlatformDeepSeek || targetPlatform == relay.PlatformAzure
+				addStreamOptions = isOpenAICompatible(targetPlatform)
 			}
 			targetBody, err = relay.PassthroughBody(bodyBytes, passModelName, ensureStream, addStreamOptions)
 			if err == nil {
 				record.RelayMode = RelayModePassthrough
 				// OpenAI 系透传同样补齐缺失的 tool call id：部分客户端重建历史时
 				// 会遗漏 tool_calls[].id，直接透传会被严格上游以 missing field id 拒绝。
-				if targetPlatform == relay.PlatformOpenAI || targetPlatform == relay.PlatformDeepSeek || targetPlatform == relay.PlatformAzure {
+				if isOpenAICompatible(targetPlatform) {
 					targetBody, err = relay.NormalizeOpenAIToolCallIDs(targetBody)
 				}
 			}
@@ -668,17 +627,12 @@ func (s *Server) chatCompletions(c *gin.Context) {
 			lastErr = fmt.Sprintf("Failed to build upstream request: %v", err)
 			s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
 			if isLast {
-				record.StatusCode = lastStatus
-				record.Error = lastErr
-				record.EndedAt = time.Now()
-				record.DurationMs = time.Since(startTime).Milliseconds()
-				s.recordUsage(record)
-				c.JSON(lastStatus, gin.H{"error": lastErr})
+				s.commitLastAttemptFailure(c, record, startTime, lastStatus, ErrorKindConversion, lastErr, gin.H{"error": lastErr})
 				committed = true
 			}
 			continue
 		}
-		record.OutgoingBody = sanitizeUsageBody(targetBody)
+		record.OutgoingBody = record.sanitizeBody(targetBody)
 		s.logVerbose("[Outgoing Request] passthrough=%v baseUrl=%s body=%s", usePassthrough, selectedModel.BaseURL, compactLogJSON(targetBody))
 
 		// 非透传路径仍需为流式补齐 stream 标记（透传已在 PassthroughBody 内处理）。
@@ -690,17 +644,12 @@ func (s *Server) chatCompletions(c *gin.Context) {
 				lastErr = fmt.Sprintf("Failed to prepare stream request: %v", streamBodyErr)
 				s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
 				if isLast {
-					record.StatusCode = lastStatus
-					record.Error = lastErr
-					record.EndedAt = time.Now()
-					record.DurationMs = time.Since(startTime).Milliseconds()
-					s.recordUsage(record)
-					c.JSON(500, gin.H{"error": lastErr})
+					s.commitLastAttemptFailure(c, record, startTime, lastStatus, ErrorKindConversion, lastErr, gin.H{"error": lastErr})
 					committed = true
 				}
 				continue
 			}
-			record.OutgoingBody = sanitizeUsageBody(targetBody)
+			record.OutgoingBody = record.sanitizeBody(targetBody)
 		}
 
 		var outcome relayOutcome
@@ -725,29 +674,33 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		lastErr = outcome.errMsg
 		s.appendRetryEvent(record, attempt, selectedModel.Name, outcome.errMsg)
 		if !isLast && group.RetryInterval > 0 {
-			// 尊重客户端取消：被放弃的请求不再空耗等待 + 对剩余候选扇出。
-			select {
-			case <-c.Request.Context().Done():
+			// 尊重客户端取消：被放弃的请求不再空耗等待 + 对剩余候选扇出
+			//（取消同样落库留痕，499 为 nginx 惯例的 client closed）。
+			if !waitForRetryOrCancel(c, group.RetryInterval) {
 				committed = true
-				record.StatusCode = 499 // client closed request（nginx 惯例码）
+				s.abortRetryOnClientCancel(c, record, startTime)
 				return
-			case <-time.After(time.Duration(group.RetryInterval) * time.Millisecond):
 			}
 		}
 	}
 
-	// 兜底：理论上最后一次尝试一定会 commit；若因边界情况未 commit，
-	// 这里补一个错误响应，避免客户端收到空响应。
+	// 兜底：最后一次尝试一定会 commit（failResult 的 isLast||!retryable 分支
+	// 与全部提前返回已覆盖）；此块仅防御未来路径回归。lastStatus 理论上
+	// 必非 0，但真为 0 时 c.JSON(0,…) 会让 net/http panic 且记录丢失——
+	// 兜底的兜底，一行守卫换掉一个潜在 panic（与 responses 入口对齐）。
 	if !committed {
-		if lastStatus == 0 {
+		if lastStatus <= 0 {
 			lastStatus = http.StatusBadGateway
 		}
 		record.StatusCode = lastStatus
-		record.Error = lastErr
+		record.Error = firstNonEmpty(lastErr, "all upstream attempts failed")
+		record.ErrorKind = ErrorKindUpstream
 		record.EndedAt = time.Now()
 		record.DurationMs = time.Since(startTime).Milliseconds()
+		// 先写响应再落记录：错误体进下游捕获器后，第四段才有内容。
+		// 状态码与记录保持一致（旧实现记录 429 却恒回 502）。
+		c.JSON(lastStatus, gin.H{"error": record.Error})
 		s.recordUsage(record)
-		c.JSON(http.StatusBadGateway, gin.H{"error": firstNonEmpty(lastErr, "all upstream attempts failed")})
 	}
 }
 
@@ -762,6 +715,7 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 		if isLast || !retryable {
 			record.StatusCode = statusCode
 			record.Error = errMsg
+			record.ErrorKind = ErrorKindUpstream
 			if respBody != nil {
 				c.Data(statusCode, contentType, respBody)
 			} else {
@@ -802,13 +756,13 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 
 		if httpResp.StatusCode != http.StatusOK {
 			respBody, _ := io.ReadAll(httpResp.Body)
-			result = failResult(httpResp.StatusCode, string(respBody), respBody, "application/json")
+			result = failResult(httpResp.StatusCode, string(respBody), respBody, contentTypeJSON)
 			return result
 		}
 
 		var claudeResp relay.ClaudeResponse
 		respBody, err := readBodyAndJSON(httpResp, &claudeResp)
-		record.ProviderResponse = sanitizeUsageBody(respBody)
+		record.ProviderResponse = record.sanitizeBody(respBody)
 		if err != nil {
 			log.Printf("Error parsing Claude response: %v", err)
 			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to parse response: %v", err), nil, "")
@@ -848,13 +802,13 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 
 		if httpResp.StatusCode != http.StatusOK {
 			respBody, _ := io.ReadAll(httpResp.Body)
-			result = failResult(httpResp.StatusCode, string(respBody), respBody, "application/json")
+			result = failResult(httpResp.StatusCode, string(respBody), respBody, contentTypeJSON)
 			return result
 		}
 
 		var geminiResp relay.GeminiResponse
 		respBody, err := readBodyAndJSON(httpResp, &geminiResp)
-		record.ProviderResponse = sanitizeUsageBody(respBody)
+		record.ProviderResponse = record.sanitizeBody(respBody)
 		if err != nil {
 			log.Printf("Error parsing Gemini response: %v", err)
 			result = failResult(http.StatusInternalServerError, fmt.Sprintf("Failed to parse response: %v", err), nil, "")
@@ -888,12 +842,12 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 		if err != nil {
 			log.Printf("Error forwarding request (status=%d): %v", statusCode, err)
 			if len(respBody) > 0 {
-				record.ProviderResponse = sanitizeUsageBody(respBody)
+				record.ProviderResponse = record.sanitizeBody(respBody)
 			}
 			if statusCode > 0 {
 				// 上游返回了真实状态码与错误体：透传给客户端（与 Claude/Gemini 分支一致），
 				// 并据真实状态码决定是否故障转移。
-				result = failResult(statusCode, string(respBody), respBody, "application/json")
+				result = failResult(statusCode, string(respBody), respBody, contentTypeJSON)
 			} else {
 				// 连接层错误（无状态码）：当作可重试的 502。
 				result = failResult(http.StatusBadGateway, fmt.Sprintf("Failed to forward request: %v", err), nil, "")
@@ -901,7 +855,7 @@ func (s *Server) handleNormalRequest(c *gin.Context, group *config.ModelGroupCon
 			return result
 		}
 
-		record.ProviderResponse = sanitizeUsageBody(respBody)
+		record.ProviderResponse = record.sanitizeBody(respBody)
 		applyProviderUsageToRecord(record, extractProviderUsageFromBody(targetPlatform, "", respBody))
 		applyLocalResponseEstimate(record, extractOutputTextFromProviderBody(targetPlatform, "", respBody), s.config.GetUsageConfig())
 		actualTokens := getInt(record.Usage.TotalTokens)
@@ -942,14 +896,6 @@ func (s *Server) handleStreamRequest(c *gin.Context, group *config.ModelGroupCon
 
 	// upstreamErrorStatus 从错误中提取上游真实状态码（UpstreamStatusError），
 	// 无则回退 fallback——永久错误（401/403/400）不得洗白成可重试的 502。
-	upstreamErrorStatus := func(err error, fallback int) int {
-		var statusErr *relay.UpstreamStatusError
-		if errors.As(err, &statusErr) && statusErr.StatusCode > 0 {
-			return statusErr.StatusCode
-		}
-		return fallback
-	}
-
 	// 流式失败的可重试性判定。注意：一旦开始向客户端写出 SSE 字节，
 	// 就无法再重试（响应头已发出），因此重试只发生在"建立上游连接 +
 	// 读到上游首个状态码"之前。
@@ -958,10 +904,14 @@ func (s *Server) handleStreamRequest(c *gin.Context, group *config.ModelGroupCon
 		if isLast || !retryable {
 			record.StatusCode = statusCode
 			record.Error = errMsg
+			record.ErrorKind = ErrorKindUpstream
 			if respBody != nil {
-				c.Data(statusCode, "application/json", respBody)
+				c.Data(statusCode, contentTypeJSON, respBody)
 			} else {
-				writeStreamForwardError(c, inputFormat, fmt.Errorf("%s", errMsg))
+				// 透传真实上游状态码（failResult 的 statusCode 已经过
+				// upstreamErrorStatus 提取）：固定 502 会让客户端看到
+				// 502 而日志记的是 401/403 等永久错误。
+				writeStreamForwardError(c, inputFormat, statusCode, fmt.Errorf("%s", errMsg))
 			}
 			return relayOutcome{committed: true, statusCode: statusCode, errMsg: errMsg}
 		}
@@ -994,10 +944,9 @@ func (s *Server) handleStreamRequest(c *gin.Context, group *config.ModelGroupCon
 	}
 
 	writer := &observingStreamWriter{
-		inner:        &ginStreamWriter{writer: c.Writer, flusher: flusher},
-		record:       record,
-		startTime:    startTime,
-		observeUsage: false,
+		inner:     &ginStreamWriter{writer: c.Writer, flusher: flusher},
+		record:    record,
+		startTime: startTime,
 	}
 
 	// forwardErr 收集"上游连接成功、SSE 已开始后"的流转发/转换错误。
@@ -1087,6 +1036,9 @@ func (s *Server) handleStreamRequest(c *gin.Context, group *config.ModelGroupCon
 	}
 
 	applyLocalResponseEstimate(record, writer.responseText.String(), s.config.GetUsageConfig())
+	// 流式成功路径同样累计日限额（与全部 8 条非流式/自定义路径对齐；
+	// 漏记会让 DailyLimitMaxTokens 对流式客户端形同虚设）。
+	s.adjustTokenUsage(group.ID, getInt(record.Usage.TotalTokens))
 	s.logDebug("Stream request completed in %dms", time.Since(startTime).Milliseconds())
 	result = relayOutcome{committed: true, statusCode: record.StatusCode}
 	return result
@@ -1116,13 +1068,17 @@ func readBodyAndJSON(resp *http.Response, v interface{}) ([]byte, error) {
 func writeStreamForwardError(
 	c *gin.Context,
 	inputFormat relay.FormatType,
+	statusCode int,
 	err error,
 ) {
 	message := fmt.Sprintf("Failed to forward request: %v", err)
+	if statusCode < 400 || statusCode > 599 {
+		statusCode = http.StatusBadGateway
+	}
 
 	switch inputFormat {
 	case relay.FormatClaude:
-		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
+		c.AbortWithStatusJSON(statusCode, gin.H{
 			"type": "error",
 			"error": gin.H{
 				"type":    "api_error",
@@ -1130,7 +1086,7 @@ func writeStreamForwardError(
 			},
 		})
 	default:
-		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
+		c.AbortWithStatusJSON(statusCode, gin.H{
 			"error": message,
 		})
 	}
@@ -1154,7 +1110,7 @@ func ensureStreamFlagInTargetBody(
 	req["stream"] = true
 
 	// OpenAI 兼容接口可附带 stream_options，帮助下游返回 usage chunk
-	if targetPlatform == relay.PlatformOpenAI || targetPlatform == relay.PlatformDeepSeek || targetPlatform == relay.PlatformAzure {
+	if isOpenAICompatible(targetPlatform) {
 		streamOptions, ok := req["stream_options"].(map[string]interface{})
 		if !ok {
 			streamOptions = map[string]interface{}{}
@@ -1184,11 +1140,6 @@ func (w *ginStreamWriter) Flush() error {
 	w.flusher.Flush()
 	return nil
 }
-
-// selectModel 根据配置的策略选择单个模型（首选）。
-// 现在复用 buildCandidates 的有序候选列表取第一个，避免旧实现里
-// round-robin 用过期索引访问 models[idx] 导致的越界 panic（高危1）。
-// 需要故障转移的路径应直接使用 buildCandidates 遍历全部候选。
 
 // tokenAllowsGroup 校验当前请求的 API key 是否被允许访问指定模型组。
 // 从 gin context 取 authMiddleware 写入的 AllowedGroups：为空表示不限制（放行）；
@@ -1429,14 +1380,14 @@ func (s *Server) listGeminiModels(c *gin.Context) {
 		}
 		inputLimit := group.MaxTokens
 		if inputLimit == 0 {
-			inputLimit = 1048576
+			inputLimit = geminiDefaultInputTokenLimit
 		}
 		models = append(models, geminiModel{
 			Name:                       "models/" + group.Name,
 			DisplayName:                group.Name,
 			Description:                "elysia-api model group",
 			InputTokenLimit:            inputLimit,
-			OutputTokenLimit:           8192,
+			OutputTokenLimit:           geminiDefaultOutputTokenLimit,
 			SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent"},
 		})
 	}
@@ -1489,6 +1440,8 @@ func (s *Server) ListenAndServe() error {
 	s.startUsageWriter()
 	s.healthChecker = newHealthChecker(s)
 	s.healthChecker.start()
+	s.usageRetention = newUsageRetention(s)
+	s.usageRetention.start()
 
 	addr := fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port)
 	log.Printf("Starting server on %s", addr)
@@ -1524,6 +1477,14 @@ func (s *Server) doShutdown() {
 	// 避免优雅关停时丢失计费/统计记录与 goroutine 泄漏。
 	if s.healthChecker != nil {
 		s.healthChecker.shutdown()
+	}
+	// 目录周期循环同样停机（裸 for+sleep 会泄漏 goroutine）。
+	if s.catalog != nil {
+		s.catalog.shutdown()
+	}
+	// 日志清理可能正在删行/删资产目录，先等它结束再冲刷 usage 队列。
+	if s.usageRetention != nil {
+		s.usageRetention.shutdown()
 	}
 	s.stopUsageWriter()
 }

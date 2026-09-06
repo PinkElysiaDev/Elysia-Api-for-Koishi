@@ -24,45 +24,89 @@ type healthChecker struct {
 	mu       sync.Mutex
 	failures map[string]int // key: modelID\x00sourceID → 连续失败次数
 
+	// client 全 checker 共享（见 newHealthChecker 注释）。
+	client *http.Client
+
 	stop chan struct{}
 	done chan struct{}
 }
 
 func newHealthChecker(s *Server) *healthChecker {
 	return &healthChecker{
-		server:   s,
+		server: s,
+		// client 全 checker 共享：此前每次探测新建 Transport，空闲连接只能等
+		// GC finalizer 回收——几百模型×每 300s 一轮会持续制造 socket/FD churn。
+		// 探测走与转发路径相同的 SSRF 防护 Transport（连接时校验每个实际拨号
+		// IP，含重定向后的目标）；超时由每次探测的 ctx 控制。
+		client:   &http.Client{Transport: relay.NewSecureTransport()},
 		failures: make(map[string]int),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
 }
 
+// pruneStaleFailureKeys 清理已不存在的模型的连续失败计数：map 只增不删
+// 会在长生命周期进程里随模型更名/源删除无限累积（每键一个 int）。
+func (h *healthChecker) pruneStaleFailureKeys(models []storage.Model) {
+	alive := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		alive[probeKey(model.ID, model.SourceID)] = struct{}{}
+	}
+	h.mu.Lock()
+	for key := range h.failures {
+		if _, ok := alive[key]; !ok {
+			delete(h.failures, key)
+		}
+	}
+	h.mu.Unlock()
+}
+
 func probeKey(modelID, sourceID string) string { return modelID + "\x00" + sourceID }
 
-// start 在配置启用且 store 可用时启动后台探测循环。
+// start 在 store 可用时启动后台探测循环。enabled 与 interval 每轮从配置
+// 热读取：旧实现把 interval 烘死在 ticker 里、enabled 只在启动时看一眼，
+// 热重载改配置完全无效。禁用状态循环保持空转（每周期一次 timer 唤醒，
+// 代价可忽略），重新启用无需重启进程。
 func (h *healthChecker) start() {
-	cfg := h.server.config.GetHealthCheckConfig()
-	if !cfg.Enabled || h.server.store == nil {
+	if h.server.store == nil {
 		close(h.done)
 		return
 	}
-	interval := time.Duration(cfg.IntervalSeconds) * time.Second
-	h.server.logInfof("health checker enabled: interval=%s timeout=%ds failureThreshold=%d", interval, cfg.TimeoutSeconds, cfg.FailureThreshold)
+	if cfg := h.server.config.GetHealthCheckConfig(); cfg.Enabled {
+		interval := h.probeInterval()
+		h.server.logInfof("health checker enabled: interval=%s timeout=%ds failureThreshold=%d", interval, cfg.TimeoutSeconds, cfg.FailureThreshold)
+	}
 	go func() {
 		defer close(h.done)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		// 启动后先跑一轮，不必等第一个 interval。
-		h.runOnce()
+		interval := h.probeInterval()
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		if h.server.config.GetHealthCheckConfig().Enabled {
+			// 启动后先跑一轮，不必等第一个 interval。
+			h.runOnce()
+		}
 		for {
 			select {
 			case <-h.stop:
 				return
-			case <-ticker.C:
-				h.runOnce()
+			case <-timer.C:
+				if h.server.config.GetHealthCheckConfig().Enabled {
+					h.runOnce()
+				}
+				// 周期热更新：interval 变化从下一轮生效。
+				timer.Reset(h.probeInterval())
 			}
 		}
 	}()
+}
+
+// probeInterval 读取当前生效的探测周期（非法值回落默认 300s）。
+func (h *healthChecker) probeInterval() time.Duration {
+	cfg := h.server.config.GetHealthCheckConfig()
+	if cfg.IntervalSeconds <= 0 {
+		return 300 * time.Second
+	}
+	return time.Duration(cfg.IntervalSeconds) * time.Second
 }
 
 func (h *healthChecker) shutdown() {
@@ -73,6 +117,7 @@ func (h *healthChecker) shutdown() {
 		close(h.stop)
 	}
 	<-h.done
+	h.client.CloseIdleConnections()
 }
 
 // runOnce 探测一轮所有模型。
@@ -86,13 +131,14 @@ func (h *healthChecker) runOnce() {
 		h.server.logWarnf("health check: failed to list models: %v", err)
 		return
 	}
+	h.pruneStaleFailureKeys(models)
 
 	changed := false
 	for _, model := range models {
 		// 每次探测在 probe 内部独立限时：若整轮共享一个超时 ctx，一个慢上游
 		// 就会耗尽预算，导致本轮后续所有探测连锁失败、健康模型被误禁。
 		ok := h.probe(context.Background(), model, cfg.TimeoutSeconds)
-		if h.record(model, ok, cfg.FailureThreshold) {
+		if h.recordProbeResult(model, ok, cfg.FailureThreshold) {
 			changed = true
 		}
 	}
@@ -104,7 +150,7 @@ func (h *healthChecker) runOnce() {
 
 // record 根据探测结果更新连续失败计数，并在跨过阈值时切换 available 状态。
 // 返回 true 表示发生了状态变更。
-func (h *healthChecker) record(model storage.Model, ok bool, threshold int) bool {
+func (h *healthChecker) recordProbeResult(model storage.Model, ok bool, threshold int) bool {
 	key := probeKey(model.ID, model.SourceID)
 	h.mu.Lock()
 	if ok {
@@ -151,15 +197,9 @@ func (h *healthChecker) probe(ctx context.Context, model storage.Model, timeoutS
 		return false
 	}
 	applyProbeAuth(req, model)
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentTypeJSON)
 
-	// 探测走与转发路径相同的 SSRF 防护 Transport：连接时校验每个实际拨号
-	// IP（含重定向后的目标），裸 http.Client 会跟随重定向绕过预校验。
-	client := &http.Client{
-		Timeout:   time.Duration(timeoutSeconds) * time.Second,
-		Transport: relay.NewSecureTransport(),
-	}
-	resp, err := client.Do(req)
+	resp, err := h.client.Do(req)
 	if err != nil {
 		return false
 	}

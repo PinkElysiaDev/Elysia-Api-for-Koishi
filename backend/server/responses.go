@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,7 +26,7 @@ func (s *Server) responses(c *gin.Context) {
 	record := s.initUsageRecord(c, startTime, bodyBytes, relay.FormatResponses)
 	record.SourceFormat = string(relay.FormatResponses)
 	record.SourceEndpoint = "/v1/responses"
-	installDownstreamCapture(c, record)
+	installDownstreamCapture(c, record, downstreamCaptureLimit(s.usageLogConfig()))
 
 	responsesCfg := s.config.GetResponsesConfig()
 	if responsesCfg.Enabled != nil && !*responsesCfg.Enabled {
@@ -37,69 +36,20 @@ func (s *Server) responses(c *gin.Context) {
 
 	maheshvaraReq, originalResponsesReq, err := relay.OpenAIResponsesToMaheshvara(bodyBytes)
 	if err != nil {
-		s.failRequestTyped(c, record, startTime, http.StatusBadRequest, "invalid_request_error", err.Error())
+		s.failRequestTypedKind(c, record, startTime, http.StatusBadRequest, "invalid_request_error", ErrorKindConversion, err.Error())
 		return
 	}
 
-	// 模型组级访问权限：先于 validateModelGroup 校验，越权即使目标组为空也返回 403。
-	if !s.tokenAllowsGroup(c, maheshvaraReq.Model) {
-		s.failRequestTyped(c, record, startTime, http.StatusForbidden, "permission_error", fmt.Sprintf("api key is not allowed to access model group '%s'", maheshvaraReq.Model))
+	// 共用前置阶段（与 chatCompletions 同一实现）：鉴权 → 组校验 → 候选 →
+	// 能力约束 → 预估 → 限流。组级 MaxTokens 覆盖维持 chat 线制独有的行为。
+	plan, ok := s.prepareRelayPlan(c, record, startTime, maheshvaraReq, relayFailer{s: s, c: c, record: record, startTime: startTime, typed: true}, false)
+	if !ok {
 		return
 	}
-
-	group, err := s.validateModelGroup(maheshvaraReq.Model)
-	if err != nil {
-		statusCode := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "not found") {
-			statusCode = http.StatusNotFound
-		} else if strings.Contains(err.Error(), "disabled") {
-			statusCode = http.StatusForbidden
-		}
-		s.failRequestTyped(c, record, startTime, statusCode, "invalid_request_error", err.Error())
-		return
-	}
-	setRecordGroup(record, group)
-
-	// 构建有序候选并按渠道亲和性置顶，与 chatCompletions 对齐——Responses 入口
-	// 此前只取单个候选、无故障转移（C1）。空候选集显式返回 500「无可用模型」，
-	// 而非让空 baseUrl 掉进 SSRF 校验误报 403。
-	candidates := s.buildCandidates(group)
-	if len(candidates) == 0 {
-		s.failRequestTyped(c, record, startTime, http.StatusInternalServerError, "api_error", fmt.Sprintf("no available models in group '%s'", group.Name))
-		return
-	}
-	if sticky := s.affinity.get(record.KeyHash, group.ID, startTime); sticky != "" {
-		candidates = applyAffinity(candidates, sticky)
-	}
-	// 组内候选软过滤（方向2）：与 chatCompletions 入口对齐。
-	candidates = reorderCandidatesByRequestNeeds(candidates,
-		maheshvaraRequestHasMultimodalInput(maheshvaraReq), maheshvaraRequestUsesTools(maheshvaraReq))
-	// 多 key 展开（方向6）：与 chatCompletions 入口对齐。
-	candidates = s.expandCandidatesByKeyStrategy(candidates)
-	// 组级 tools 能力落地（方向2）：携带工具的请求对不支持工具的组直接 400。
-	if rejectToolRequestsIfNeeded(group, maheshvaraReq) {
-		s.failRequestTyped(c, record, startTime, http.StatusBadRequest, "invalid_request_error",
-			fmt.Sprintf("model group '%s' does not support tool calling, but the request contains tools or tool messages", group.Name))
-		return
-	}
-	filteredVision, filteredVisionParts, filteredModalities := filterMaheshvaraMultimodalInputsIfNeeded(group, maheshvaraReq)
-	if filteredVision {
-		s.logVerbose("[Maheshvara Multimodal Filter] group=%s filteredParts=%d modalities=%v", group.Name, filteredVisionParts, filteredModalities)
-		c.Writer.Header().Set("X-Elysia-Filtered-Modalities", strings.Join(filteredModalities, ","))
-	}
-
-	estimatedUsage := estimateMaheshvaraRequestUsage(maheshvaraReq, s.config.GetUsageConfig())
-	estimatedTokens := estimatedUsage.EstimatedTotalTokens
-	record.Usage = usageTokenUsageFromMaheshvara(estimatedUsage)
-	record.UsageDetail = usageDetailFromMaheshvara(estimatedUsage)
-	record.UsageSource = estimatedUsage.Source
-
-	releaseLimiter, err := s.acquireRateLimit(group, estimatedTokens)
-	if err != nil {
-		s.failRequestTyped(c, record, startTime, http.StatusTooManyRequests, "rate_limit_error", err.Error())
-		return
-	}
-	defer releaseLimiter()
+	group, candidates := plan.group, plan.candidates
+	filteredVision := plan.filtered
+	estimatedTokens := plan.estimatedTokens
+	defer plan.releaseLimiter()
 
 	attempts := maxAttempts(group.MaxRetries, len(candidates))
 	var lastStatus int
@@ -107,6 +57,11 @@ func (s *Server) responses(c *gin.Context) {
 	committed := false
 
 	for attempt := 0; attempt < attempts; attempt++ {
+		// 循环顶部拦截客户端取消：interval=0 时无等待期可拦截。
+		if attempt > 0 && s.abortRetryOnClientCancel(c, record, startTime) {
+			committed = true
+			return
+		}
 		selectedModel := candidates[attempt]
 		isLast := attempt == attempts-1
 
@@ -116,12 +71,7 @@ func (s *Server) responses(c *gin.Context) {
 			lastErr = fmt.Sprintf("target baseUrl rejected: %v", err)
 			s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
 			if isLast {
-				record.StatusCode = lastStatus
-				record.Error = lastErr
-				record.EndedAt = time.Now()
-				record.DurationMs = time.Since(startTime).Milliseconds()
-				s.recordUsage(record)
-				c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
+				s.commitLastAttemptFailure(c, record, startTime, lastStatus, "", lastErr, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
 				committed = true
 			}
 			continue
@@ -139,12 +89,7 @@ func (s *Server) responses(c *gin.Context) {
 			record.ResponsesMode = responsesMode
 			s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
 			if isLast {
-				record.StatusCode = lastStatus
-				record.Error = lastErr
-				record.EndedAt = time.Now()
-				record.DurationMs = time.Since(startTime).Milliseconds()
-				s.recordUsage(record)
-				c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": lastErr, "type": "unsupported_endpoint", "code": "responses_api_not_supported"}})
+				s.commitLastAttemptFailure(c, record, startTime, lastStatus, "", lastErr, gin.H{"error": gin.H{"message": lastErr, "type": "unsupported_endpoint", "code": "responses_api_not_supported"}})
 				committed = true
 			}
 			continue
@@ -156,12 +101,7 @@ func (s *Server) responses(c *gin.Context) {
 				lastErr = "Responses target cannot represent the filtered maheshvara vision input"
 				s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
 				if isLast {
-					record.StatusCode = lastStatus
-					record.Error = lastErr
-					record.EndedAt = time.Now()
-					record.DurationMs = time.Since(startTime).Milliseconds()
-					s.recordUsage(record)
-					c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
+					s.commitLastAttemptFailure(c, record, startTime, lastStatus, ErrorKindConversion, lastErr, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
 					committed = true
 				}
 				continue
@@ -208,17 +148,12 @@ func (s *Server) responses(c *gin.Context) {
 			lastErr = err.Error()
 			s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
 			if isLast {
-				record.StatusCode = lastStatus
-				record.Error = lastErr
-				record.EndedAt = time.Now()
-				record.DurationMs = time.Since(startTime).Milliseconds()
-				s.recordUsage(record)
-				c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
+				s.commitLastAttemptFailure(c, record, startTime, lastStatus, ErrorKindConversion, lastErr, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
 				committed = true
 			}
 			continue
 		}
-		record.OutgoingBody = sanitizeUsageBody(targetBody)
+		record.OutgoingBody = record.sanitizeBody(targetBody)
 
 		var outcome relayOutcome
 		if maheshvaraReq.Stream {
@@ -240,26 +175,29 @@ func (s *Server) responses(c *gin.Context) {
 		lastErr = outcome.errMsg
 		s.appendRetryEvent(record, attempt, selectedModel.Name, outcome.errMsg)
 		if !isLast && group.RetryInterval > 0 {
-			// 尊重客户端取消：被放弃的请求不再空耗等待 + 对剩余候选扇出。
-			select {
-			case <-c.Request.Context().Done():
+			// 尊重客户端取消：被放弃的请求不再空耗等待 + 对剩余候选扇出
+			//（取消同样落库留痕，499 为 nginx 惯例的 client closed）。
+			if !waitForRetryOrCancel(c, group.RetryInterval) {
 				committed = true
+				s.abortRetryOnClientCancel(c, record, startTime)
 				return
-			case <-time.After(time.Duration(group.RetryInterval) * time.Millisecond):
 			}
 		}
 	}
 
 	if !committed {
-		if lastStatus == 0 {
+		// 防御未来路径回归；与 chat 入口对齐：零守卫防 c.JSON(0,…) panic，
+		// 回传真实状态与记录一致（旧实现记录 429 却恒回 502）。
+		if lastStatus <= 0 {
 			lastStatus = http.StatusBadGateway
 		}
 		record.StatusCode = lastStatus
-		record.Error = lastErr
+		record.Error = firstNonEmpty(lastErr, "all upstream attempts failed")
+		record.ErrorKind = ErrorKindUpstream
 		record.EndedAt = time.Now()
 		record.DurationMs = time.Since(startTime).Milliseconds()
+		c.JSON(lastStatus, gin.H{"error": gin.H{"message": record.Error, "type": "api_error"}})
 		s.recordUsage(record)
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": firstNonEmpty(lastErr, "all upstream attempts failed"), "type": "api_error"}})
 	}
 }
 
@@ -274,8 +212,9 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 		if isLast || !retryable {
 			record.StatusCode = statusCode
 			record.Error = errMsg
+			record.ErrorKind = ErrorKindUpstream
 			if respBody != nil {
-				c.Data(statusCode, "application/json", respBody)
+				c.Data(statusCode, contentTypeJSON, respBody)
 			} else {
 				c.JSON(statusCode, gin.H{"error": gin.H{"message": errMsg, "type": "api_error"}})
 			}
@@ -302,7 +241,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 	switch targetFormat {
 	case relay.FormatResponses:
 		responsesResp, respBody, upstreamStatus, err := s.openaiAdapter.SendResponsesRawWithBody(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
-		record.ProviderResponse = sanitizeUsageBody(respBody)
+		record.ProviderResponse = record.sanitizeBody(respBody)
 		if err != nil {
 			status := upstreamStatus
 			if status <= 0 {
@@ -322,7 +261,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 		actualTokens := getInt(record.Usage.TotalTokens)
 		s.adjustTokenUsage(group.ID, actualTokens)
 		record.StatusCode = http.StatusOK
-		c.Data(http.StatusOK, "application/json", respBody)
+		c.Data(http.StatusOK, contentTypeJSON, respBody)
 		result = relayOutcome{committed: true, statusCode: http.StatusOK}
 		return result
 
@@ -340,7 +279,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 		}
 		var claudeResp relay.ClaudeResponse
 		respBody, err := readBodyAndJSON(httpResp, &claudeResp)
-		record.ProviderResponse = sanitizeUsageBody(respBody)
+		record.ProviderResponse = record.sanitizeBody(respBody)
 		if err != nil {
 			result = failResult(http.StatusInternalServerError, err.Error(), nil)
 			return result
@@ -365,7 +304,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 		}
 		var geminiResp relay.GeminiResponse
 		respBody, err := readBodyAndJSON(httpResp, &geminiResp)
-		record.ProviderResponse = sanitizeUsageBody(respBody)
+		record.ProviderResponse = record.sanitizeBody(respBody)
 		if err != nil {
 			result = failResult(http.StatusInternalServerError, err.Error(), nil)
 			return result
@@ -378,7 +317,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 
 	default:
 		openAIResp, respBody, statusCode, err := s.openaiAdapter.SendRequestRawWithBody(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
-		record.ProviderResponse = sanitizeUsageBody(respBody)
+		record.ProviderResponse = record.sanitizeBody(respBody)
 		if err != nil {
 			if statusCode <= 0 {
 				statusCode = http.StatusBadGateway
@@ -430,14 +369,6 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 
 	// upstreamErrorStatus 从错误中提取上游真实状态码：永久错误（401/403/400）
 	// 不得洗白成 502 触发全候选扇出重试。
-	upstreamErrorStatus := func(err error, fallback int) int {
-		var statusErr *relay.UpstreamStatusError
-		if errors.As(err, &statusErr) && statusErr.StatusCode > 0 {
-			return statusErr.StatusCode
-		}
-		return fallback
-	}
-
 	// connFail 处理「SSE 尚未开始」的上游建连失败：可重试且非最后一次 →
 	// committed=false 让上层换下一个候选；否则写出 JSON 错误并提交。
 	connFail := func(statusCode int, errMsg string, respBody []byte) relayOutcome {
@@ -445,8 +376,9 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 		if isLast || !retryable {
 			record.StatusCode = statusCode
 			record.Error = errMsg
+			record.ErrorKind = ErrorKindUpstream
 			if respBody != nil {
-				c.Data(statusCode, "application/json", respBody)
+				c.Data(statusCode, contentTypeJSON, respBody)
 			} else {
 				c.AbortWithStatusJSON(statusCode, gin.H{"error": gin.H{"message": errMsg, "type": "api_error"}})
 			}
@@ -483,10 +415,9 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 	}
 
 	writer := &observingStreamWriter{
-		inner:        &ginStreamWriter{writer: c.Writer, flusher: flusher},
-		record:       record,
-		startTime:    startTime,
-		observeUsage: true,
+		inner:     &ginStreamWriter{writer: c.Writer, flusher: flusher},
+		record:    record,
+		startTime: startTime,
 	}
 
 	var streamErr error

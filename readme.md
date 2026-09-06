@@ -43,7 +43,7 @@ Koishi 插件不是请求转发层，而是一个可选入口：它只负责写�
 elysia-api/
 ├── backend/                # Go 后端（网关本体）
 │   ├── config/             # 配置加载 / 热重载 / 加密密钥
-│   ├── relay/              # 上游转发 / 格式转换 / Canonical 中间表示
+│   ├── relay/              # 上游转发 / 格式转换 / Maheshvara 中间表示
 │   ├── server/             # HTTP 路由 / 鉴权中间件 / Usage 仪表盘 / 管理 API
 │   ├── storage/            # 持久化
 │   └── webui/              # 内嵌 WebUI 静态资源（//go:embed all:dist）
@@ -57,15 +57,17 @@ elysia-api/
 ## 功能特性
 
 - **模型组与负载均衡**：把模型组织成自定义组，支持轮询 / 顺序 / 随机策略，支持模型组级权限。
-- **多格式互转**：以 Canonical Request / Response / Usage 为中间表示，在 OpenAI Chat Completions、OpenAI Responses、Claude Messages、Gemini GenerateContent 之间自动转换。
-- **Responses API**：`/v1/responses` 可原生转发，也可经 Canonical 中间层转换到 Chat / Claude / Gemini 上游。
+- **多格式互转**：以 Maheshvara Request / Response / Usage 为中间表示，在 OpenAI Chat Completions、OpenAI Responses、Claude Messages、Gemini GenerateContent 之间自动转换。
+- **Responses API**：`/v1/responses` 可原生转发，也可经 Maheshvara 中间层转换到 Chat / Claude / Gemini 上游。
 - **流式响应**：完整支持流式输出，并支持 Chat / Claude / Gemini 流转换为 Responses SSE 事件。
 - **同源直发透传**：Claude / Gemini / Chat 同源请求可零损耗透传，避免不必要的格式往返。
 - **Token 计费**：跟踪缓存命中、推理 token、多模态 token、内置工具调用等用量明细。
+- **日志留存治理**：按保留天数 / 磁盘占用 / 条数上限自动清理调用日志，支持单条 body 截断、仅失败请求存正文。
+- **媒体外置去重**：日志中的 base64 图片 / 音频外置为内容寻址文件，相同媒体跨请求只存一份，WebUI 提供黑底全屏查看器（缩放 / 拖拽 / 缩略图条）。
 - **流量限制**：可选的请求频率控制与并发限制。
 - **安全加固**：密钥加密存储、SSRF 防护、常量时间 token 比较防时序侧信道。
 - **运维诊断**：WebUI 内置健康检查、内存指标、pprof 性能分析；后端支持热重载与 daemon 化。
-- **独立 Usage 仪表盘**：`/usage` 提供无需登录控制台即可查看的用量统计页面（同样需要 panel access token）。
+- **多平台二进制**：内置 Windows / Linux（含 ARM64）与 macOS（Intel / Apple Silicon）六平台后端二进制。
 
 ## 部署与启动
 
@@ -352,15 +354,13 @@ Relay API Token 存储在 SQLite 中。恢复 panel access 后，可通过 WebUI
 | `GET /v1/models` | 列出可用模型 | API Key |
 | `GET /v1beta/models` / `POST /v1beta/models/*` | Gemini 兼容入口 | API Key |
 | `GET /ui` | WebUI 控制台 | — |
-| `GET /usage` | 独立 Usage 仪表盘 | Panel Token |
-| `GET /__usage/*` | Usage 统计 / 日志 API | Panel Token |
-| `GET /api/admin/*` | 管理 API（模型源、模型组、Token、运行时配置等） | Panel Token |
+| `GET /api/admin/*` | 管理 API（模型源、模型组、Token、运行时配置、Usage 统计 / 日志 / 存储统计 / 手动清理等） | Panel Token |
 | `GET /debug/pprof/*` | pprof 性能分析（需启用） | Panel Token |
 | `GET /health` | 健康检查 | — |
 
 ## API 格式与 Responses 支持
 
-后端以 Canonical Request / Response / Usage 作为中间表示，支持在以下格式之间转换：
+后端以 Maheshvara Request / Response / Usage 作为中间表示，支持在以下格式之间转换：
 
 | 输入 / 输出格式 | 非流式 | 流式 | 工具调用 | Usage 提取 |
 | --- | --- | --- | --- | --- |
@@ -430,7 +430,7 @@ Claude-only 上游可配置 `platform: "anthropic"` 或 `endpoints.claudeMessage
 - `usageSource`
 - `estimated` / `estimatedTokens`
 
-当上游没有返回 usage 且开启 `usage.estimateWhenMissing` 时，后端会基于 Canonical 请求内容进行估算。估算值会标记为 `estimated=true`，并单独计入 `estimatedTokens`，不会污染 provider 返回的真实 token 总量。
+当上游没有返回 usage 且开启 `usage.estimateWhenMissing` 时，后端会基于 Maheshvara 请求内容进行估算。估算值会标记为 `estimated=true`，并单独计入 `estimatedTokens`，不会污染 provider 返回的真实 token 总量。
 
 ## pprof 性能分析
 

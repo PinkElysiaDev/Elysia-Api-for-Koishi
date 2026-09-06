@@ -24,11 +24,13 @@ import { Switch } from '@/components/ui/switch'
 import { AsyncState } from '@/components/ui/states'
 import { ExpandRow } from '@/components/expand-row'
 import { CapChip, Dot, PlatformBadge } from '@/components/badges'
+import { SearchInput } from '@/components/ui/search-input'
+import { ToolbarSummary } from '@/components/toolbar-summary'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { useToast } from '@/components/ui/use-toast'
-import { useSources, useModels, useModelCatalogStatus, useDebouncedValue, revalidate } from '@/lib/hooks'
+import { useSources, useModels, useModelCatalogStatus, useDebouncedValue, revalidate, POLL } from '@/lib/hooks'
 import { api } from '@/lib/api'
-import { cn, formatNumber, formatRelative } from '@/lib/utils'
+import { cn, formatNumber, formatRelative, matchesModelKeyword } from '@/lib/utils'
 import type { ModelSource, Model } from '@/lib/types'
 import { SourceFormDialog } from './sources/source-form'
 import { ModelEditDialog } from './sources/model-edit-dialog'
@@ -85,8 +87,8 @@ export function SourcesPage() {
   const toast = useToast()
   const { confirm, dialog } = useConfirm()
   // 60s 自动刷新：拉取时间/检测时间/模型数所见即所得，无需手动刷新。
-  const { data, isLoading, error, mutate } = useSources(60_000)
-  const { data: models } = useModels(60_000)
+  const { data, isLoading, error, mutate } = useSources(POLL.LIST)
+  const { data: models } = useModels(POLL.LIST)
   const { data: catalogStatus } = useModelCatalogStatus()
   const [keyword, setKeyword] = useState('')
   const [editing, setEditing] = useState<ModelSource | null>(null)
@@ -217,11 +219,23 @@ export function SourcesPage() {
         list.map((m) => api.updateModel(m.sourceId ?? '', m.id, { enabled })),
       )
       const okCount = results.filter((r) => r.status === 'fulfilled').length
-      const failedCount = results.length - okCount
+      const failed = results.filter((r) => r.status === 'rejected')
       await revalidate.models()
-      toast.success(
-        enabled ? '已批量启用' : '已批量禁用',
-        `${list.length} 个模型：成功 ${okCount}${failedCount > 0 ? `，失败 ${failedCount}` : ''}`,
+      // 操作落地即清除对应选择（allSettled 保序，按下标对回原模型）；
+      // 失败的保留勾选，便于修正后直接重试。
+      const succeeded = list.filter((_, i) => results[i].status === 'fulfilled')
+      if (succeeded.length > 0) setModelsSelected(succeeded, false)
+      if (failed.length === 0) {
+        toast.success(enabled ? '已批量启用' : '已批量禁用', `成功 ${okCount} 个模型`)
+        return
+      }
+      // 失败原因去重后展示，避免只报数量不知道原因。
+      const reasons = [
+        ...new Set(failed.map((r) => (r as PromiseRejectedResult).reason instanceof Error ? r.reason.message : String(r.reason))),
+      ]
+      toast.error(
+        `${enabled ? '批量启用' : '批量禁用'}：成功 ${okCount}，失败 ${failed.length}`,
+        reasons.slice(0, 2).join('；') + (reasons.length > 2 ? `（等 ${reasons.length} 种原因）` : ''),
       )
     } catch (err) {
       toast.error('批量操作失败', (err as Error).message)
@@ -237,7 +251,7 @@ export function SourcesPage() {
     const id = setInterval(() => {
       revalidate.sources()
       revalidate.models()
-    }, 3000)
+    }, POLL.SOURCE_FAST)
     return () => clearInterval(id)
   }, [anyRefreshing])
 
@@ -341,21 +355,10 @@ export function SourcesPage() {
 
       <div className="relative z-[1] space-y-6">
         <PageHeader
-          title="模型源"          actions={
+          title="模型源"
+          actions={
             <>
-              {catalogStatus?.enabled && (
-                <CapChip
-                  className="max-w-[280px] truncate"
-                  title={
-                    catalogStatus.entries > 0
-                      ? `模型能力目录已加载 ${catalogStatus.entries} 个模型（models.dev），刷新模型时自动回填视觉/工具等能力`
-                      : '能力目录尚未加载成功：模型能力不会被自动回填，可在模型编辑中手动开启；服务器需可访问 models.dev（或配置 modelCatalog.url/proxy）'
-                  }
-                >
-                  {catalogStatus.entries > 0 ? `能力目录 ${catalogStatus.entries} 模型` : '能力目录未加载'}
-                </CapChip>
-              )}
-              <Button onClick={refreshAll} disabled={refreshingAll}>
+              <Button variant="ghost" onClick={refreshAll} disabled={refreshingAll}>
                 <RefreshCw className={cn('h-4 w-4', (refreshingAll || anyRefreshing) && 'animate-spin')} /> 刷新全部模型
               </Button>
               <Button variant="primary" onClick={openCreate}>
@@ -367,34 +370,35 @@ export function SourcesPage() {
 
         {/* 搜索工具条与统计指标 */}
         <div className="flex flex-wrap items-center justify-between gap-3 py-1">
-          <div className="relative w-full sm:w-72">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              className="pl-9 text-xs"
-              type="search"
-              placeholder="搜索源名称 / 平台 / 接口地址…"
-              value={keyword}
-              onChange={(e) => setKeyword(e.target.value)}
+          <SearchInput
+            className="w-full text-xs sm:w-80"
+            ariaLabel="搜索模型源"
+            placeholder="搜索源名称 / 平台 / 接口地址…"
+            value={keyword}
+            onChange={setKeyword}
+          />
+          <div className="flex flex-wrap items-center gap-4">
+            {catalogStatus?.enabled && (
+              <CapChip
+                className="max-w-[280px] truncate"
+                title={
+                  catalogStatus.entries > 0
+                    ? `模型能力目录已加载 ${catalogStatus.entries} 个模型（models.dev），刷新模型时自动回填视觉/工具等能力`
+                    : '能力目录尚未加载成功：模型能力不会被自动回填，可在模型编辑中手动开启；服务器需可访问 models.dev（或配置 modelCatalog.url/proxy）'
+                }
+              >
+                {catalogStatus.entries > 0 ? `能力目录 ${catalogStatus.entries} 模型` : '能力目录未加载'}
+              </CapChip>
+            )}
+            <ToolbarSummary
+              items={[
+                { label: '启用', value: enabledCount, tone: 'jade' },
+                { label: '停用', value: disabledCount, tone: 'ember' },
+                { label: '聚合模型', value: models?.length ?? 0 },
+              ]}
+              total={(data ?? []).length}
+              unit="个模型源"
             />
-          </div>
-          <div className="flex items-center gap-4 text-xs">
-            <span className="tnum flex items-center gap-3 text-muted-foreground font-mono">
-              <span className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-jade" />
-                <b className="font-semibold text-foreground">{enabledCount}</b> 启用
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-ember" />
-                <b className="font-semibold text-foreground">{disabledCount}</b> 停用
-              </span>
-              <span className="flex items-center gap-1.5">
-                聚合模型 <b className="font-semibold text-foreground">{formatNumber(models?.length ?? 0)}</b>
-              </span>
-            </span>
-            <span className="h-3 w-px bg-border/70" />
-            <span className="text-muted-foreground font-mono">
-              共 <b className="tnum font-semibold text-foreground">{(data ?? []).length}</b> 个模型源
-            </span>
           </div>
         </div>
 
@@ -439,16 +443,16 @@ export function SourcesPage() {
                     const globalKeyword = (debouncedGlobalSearch[source.id] ?? '').trim().toLowerCase()
                     const matchesGlobal = (m: Model) =>
                       !globalKeyword ||
-                      `${m.id} ${m.name} ${m.sourceName ?? ''}`.toLowerCase().includes(globalKeyword)
+                      matchesModelKeyword(globalKeyword, m)
                     const selectedCount = selectedModelsOf(source.id).length
                     const allVisibleModels = groups
                       .map((g) => {
-                        const kw2 = (debouncedGroupSearch[`${source.id}:${g.key}`] ?? '').trim().toLowerCase()
-                        return kw2
+                        const groupKeyword = (debouncedGroupSearch[`${source.id}:${g.key}`] ?? '').trim().toLowerCase()
+                        return groupKeyword
                           ? g.models.filter(
                               (m) =>
                                 matchesGlobal(m) &&
-                                `${m.id} ${m.name} ${m.sourceName ?? ''}`.toLowerCase().includes(kw2),
+                                matchesModelKeyword(groupKeyword, m),
                             )
                           : g.models.filter(matchesGlobal)
                       })
@@ -457,12 +461,12 @@ export function SourcesPage() {
                       <Fragment key={source.id}>
                         {/* border-b-0：行间分隔线只由 divide-y 的 /30 淡线承担，
                             覆盖 TableRow 默认的全强度底边框 */}
-                        <TableRow className="border-b-0 transition-colors hover:bg-secondary/30">
+                        <TableRow className="border-b-0">
                           <TableCell className="w-[38px] px-0 text-center">
                             <button
                               type="button"
                               onClick={() => toggleExpand(source.id)}
-                              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:text-foreground hover:bg-secondary"
+                              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-wash hover:text-rose"
                               aria-label={isOpen ? '收起' : '展开'}
                             >
                               <ChevronRight
@@ -619,7 +623,7 @@ export function SourcesPage() {
                                 (m) =>
                                   matchesGlobal(m) &&
                                   (!groupKeyword ||
-                                    `${m.id} ${m.name} ${m.sourceName ?? ''}`.toLowerCase().includes(groupKeyword)),
+                                    matchesModelKeyword(groupKeyword, m)),
                               )
                               const collapsed = !!collapsedGroups[groupStateKey]
                               return (
@@ -744,11 +748,13 @@ export function SourcesPage() {
             ? quickCreate.models[0].name || quickCreate.models[0].id
             : quickCreate?.source.name ?? ''
         }
+        onSuccess={() => quickCreate && setModelsSelected(quickCreate.models, false)}
       />
       <AddToGroupDialog
         open={addToGroup !== null}
         onOpenChange={(open) => !open && setAddToGroup(null)}
         models={addToGroup ?? []}
+        onSuccess={() => addToGroup && setModelsSelected(addToGroup, false)}
       />
       {dialog}
     </div>

@@ -147,9 +147,8 @@ func TestGeminiStreamUsageMetadata(t *testing.T) {
 func TestConvertedStreamWriterDoesNotRecordPlaceholderUsage(t *testing.T) {
 	record := &usageRecord{}
 	writer := &observingStreamWriter{
-		inner:        nopStreamWriter{},
-		record:       record,
-		observeUsage: false,
+		inner:  nopStreamWriter{},
+		record: record,
 	}
 
 	_, err := writer.WriteString("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n")
@@ -177,6 +176,7 @@ func TestUpstreamObserverRecordsRawUsage(t *testing.T) {
 	if record.Usage.InputTokens == nil || *record.Usage.InputTokens != 12 || record.Usage.OutputTokens == nil || *record.Usage.OutputTokens != 9 || record.Usage.TotalTokens == nil || *record.Usage.TotalTokens != 21 {
 		t.Fatalf("expected upstream raw stream usage, got %+v", record.Usage)
 	}
+	record.materializeStreamEvents()
 	if record.ProviderResponse.Content == "" {
 		t.Fatal("expected upstream raw stream sample to be recorded")
 	}
@@ -243,44 +243,6 @@ type nopStreamWriter struct{}
 func (nopStreamWriter) Write(data []byte) (int, error)       { return len(data), nil }
 func (nopStreamWriter) WriteString(data string) (int, error) { return len(data), nil }
 func (nopStreamWriter) Flush() error                         { return nil }
-
-func TestUsageStatusMatches(t *testing.T) {
-	cases := []struct {
-		name       string
-		statusCode int
-		filter     string
-		want       bool
-	}{
-		{name: "success accepts 2xx", statusCode: 200, filter: "success", want: true},
-		{name: "success accepts 3xx", statusCode: 302, filter: "success", want: true},
-		{name: "success rejects 4xx", statusCode: 404, filter: "success", want: false},
-		{name: "failed accepts 4xx", statusCode: 429, filter: "failed", want: true},
-		{name: "failed accepts 5xx", statusCode: 500, filter: "failed", want: true},
-		{name: "failed rejects 2xx", statusCode: 200, filter: "failed", want: false},
-		{name: "exact status matches", statusCode: 401, filter: "401", want: true},
-		{name: "exact status rejects other codes", statusCode: 403, filter: "401", want: false},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := usageStatusMatches(tc.statusCode, tc.filter); got != tc.want {
-				t.Fatalf("expected %v, got %v", tc.want, got)
-			}
-		})
-	}
-}
-
-func TestUsageValueMatches(t *testing.T) {
-	if !usageValueMatches(nil, "caller-a") {
-		t.Fatal("expected empty filters to match")
-	}
-	if !usageValueMatches([]string{"caller-a", "caller-b"}, "caller-b") {
-		t.Fatal("expected multi-value filter to match included value")
-	}
-	if usageValueMatches([]string{"caller-a", "caller-b"}, "caller-c") {
-		t.Fatal("expected multi-value filter to reject missing value")
-	}
-}
 
 func TestUsageDetailAndBuiltinToolUsageFromMaheshvara(t *testing.T) {
 	maheshvara := &relay.MaheshvaraUsage{
@@ -441,26 +403,6 @@ func TestUsageRequestIDUniqueForSameNanosecond(t *testing.T) {
 	now := time.Now()
 	if usageRequestID(now) == usageRequestID(now) {
 		t.Fatal("usage request ids must carry a random suffix")
-	}
-}
-
-// 回归：时间窗口按本地时钟对齐。t.Truncate 按 Unix 纪元取整，在非整小时
-// 时区（如 UTC+5:30）会把"小时"桶切到半点上，图表标签与数据错位。
-func TestTruncateUsageWindowAlignsToLocalClock(t *testing.T) {
-	zone := time.FixedZone("IST", 5*3600+30*60)
-	input := time.Date(2026, 8, 1, 12, 7, 33, 0, zone)
-
-	hour := truncateUsageWindow(input, "hour")
-	if hour.Hour() != 12 || hour.Minute() != 0 {
-		t.Fatalf("hour bucket must align to the local clock hour, got %v", hour)
-	}
-	five := truncateUsageWindow(input, "5m")
-	if five.Minute() != 5 {
-		t.Fatalf("5m bucket must align to local 5-minute boundary, got %v", five)
-	}
-	fifteen := truncateUsageWindow(input, "15m")
-	if fifteen.Minute() != 0 {
-		t.Fatalf("15m bucket must align to local 15-minute boundary, got %v", fifteen)
 	}
 }
 

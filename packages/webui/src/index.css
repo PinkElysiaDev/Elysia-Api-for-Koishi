@@ -71,10 +71,29 @@
   --grad-a: var(--rose);                /* 品牌渐变：瑰梅 → 明艳粉 */
   --grad-b: #F43F85;
 
+  /* 主按钮「浅玫瑰瓷」：淡玫瑰瓷底 + 深瑰梅墨字，顶边瓷光 + 极轻落影；hover 瓷色加深一档 */
+  --btn-primary: hsl(336 70% 91%);
+  --btn-primary-hover: hsl(336 72% 87.5%);
+  --btn-primary-ink: hsl(336 70% 33%);
+  --btn-primary-shadow: inset 0 1px 0 hsl(0 0% 100% / 0.55),
+    0 1px 3px hsl(336 50% 45% / 0.12);
+
   --scrim: rgba(15, 23, 42, 0.45);
 
   --shadow-soft: 0 1px 3px rgba(15, 23, 42, 0.03), 0 8px 20px -8px rgba(15, 23, 42, 0.06);
   --shadow-lg: 0 4px 6px -1px rgba(15, 23, 42, 0.04), 0 20px 32px -12px rgba(15, 23, 42, 0.09);
+
+  /* ---- 凹槽材质：Seg 轨道 / 筛选触发器 / 输入框共享的素色凹槽底 ---- */
+  --well: hsl(228 24% 14% / 0.04);
+  --well-border: hsl(228 24% 14% / 0.08);
+  --well-shadow: inset 0 1px 1.5px hsl(228 24% 14% / 0.05);
+
+  /* ---- 分段控件（瓷钮 Seg）---- */
+  --seg-key-a: hsl(0 0% 100%);
+  --seg-key-b: hsl(0 0% 100%);
+  --seg-key-border: hsl(228 24% 14% / 0.09);
+  --seg-key-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), 0 2px 6px -1px rgba(15, 23, 42, 0.05),
+    inset 0 1px 0 rgba(255, 255, 255, 0.85);
 }
 
 .dark {
@@ -133,10 +152,28 @@
   --grad-a: var(--rose);                /* 品牌渐变：霓虹梅粉 → 兰花紫 */
   --grad-b: #C084FC;
 
+  /* 主按钮「梅釉」暗色：灰玫瑰实色 + 深梅墨字（明暗两版同一枚印，墨色随底反转） */
+  --btn-primary: hsl(336 45% 54%);
+  --btn-primary-hover: hsl(336 48% 60%);
+  --btn-primary-ink: hsl(336 80% 13%);
+  --btn-primary-shadow: inset 0 1px 0 hsl(0 0% 100% / 0.18),
+    0 2px 10px -3px hsl(336 80% 55% / 0.35);
+
   --scrim: rgba(0, 0, 0, 0.72);
 
   --shadow-soft: 0 1px 3px rgba(0, 0, 0, 0.4), 0 12px 28px -10px rgba(0, 0, 0, 0.6);
   --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.5), 0 24px 48px -15px rgba(0, 0, 0, 0.7);
+
+  /* ---- 凹槽材质：Seg 轨道 / 筛选触发器 / 输入框共享的素色凹槽底 ---- */
+  --well: hsl(0 0% 100% / 0.05);
+  --well-border: hsl(0 0% 100% / 0.09);
+  --well-shadow: inset 0 1px 1.5px hsl(0 0% 0% / 0.3);
+
+  /* ---- 瓷钮 Seg 凸键：白 14% → 7% 微渐亮 + 顶边高光 ---- */
+  --seg-key-a: hsl(0 0% 100% / 0.14);
+  --seg-key-b: hsl(0 0% 100% / 0.07);
+  --seg-key-border: hsl(0 0% 100% / 0.16);
+  --seg-key-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1), 0 2px 8px -2px rgba(0, 0, 0, 0.5);
 }
 
 * {
@@ -243,6 +280,102 @@ body::before {
   }
 }
 
+/*
+ * 主题切换的「光线转场」：
+ * - 主路径：View Transitions 整页交叉淡化（lib/theme.tsx 的 startViewTransition），
+ *   单一合成层，所有颜色作为一个整体一起变——时长 320ms，见下方伪元素规则；
+ * - 降级：无 VT 的浏览器走 html.theme-transitioning 逐元素过渡窗口（统一
+ *   380ms 单一时长，避免参差收尾的卡顿感；排除 .theme-sun——日月 morph
+ *   有自己的节奏），由 lib/theme.tsx 在 480ms 后移除；
+ * - .theme-toggle 图标钮：日/月 morph（toggles.dev「Classic」移植）+ 一次性品牌光晕。
+ */
+html.theme-transitioning :where(body, #root, #root *):not(.theme-sun):not(.theme-sun *) {
+  transition-property: background-color, color, border-color !important;
+  transition-duration: 380ms !important;
+  transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1) !important;
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 320ms;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/*
+ * 日/月 morph（移植自 toggles.dev/classic）。
+ * 光芒的 15% 延迟只服务回浅色时的错峰回归，切深色必须归零让弯月立即成形；
+ * 400ms 与 lib/theme 的 320ms 整页转场大致同期收尾。
+ */
+.theme-sun {
+  --tt-duration: 400ms;
+  display: block;
+  width: 1.125rem;
+  height: 1.125rem;
+}
+.theme-sun .sun-clip-path {
+  transition:
+    d var(--tt-duration),
+    translate var(--tt-duration);
+}
+.theme-sun .sun-disc {
+  transform-origin: center;
+  transition: transform var(--tt-duration);
+}
+.theme-sun .sun-ray {
+  transform-box: view-box;
+  transform-origin: center;
+  transition:
+    transform var(--tt-duration),
+    opacity var(--tt-duration);
+  transition-delay: calc(var(--tt-duration) * 0.15);
+}
+.dark .theme-sun .sun-clip-path {
+  d: path('M0 2h13a1 1 0 0010 10v14H0Z');
+}
+.dark .theme-sun .sun-disc {
+  transform: scale(1.7);
+}
+.dark .theme-sun .sun-ray {
+  transform: scale(0);
+  opacity: 0;
+  transition-delay: 0s;
+}
+/* d 属性形变不可用的浏览器：clipPath 平移到同一弯月位作近似降级。 */
+@supports not (d: path('M0 0')) {
+  .dark .theme-sun .sun-clip-path {
+    translate: -13px 2px;
+  }
+}
+
+.theme-toggle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(circle, color-mix(in srgb, var(--rose) 14%, transparent), transparent 65%);
+  transform: translate(-50%, -50%) scale(0.2);
+}
+.theme-toggle.is-switching::after {
+  animation: theme-ripple 560ms ease-out;
+}
+.dark .theme-toggle.is-switching::after {
+  background: radial-gradient(circle, color-mix(in srgb, var(--orchid) 20%, transparent), transparent 65%);
+}
+@keyframes theme-ripple {
+  0% {
+    opacity: 0.55;
+    transform: translate(-50%, -50%) scale(0.2);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1.35);
+  }
+}
+
 :focus-visible {
   outline: 2px solid hsl(var(--ring));
   outline-offset: 2px;
@@ -268,6 +401,11 @@ body::before {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+  /* 主题整页交叉淡化不走 * 选择器（伪元素），单独禁用——减少动画下立即换肤。 */
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 0.01ms !important;
   }
 }
 

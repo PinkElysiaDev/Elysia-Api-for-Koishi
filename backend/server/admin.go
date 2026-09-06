@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -43,8 +45,11 @@ func (s *Server) setupAdminRoutes(admin *gin.RouterGroup) {
 	admin.POST("/model-catalog/refresh", s.adminModelCatalogRefresh)
 	admin.GET("/models", s.adminListModels)
 	admin.POST("/models/refresh", s.adminRefreshModels)
-	admin.PATCH("/models/:sourceId/:modelId", s.adminUpdateModel)
-	admin.DELETE("/models/:sourceId/:modelId", s.adminDeleteModel)
+	// modelId 走 query 而非路径段：模型 ID 常含 "/"（如 org/model），路径参数
+	// 在 Gin 路由前已被 URL 解码，%2F 会拆成多段导致 404；query 值只经一次
+	// 解码、不参与路由匹配，对任意字符稳健。
+	admin.PATCH("/models/:sourceId", s.adminUpdateModel)
+	admin.DELETE("/models/:sourceId", s.adminDeleteModel)
 	admin.GET("/model-groups", s.adminListGroups)
 	admin.POST("/model-groups", s.adminUpsertGroup)
 	admin.PUT("/model-groups/:id", s.adminUpsertGroup)
@@ -65,6 +70,10 @@ func (s *Server) setupAdminRoutes(admin *gin.RouterGroup) {
 	admin.GET("/usage/logs/:id", s.adminUsageLogDetail)
 	admin.GET("/usage/seq", s.adminUsageSeq)
 	admin.POST("/usage/reset", s.adminUsageReset)
+	// 日志管理：外置媒体文件、占用状态、手动触发清理巡检。
+	admin.GET("/usage/assets/:requestId/:file", s.adminUsageAsset)
+	admin.GET("/usage/storage", s.adminUsageStorage)
+	admin.POST("/usage/cleanup", s.adminUsageCleanup)
 	admin.GET("/logs", s.adminSystemLogs)
 	admin.GET("/health", s.adminHealth)
 }
@@ -81,6 +90,7 @@ func (s *Server) adminRuntimeConfig(c *gin.Context) {
 	server := s.config.GetServer()
 	catalog := s.config.GetModelCatalog()
 	catalogEnabled := catalog.Enabled == nil || *catalog.Enabled
+	usageLog := s.config.GetUsageLogConfig()
 	respondOK(c, gin.H{
 		"host":                server.Host,
 		"port":                server.Port,
@@ -91,6 +101,17 @@ func (s *Server) adminRuntimeConfig(c *gin.Context) {
 		"httpTimeout":         s.config.GetHTTPTimeout(),
 		"enablePprof":         s.config.GetEnablePprof(),
 		"allowFakeIPOutbound": s.config.IsFakeIPOutboundAllowed(),
+		"usageLog": gin.H{
+			// 生效值（归一化后）：表单直接显示当前实际口径，保存时整体回写。
+			"persistEnabled":         usageLog.PersistEnabled,
+			"retentionDays":          usageLog.RetentionDays,
+			"maxStorageMB":           usageLog.MaxStorageBytes / 1024 / 1024,
+			"maxRecords":             usageLog.MaxRecords,
+			"bodyMaxKB":              usageLog.BodyMaxBytes / 1024,
+			"bodyOnErrorOnly":        usageLog.BodyOnErrorOnly,
+			"externalizeMedia":       usageLog.ExternalizeMedia,
+			"cleanupIntervalMinutes": int(usageLog.CleanupInterval.Minutes()),
+		},
 		"modelCatalog": gin.H{
 			"enabled": catalogEnabled,
 			"url":     catalogResolveURL(catalog),
@@ -101,42 +122,37 @@ func (s *Server) adminRuntimeConfig(c *gin.Context) {
 	})
 }
 
+// runtimeConfigPayload 是 PUT /runtime-config 的请求体：指针/空串字段
+// 表示「未提供（不修改）」。
+type runtimeConfigPayload struct {
+	Host                string                 `json:"host"`
+	Port                int                    `json:"port"`
+	LogLevel            string                 `json:"logLevel"`
+	HTTPTimeout         *int                   `json:"httpTimeout"`
+	PanelAccessToken    *string                `json:"panelAccessToken"`
+	DatabasePath        *string                `json:"databasePath"`
+	EnablePprof         *bool                  `json:"enablePprof"`
+	AllowFakeIPOutbound *bool                  `json:"allowFakeIPOutbound"`
+	UsageLog            *config.UsageLogConfig `json:"usageLog"`
+	ModelCatalog        *struct {
+		SyncIntervalMinutes *int `json:"syncIntervalMinutes"`
+	} `json:"modelCatalog"`
+}
+
 func (s *Server) adminUpdateRuntimeConfig(c *gin.Context) {
-	var payload struct {
-		Host                string  `json:"host"`
-		Port                int     `json:"port"`
-		LogLevel            string  `json:"logLevel"`
-		HTTPTimeout         *int    `json:"httpTimeout"`
-		PanelAccessToken    *string `json:"panelAccessToken"`
-		DatabasePath        *string `json:"databasePath"`
-		EnablePprof         *bool   `json:"enablePprof"`
-		AllowFakeIPOutbound *bool   `json:"allowFakeIPOutbound"`
-		ModelCatalog        *struct {
-			SyncIntervalMinutes *int `json:"syncIntervalMinutes"`
-		} `json:"modelCatalog"`
-	}
+	var payload runtimeConfigPayload
 	if err := c.ShouldBindJSON(&payload); err != nil {
 		respondFail(c, 400, "invalid_json", err.Error())
 		return
 	}
+	// 两阶段：先整体校验（validateRuntimeConfigPayload），全部通过后再应用
+	//——避免「后段字段非法/保存失败但前段已生效」的内存与磁盘状态分叉。
+	if verr := validateRuntimeConfigPayload(&payload); verr != nil {
+		respondFail(c, verr.status, verr.code, verr.message)
+		return
+	}
 	server := s.config.GetServer()
 	requestsRestart := (payload.Host != "" && payload.Host != server.Host) || (payload.Port != 0 && payload.Port != server.Port)
-	// 两阶段：先整体校验，全部通过后再应用——避免「后段字段非法/保存失败
-	// 但前段已生效」造成的内存与磁盘状态分叉（面板令牌等即时字段尤其敏感）。
-	if payload.HTTPTimeout != nil && *payload.HTTPTimeout < 0 {
-		respondFail(c, 400, "invalid_http_timeout", "httpTimeout must not be negative")
-		return
-	}
-	if payload.PanelAccessToken != nil && strings.TrimSpace(*payload.PanelAccessToken) == "" {
-		// 空面板令牌会让 IsValidPanelAccessToken 对一切请求返回 false，
-		// 直接锁死整个管理面板，只能去服务器手改 config.json 恢复。
-		respondFail(c, 400, "invalid_panel_access_token", "panel access token must not be empty")
-		return
-	}
-	if payload.ModelCatalog != nil && payload.ModelCatalog.SyncIntervalMinutes != nil && *payload.ModelCatalog.SyncIntervalMinutes < 0 {
-		respondFail(c, 400, "invalid_sync_interval", "syncIntervalMinutes must not be negative")
-		return
-	}
 
 	if payload.LogLevel != "" {
 		s.config.SetLogLevel(payload.LogLevel)
@@ -170,9 +186,23 @@ func (s *Server) adminUpdateRuntimeConfig(c *gin.Context) {
 		// 即时下发到 relay 包级开关，无需重启。
 		s.syncRelaySSRFPolicy()
 	}
+	if payload.UsageLog != nil {
+		// 局部更新：仅覆盖显式提供的字段。BodyMaxKB/开关对后续请求即时生效；
+		// 清理参数由后台巡检在下一 tick 重新读取。无需重启。
+		s.config.SetUsageLogConfig(*payload.UsageLog)
+	}
 	if payload.ModelCatalog != nil && payload.ModelCatalog.SyncIntervalMinutes != nil {
 		// 周期检查是动态的，写入配置即生效（0 = 默认 24h），无需重启。
 		s.config.SetModelCatalogSyncInterval(*payload.ModelCatalog.SyncIntervalMinutes)
+	}
+	// host/port：此前只用于计算 restartRequired 而从未应用——设置页保存后
+	// 表单闪回旧值、重启后监听也没变。现在即时应用到配置并随 Save() 落盘；
+	// 监听套接字仍需重启切换（restartRequired 语义不变）。
+	if payload.Host != "" && payload.Host != server.Host {
+		s.config.SetHost(payload.Host)
+	}
+	if payload.Port != 0 && payload.Port != server.Port {
+		s.config.SetPort(payload.Port)
 	}
 	if requestsRestart {
 		s.markRestartRequired()
@@ -182,6 +212,67 @@ func (s *Server) adminUpdateRuntimeConfig(c *gin.Context) {
 		return
 	}
 	respondOK(c, gin.H{"updated": true, "restartRequired": requestsRestart})
+}
+
+// runtimeConfigError 携带校验失败的 HTTP 语义（状态码 + 错误码 + 消息）。
+type runtimeConfigError struct {
+	status  int
+	code    string
+	message string
+}
+
+func (e runtimeConfigError) Error() string { return e.message }
+
+// validateRuntimeConfigPayload 整体校验 PUT /runtime-config 的全部字段：
+// 任一非法即返回错误，保证第二阶段（应用 + Save）不会落在部分生效的
+// 状态上。数值字段 0 是合法的「关闭/不保存」语义，只拒绝负数。
+func validateRuntimeConfigPayload(p *runtimeConfigPayload) *runtimeConfigError {
+	if p.HTTPTimeout != nil && *p.HTTPTimeout < 0 {
+		return &runtimeConfigError{400, "invalid_http_timeout", "httpTimeout must not be negative"}
+	}
+	if p.Port != 0 && (p.Port < 1 || p.Port > 65535) {
+		return &runtimeConfigError{400, "invalid_port", "port must be between 1 and 65535"}
+	}
+	if p.Host != "" && strings.TrimSpace(p.Host) == "" {
+		return &runtimeConfigError{400, "invalid_host", "host must not be blank"}
+	}
+	if p.LogLevel != "" {
+		switch p.LogLevel {
+		case "debug", "info", "warn", "error":
+		default:
+			// logAt 对未知级别静默按 info 兜底，保存成功但设置无效——
+			// 直接拒绝，避免「改了没生效」的困惑。
+			return &runtimeConfigError{400, "invalid_log_level", "logLevel must be one of debug/info/warn/error"}
+		}
+	}
+	if p.DatabasePath != nil && strings.TrimSpace(*p.DatabasePath) == "" {
+		return &runtimeConfigError{400, "invalid_database_path", "databasePath must not be empty; unset it in config.json to use the default"}
+	}
+	if p.PanelAccessToken != nil && strings.TrimSpace(*p.PanelAccessToken) == "" {
+		// 空面板令牌会让 IsValidPanelAccessToken 对一切请求返回 false，
+		// 直接锁死整个管理面板，只能去服务器手改 config.json 恢复。
+		return &runtimeConfigError{400, "invalid_panel_access_token", "panel access token must not be empty"}
+	}
+	if p.ModelCatalog != nil && p.ModelCatalog.SyncIntervalMinutes != nil && *p.ModelCatalog.SyncIntervalMinutes < 0 {
+		return &runtimeConfigError{400, "invalid_sync_interval", "syncIntervalMinutes must not be negative"}
+	}
+	if p.UsageLog != nil {
+		for _, check := range []struct {
+			name  string
+			value *int
+		}{
+			{"retentionDays", p.UsageLog.RetentionDays},
+			{"maxStorageMB", p.UsageLog.MaxStorageMB},
+			{"maxRecords", p.UsageLog.MaxRecords},
+			{"bodyMaxKB", p.UsageLog.BodyMaxKB},
+			{"cleanupIntervalMinutes", p.UsageLog.CleanupIntervalMinutes},
+		} {
+			if check.value != nil && *check.value < 0 {
+				return &runtimeConfigError{400, "invalid_usage_log", check.name + " must not be negative"}
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Server) adminReload(c *gin.Context) { s.reloadConfig(c) }
@@ -249,7 +340,13 @@ func (s *Server) adminUpsertSource(c *gin.Context) {
 	}
 	// 「留空即不变」：编辑时若未填 apiKey，保留已有记录的原 key，避免被清空。
 	if strings.TrimSpace(item.APIKey) == "" {
-		if existing, found := s.findSourceByID(c.Request.Context(), item.ID); found {
+		existing, found, findErr := s.findSourceByID(c.Request.Context(), item.ID)
+		if findErr != nil {
+			// 查询失败时绝不能带着空 key 继续保存（会把存量密钥抹掉）。
+			respondFail(c, 500, "lookup_source_failed", findErr.Error())
+			return
+		}
+		if found {
 			item.APIKey = existing.APIKey
 		}
 	}
@@ -299,20 +396,22 @@ func validateCustomSourceProtocol(item *storage.ModelSource) error {
 }
 
 // findSourceByID 按 id 查找模型源（用于「留空即不变」保留原 secret）。
-func (s *Server) findSourceByID(ctx context.Context, id string) (storage.ModelSource, bool) {
+// 查询失败必须显式报错：把错误当「不存在」会让调用方把留空的 api_key 当
+// 「不需要保留」直接写空，静默抹掉存量密钥。
+func (s *Server) findSourceByID(ctx context.Context, id string) (storage.ModelSource, bool, error) {
 	if s.store == nil || id == "" {
-		return storage.ModelSource{}, false
+		return storage.ModelSource{}, false, nil
 	}
 	sources, err := s.store.ListSources(ctx)
 	if err != nil {
-		return storage.ModelSource{}, false
+		return storage.ModelSource{}, false, err
 	}
 	for _, src := range sources {
 		if src.ID == id {
-			return src, true
+			return src, true, nil
 		}
 	}
-	return storage.ModelSource{}, false
+	return storage.ModelSource{}, false, nil
 }
 
 func (s *Server) adminDeleteSource(c *gin.Context) {
@@ -324,6 +423,11 @@ func (s *Server) adminDeleteSource(c *gin.Context) {
 		respondFail(c, 500, "delete_source_failed", err.Error())
 		return
 	}
+	// 源级多 key RR 游标一并清理：游标以 sourceID 为键，删除/重建循环下
+	// 不清理会让 map 随历史源数量无限增长。
+	s.keyRRMutex.Lock()
+	delete(s.keyRRIndex, c.Param("id"))
+	s.keyRRMutex.Unlock()
 	s.invalidateRouteCache()
 	respondOK(c, gin.H{"deleted": true})
 }
@@ -406,7 +510,7 @@ func (s *Server) adminSetSourceEnabled(c *gin.Context) {
 		respondFail(c, 404, "source_not_found", "model source not found")
 		return
 	}
-	// 路由装配按源 enabled 过滤模型（ListModels/ListGroups 的 join 条件），必须失效。
+	// 路由装配按源 enabled 过滤模型（ListModels 的 join 条件），必须失效。
 	s.invalidateRouteCache()
 	respondOK(c, gin.H{"updated": true, "enabled": *payload.Enabled})
 }
@@ -481,7 +585,12 @@ func (s *Server) adminUpdateModel(c *gin.Context) {
 		respondFail(c, 400, "invalid_thinking_mode", "thinkingMode must not be empty")
 		return
 	}
-	found, err := store.UpdateModel(c.Request.Context(), c.Param("modelId"), c.Param("sourceId"), patch)
+	modelID := c.Query("modelId")
+	if modelID == "" {
+		respondFail(c, 400, "model_id_required", "modelId query parameter is required")
+		return
+	}
+	found, err := store.UpdateModel(c.Request.Context(), modelID, c.Param("sourceId"), patch)
 	if err != nil {
 		respondFail(c, 500, "update_model_failed", err.Error())
 		return
@@ -500,7 +609,12 @@ func (s *Server) adminDeleteModel(c *gin.Context) {
 	if !okStore {
 		return
 	}
-	deleted, err := store.DeleteModel(c.Request.Context(), c.Param("modelId"), c.Param("sourceId"))
+	modelID := c.Query("modelId")
+	if modelID == "" {
+		respondFail(c, 400, "model_id_required", "modelId query parameter is required")
+		return
+	}
+	deleted, err := store.DeleteModel(c.Request.Context(), modelID, c.Param("sourceId"))
 	if err != nil {
 		respondFail(c, 500, "delete_model_failed", err.Error())
 		return
@@ -665,10 +779,18 @@ func (s *Server) adminUpsertToken(c *gin.Context) {
 		item.Name = name
 	}
 	// 「留空即不变」：编辑时若未填 token，保留原值（不清空）。
+	isNew := true
 	if strings.TrimSpace(item.Token) == "" {
 		if existing, found, err := store.FindAPITokenByName(c.Request.Context(), item.Name); err == nil && found {
 			item.Token = existing.Token
+			isNew = false
 		}
+	}
+	// 新建时空 token 是死行（hash 为空、认证永远不命中）：直接拒绝而不是
+	// 落一条不可用的记录。编辑路径的「留空即不变」不受影响。
+	if isNew && strings.TrimSpace(item.Token) == "" {
+		respondFail(c, 400, "invalid_token", "token must not be empty when creating a new API token")
+		return
 	}
 	if err := store.UpsertAPIToken(c.Request.Context(), item); err != nil {
 		respondFail(c, 400, "save_token_failed", err.Error())
@@ -766,8 +888,8 @@ func (s *Server) adminUsageByModelDaily(c *gin.Context) {
 	top := 8
 	if raw := c.Query("top"); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > 20 {
-			respondFail(c, 400, "invalid_top", "top must be an integer between 1 and 20")
+		if err != nil || n < 1 || n > 50 {
+			respondFail(c, 400, "invalid_top", "top must be an integer between 1 and 50")
 			return
 		}
 		top = n
@@ -848,6 +970,155 @@ func (s *Server) adminUsageSeq(c *gin.Context) {
 
 func (s *Server) adminUsageReset(c *gin.Context) { s.resetUsage(c) }
 
+// ---- 日志管理（usage-assets / 占用状态 / 手动清理）----
+
+// adminUsageAsset 下发外置媒体文件。资产是捕获的用户内容，必须留在管理
+// 鉴权之后，绝不做公开静态目录。存储为扁平内容寻址（usage-assets/<hash>.<ext>，
+// 同一图片全局一份）；URL 保留 /:requestId/ 段仅为占位符格式兼容，不参与
+// 寻址。文件名格式严格校验（16 位 hex + 白名单扩展名）防穿越。
+func (s *Server) adminUsageAsset(c *gin.Context) {
+	fileName := c.Param("file")
+	hash, ext, ok := parseAssetFileName(fileName)
+	if !ok {
+		respondFail(c, 400, "invalid_asset_name", "invalid asset file name")
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(s.usageAssetsRoot(), hash+"."+ext))
+	if err != nil {
+		respondFail(c, 404, "asset_not_found", "asset file not found")
+		return
+	}
+	c.Header("Cache-Control", "private, max-age=86400")
+	c.Data(http.StatusOK, mimeByAssetExt(ext), data)
+}
+
+func mimeByAssetExt(ext string) string {
+	switch ext {
+	case "png":
+		return "image/png"
+	case "jpg":
+		return "image/jpeg"
+	case "gif":
+		return "image/gif"
+	case "webp":
+		return "image/webp"
+	case "mp3":
+		return "audio/mpeg"
+	case "wav":
+		return "audio/wav"
+	case "ogg":
+		return "audio/ogg"
+	case "mp4":
+		return "video/mp4"
+	case "webm":
+		return "video/webm"
+	case "pdf":
+		return "application/pdf"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// usageAssetsUsage 是资产目录的体积统计（WalkDir 全量遍历，带短 TTL 缓存）。
+type usageAssetsUsage struct {
+	Bytes int64 `json:"bytes"`
+	Files int   `json:"files"`
+	Dirs  int   `json:"dirs"`
+}
+
+const assetsUsageCacheTTL = 30 * time.Second
+
+func (s *Server) usageAssetsUsage() usageAssetsUsage {
+	s.assetsUsageMu.Lock()
+	if time.Since(s.assetsUsageAt) < assetsUsageCacheTTL {
+		cached := s.assetsUsage
+		s.assetsUsageMu.Unlock()
+		return cached
+	}
+	s.assetsUsageMu.Unlock()
+
+	usage := usageAssetsUsage{}
+	_ = filepath.WalkDir(s.usageAssetsRoot(), func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // 目录缺失/权限等：统计尽力而为
+		}
+		if d.IsDir() {
+			usage.Dirs++
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			usage.Bytes += info.Size()
+			usage.Files++
+		}
+		return nil
+	})
+
+	s.assetsUsageMu.Lock()
+	s.assetsUsage, s.assetsUsageAt = usage, time.Now()
+	s.assetsUsageMu.Unlock()
+	return usage
+}
+
+// adminUsageStorage 返回日志占用状态与最近一轮清理结果（设置页展示）。
+func (s *Server) adminUsageStorage(c *gin.Context) {
+	store, okStore := s.requireStore(c)
+	if !okStore {
+		return
+	}
+	ctx := c.Request.Context()
+	dbStats, dbErr := store.UsageDBPageStats(ctx)
+	recordCount, countErr := store.CountUsageRecords(ctx)
+	if dbErr != nil || countErr != nil {
+		respondFail(c, 500, "storage_stats_failed", firstErrMsg(dbErr, countErr))
+		return
+	}
+	cfg := s.config.GetUsageLogConfig()
+	resp := gin.H{
+		"db": gin.H{
+			"totalBytes":   dbStats.TotalBytes(),
+			"logicalBytes": dbStats.LogicalBytes(),
+			"pageCount":    dbStats.PageCount,
+			"pageSize":     dbStats.PageSize,
+			"freePages":    dbStats.FreePages,
+		},
+		"recordCount": recordCount,
+		"assets":      s.usageAssetsUsage(),
+		"config": gin.H{
+			"persistEnabled":         cfg.PersistEnabled,
+			"retentionDays":          cfg.RetentionDays,
+			"maxStorageMB":           cfg.MaxStorageBytes / 1024 / 1024,
+			"maxRecords":             cfg.MaxRecords,
+			"bodyMaxKB":              cfg.BodyMaxBytes / 1024,
+			"bodyOnErrorOnly":        cfg.BodyOnErrorOnly,
+			"externalizeMedia":       cfg.ExternalizeMedia,
+			"cleanupIntervalMinutes": int(cfg.CleanupInterval.Minutes()),
+		},
+	}
+	if r := s.usageRetention; r != nil {
+		resp["lastCleanup"] = r.snapshotStats()
+	}
+	respondOK(c, resp)
+}
+
+// adminUsageCleanup 手动触发一轮清理巡检（异步执行，防重入）。
+func (s *Server) adminUsageCleanup(c *gin.Context) {
+	if s.usageRetention == nil {
+		respondFail(c, http.StatusServiceUnavailable, "retention_unavailable", "usage retention is not running")
+		return
+	}
+	accepted := s.usageRetention.triggerAsync()
+	respondOK(c, gin.H{"accepted": accepted})
+}
+
+func firstErrMsg(errs ...error) string {
+	for _, err := range errs {
+		if err != nil {
+			return err.Error()
+		}
+	}
+	return "unknown error"
+}
+
 func (s *Server) adminSystemLogs(c *gin.Context) {
 	store, okStore := s.requireStore(c)
 	if !okStore {
@@ -878,7 +1149,7 @@ func usageQueryFromRequest(c *gin.Context) storage.UsageQuery {
 	return storage.UsageQuery{
 		From:       from,
 		To:         to,
-		Limit:      parsePositiveInt(c.Query("limit"), 50),
+		Limit:      parsePositiveInt(c.Query("limit"), UsageLogsDefaultPageSize),
 		Offset:     parsePositiveInt(c.Query("offset"), 0),
 		KeyName:    c.Query("keyName"),
 		KeyHash:    c.Query("keyHash"),

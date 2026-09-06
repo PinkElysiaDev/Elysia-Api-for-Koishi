@@ -15,14 +15,14 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { SettingSection, SettingRow } from '@/components/ui/setting-card'
 import { ErrorState } from '@/components/ui/states'
-import { useHealth, useRuntimeConfig, revalidate } from '@/lib/hooks'
+import { useHealth, useRuntimeConfig, revalidate, POLL } from '@/lib/hooks'
 import { useToast } from '@/components/ui/use-toast'
 import { api } from '@/lib/api'
 import { formatBytes, formatNumber } from '@/lib/utils'
 
 export function DiagnosticsPage() {
   const toast = useToast()
-  const { data: health, isLoading, error, mutate } = useHealth(10000)
+  const { data: health, isLoading, error, mutate } = useHealth(POLL.HEALTH_SLOW)
   const { data: runtimeConfig } = useRuntimeConfig()
   const [togglingPprof, setTogglingPprof] = useState(false)
 
@@ -56,7 +56,7 @@ export function DiagnosticsPage() {
       <div className="relative z-[1] space-y-6">
         <PageHeader
           title="系统诊断"          actions={
-            <Button onClick={() => mutate()} disabled={isLoading}>
+            <Button variant="ghost" onClick={() => mutate()} disabled={isLoading}>
               <RefreshCw className={isLoading ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} /> 立即刷新
             </Button>
           }

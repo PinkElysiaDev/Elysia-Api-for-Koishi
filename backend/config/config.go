@@ -28,9 +28,9 @@ type Config struct {
 	Tokens                 []AccessToken      `json:"-"`                                // 运行时字段：仅用于 store-nil 回退与测试；不再从 config.json 读取（模型/token 走 SQLite）
 	Groups                 []ModelGroupConfig `json:"-"`                                // 同上：旧 config.json 的 modelGroups 字段已废弃，数据走 SQLite
 	Responses              ResponsesConfig    `json:"responses,omitempty"`              // Responses API 兼容策略
-	Relay                  RelayConfig        `json:"relay,omitempty"`                  // 转发（chat/claude/gemini）策略
 	CustomProtocols        []json.RawMessage  `json:"customProtocols,omitempty"`        // Maheshvara 自定义协议 JSON 配置
 	Usage                  UsageConfig        `json:"usage,omitempty"`                  // 用量估算配置
+	UsageLog               UsageLogConfig     `json:"usageLog,omitempty"`               // 请求日志留存与内容策略（清理默认关闭）
 	HTTPTimeout            int                `json:"httpTimeout,omitempty"`            // HTTP 请求超时时间（秒），0 为不限制
 	DebugMode              bool               `json:"debugMode,omitempty"`              // 调试模式
 	VerboseLog             bool               `json:"verboseLog,omitempty"`             // 详细日志模式
@@ -86,20 +86,6 @@ type ServerConfig struct {
 type ResponsesConfig struct {
 	Enabled      *bool  `json:"enabled,omitempty"`
 	UpstreamMode string `json:"upstreamMode,omitempty"` // native | transform | auto
-
-	// Deprecated: Maheshvara now uses explicit conversion errors and protocol-bound RawExtra fields.
-	TransformUnsupportedBehavior string `json:"transformUnsupportedBehavior,omitempty"`
-	// Deprecated: unknown fields are retained in Maheshvara RawExtra and are never blindly copied across protocols.
-	PassThroughUnknownFields *bool `json:"passThroughUnknownFields,omitempty"`
-}
-
-// RelayConfig controls compatibility optimizations around the Maheshvara path.
-// Same-protocol passthrough (client wire == upstream wire) is now applied
-// unconditionally so provider-specific fields survive verbatim. The legacy
-// Passthrough flag is retained for backward compatibility only.
-type RelayConfig struct {
-	// Deprecated: same-protocol passthrough is unconditional; no longer consulted.
-	Passthrough *bool `json:"passthrough,omitempty"`
 }
 
 type UsageConfig struct {
@@ -108,6 +94,57 @@ type UsageConfig struct {
 	DefaultOutputTokenEstimate  int   `json:"defaultOutputTokenEstimate,omitempty"`
 	ImageInputTokenEstimate     int   `json:"imageInputTokenEstimate,omitempty"`
 	FileInputTokenEstimatePerKB int   `json:"fileInputTokenEstimatePerKB,omitempty"`
+}
+
+// UsageLogConfig 控制请求日志（usage_records）的留存与内容策略。
+// 三个清理上限（RetentionDays/MaxStorageMB/MaxRecords）均为 nil/0 = 不启用：
+// 开箱默认与历史版本一致——日志持续累积，不做自动清理。
+//
+// 字段全部用指针以区分「未配置（走默认）」与「显式 0（关闭/不保存）」，
+// 管理端 PUT runtime-config 据此实现局部更新。旧扁平键 usagePersistEnabled /
+// usagePersistMaxRecords 仅在显式设置且块内对应字段未配置时作为回退。
+type UsageLogConfig struct {
+	// PersistEnabled 是日志持久化总开关，默认 true；false 时完全不落库。
+	PersistEnabled *bool `json:"persistEnabled,omitempty"`
+	// RetentionDays>0 时自动清理 started_at 早于该天数的记录。
+	RetentionDays *int `json:"retentionDays,omitempty"`
+	// MaxStorageMB>0 时按 SQLite 逻辑大小（page_count×page_size）限额，
+	// 超限按最旧优先删除记录；0=不限。
+	MaxStorageMB *int `json:"maxStorageMB,omitempty"`
+	// MaxRecords>0 时限制保留记录条数，超出删最旧；0=不限。
+	MaxRecords *int `json:"maxRecords,omitempty"`
+	// BodyMaxKB 是单段请求体（四段链路各一）落库上限；nil=默认 1024（1MiB），
+	// 显式 0=不保存任何请求体（仅保留元数据）。
+	BodyMaxKB *int `json:"bodyMaxKB,omitempty"`
+	// BodyOnErrorOnly 开启后仅失败请求（error 非空）保留请求体，成功请求
+	// 四段 body 与外置媒体资产全部不落。默认 false。
+	BodyOnErrorOnly *bool `json:"bodyOnErrorOnly,omitempty"`
+	// ExternalizeMedia 开启后请求体中的 base64 媒体（图片/音频/视频/文件）
+	// 外置为独立文件，body 内以 __ELYSIA_ASSET__ 占位符替代。默认 true。
+	ExternalizeMedia *bool `json:"externalizeMedia,omitempty"`
+	// CleanupIntervalMinutes 是后台清理巡检周期（分钟）；nil/0=默认 60，下限 5。
+	CleanupIntervalMinutes *int `json:"cleanupIntervalMinutes,omitempty"`
+}
+
+// 日志管理默认值。DefaultUsageBodyMaxKB 与 server.UsageBodyMaxBytes（1MiB）
+// 保持一致：历史版本的硬编码上限即 1MiB。
+const (
+	DefaultUsageBodyMaxKB        = 1024
+	DefaultUsageCleanupIntervalM = 60
+	MinUsageCleanupIntervalM     = 5
+)
+
+// UsageLogResolved 是 GetUsageLogConfig 归一化后的生效值（无指针语义），
+// 供日志管线与清理任务直接消费。
+type UsageLogResolved struct {
+	PersistEnabled   bool
+	RetentionDays    int
+	MaxStorageBytes  int64 // MaxStorageMB 换算后的字节限额；0=不限
+	MaxRecords       int   // 0=不限
+	BodyMaxBytes     int   // 0=不保存任何请求体
+	BodyOnErrorOnly  bool
+	ExternalizeMedia bool
+	CleanupInterval  time.Duration
 }
 
 type AccessToken struct {
@@ -175,6 +212,7 @@ func Load(path string) (*Config, error) {
 
 	cfg.path = path
 	cfg.applyBootstrapDefaults(path)
+	cfg.applyEnvironmentOverrides()
 
 	cfg.mu.Lock()
 	GlobalConfig = &cfg
@@ -219,6 +257,13 @@ func (c *Config) applyBootstrapDefaults(path string) {
 	}
 }
 
+func (c *Config) applyEnvironmentOverrides() {
+	if host := strings.TrimSpace(os.Getenv("ELYSIA_API_HOST")); host != "" {
+		c.Host = host
+		c.Server.Host = host
+	}
+}
+
 func (c *Config) Save() error {
 	// 读-改-写全程持写锁：并发 Save（多管理员同时改配置）若跨两次 RLock 段
 	// 进行，会基于彼此过期的快照互相覆盖。
@@ -243,6 +288,21 @@ func (c *Config) Save() error {
 	raw["enablePprof"] = c.EnablePprof
 	raw["httpTimeout"] = c.HTTPTimeout
 	raw["allowFakeIPOutbound"] = c.AllowFakeIPOutbound
+	// usageLog 块：全默认（所有指针字段为 nil，序列化为 {}）时删除键保持文件
+	// 干净；任一字段显式配置过才写入。旧扁平键（usagePersistEnabled 等）由
+	// 读合写原样保留，不在此处迁移。
+	if encoded, err := json.Marshal(c.UsageLog); err == nil && string(encoded) != "{}" {
+		raw["usageLog"] = c.UsageLog
+	} else {
+		delete(raw, "usageLog")
+	}
+	// modelCatalog 块：管理页可改 syncIntervalMinutes（url/proxy/enabled 走
+	// 手编 config.json），必须随 Save 落盘，否则重启后静默回退默认值。
+	if encoded, err := json.Marshal(c.ModelCatalog); err == nil && string(encoded) != "{}" {
+		raw["modelCatalog"] = c.ModelCatalog
+	} else {
+		delete(raw, "modelCatalog")
+	}
 	if len(c.CustomProtocols) > 0 {
 		protocols := make([]json.RawMessage, len(c.CustomProtocols))
 		for index, protocol := range c.CustomProtocols {
@@ -312,10 +372,36 @@ func (c *Config) GetDefaultDatabasePath() string {
 	return filepath.Join(filepath.Dir(c.path), "elysia-api.sqlite3")
 }
 
+// GetMaxBodyBytes 返回请求体大小上限。热路径（body-limit 中间件）每请求
+// 读取，必须走锁——此前直接读字段与 Reload 的持锁写入构成数据竞争。
+func (c *Config) GetMaxBodyBytes() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.MaxBodyBytes
+}
+
 func (c *Config) SetEnablePprof(enabled bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.EnablePprof = enabled
+}
+
+// SetHost/SetPort 更新监听地址与端口（同步嵌套 Server 字段）。监听套接字
+// 在进程启动时绑定，改动需重启才真正换监听；但配置即时落盘（Save 由调用方
+// 触发），重启后即用新值——此前设置页的 host/port 只用来计算 restartRequired
+// 从未应用，保存等于白保存。
+func (c *Config) SetHost(host string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Host = host
+	c.Server.Host = host
+}
+
+func (c *Config) SetPort(port int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Port = port
+	c.Server.Port = port
 }
 
 func (c *Config) GetEnablePprof() bool {
@@ -340,6 +426,12 @@ func (c *Config) SetAllowFakeIPOutbound(v bool) {
 }
 
 func (c *Config) Reload() error {
+	// 全程持锁（含读文件）：此前文件读取在锁外，与「管理端 setter + Save」
+	// 交错时会把刚设置并落盘的值用旧文件内容覆盖，下次 Save 即永久丢失
+	// 管理员改动（丢失更新窗口）。unmarshal 开销极小，不值得为它开窗口。
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	data, err := os.ReadFile(c.path)
 	if err != nil {
 		return err
@@ -352,8 +444,10 @@ func (c *Config) Reload() error {
 
 	newCfg.path = c.path
 	newCfg.applyBootstrapDefaults(c.path)
+	// 与 Load 同序：环境变量覆盖最后应用。否则热重载会让 ELYSIA_API_HOST
+	// 部署静默失效，且随后的 Save 会把文件值固化覆盖部署配置。
+	newCfg.applyEnvironmentOverrides()
 
-	c.mu.Lock()
 	c.Host = newCfg.Host
 	c.Port = newCfg.Port
 	c.PanelAccessToken = newCfg.PanelAccessToken
@@ -368,6 +462,11 @@ func (c *Config) Reload() error {
 	// 因此热重载不覆盖它们（模型组/token 的变更走 SQLite + 路由缓存失效）。
 	c.Responses = newCfg.Responses
 	c.Usage = newCfg.Usage
+	c.UsageLog = newCfg.UsageLog
+	// ModelCatalog 必须随热重载更新：目录子系统按「周期动态读取配置」设计
+	//（runPeriodic 每轮重读 getter），漏拷会让 url/proxy/enabled/周期在
+	// 重载后维持旧值直到进程重启。
+	c.ModelCatalog = newCfg.ModelCatalog
 	c.HTTPTimeout = newCfg.HTTPTimeout
 	c.DebugMode = newCfg.DebugMode
 	c.VerboseLog = newCfg.VerboseLog
@@ -379,16 +478,8 @@ func (c *Config) Reload() error {
 	for index, protocol := range newCfg.CustomProtocols {
 		c.CustomProtocols[index] = append(json.RawMessage(nil), protocol...)
 	}
-	c.mu.Unlock()
 
 	return nil
-}
-
-func (c *Config) Dir() string {
-	c.mu.RLock()
-	path := c.path
-	c.mu.RUnlock()
-	return filepath.Dir(path)
 }
 
 func (c *Config) GetGroups() []ModelGroupConfig {
@@ -398,8 +489,6 @@ func (c *Config) GetGroups() []ModelGroupConfig {
 	// 与 Reload/admin 的并发重写竞争（go test -race 可验证）。
 	return append([]ModelGroupConfig(nil), c.Groups...)
 }
-
-// GetGroupByName 根据模型组名称查找模型组配置
 
 func (c *Config) GetTokens() []AccessToken {
 	c.mu.RLock()
@@ -582,13 +671,6 @@ func (c *Config) GetDBEncryptionKey() []byte {
 	return []byte(key)
 }
 
-func (c *Config) IsPanelAccessConfigured() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.PanelAccessToken != ""
-}
-
-
 func (c *Config) FindAccessToken(token string) (AccessToken, bool) {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -626,24 +708,6 @@ func constantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-func (c *Config) IsUsagePersistEnabled() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.UsagePersistEnabled == nil || *c.UsagePersistEnabled
-}
-
-func (c *Config) GetUsagePersistMaxRecords() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.UsagePersistMaxRecords <= 0 {
-		return 10000
-	}
-	if c.UsagePersistMaxRecords < 1000 {
-		return 1000
-	}
-	return c.UsagePersistMaxRecords
-}
-
 func (c *Config) GetResponsesConfig() ResponsesConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -655,13 +719,6 @@ func (c *Config) GetResponsesConfig() ResponsesConfig {
 	}
 	if strings.TrimSpace(cfg.UpstreamMode) == "" {
 		cfg.UpstreamMode = "auto"
-	}
-	if strings.TrimSpace(cfg.TransformUnsupportedBehavior) == "" {
-		cfg.TransformUnsupportedBehavior = "error"
-	}
-	if cfg.PassThroughUnknownFields == nil {
-		v := true
-		cfg.PassThroughUnknownFields = &v
 	}
 	return cfg
 }
@@ -688,6 +745,127 @@ func (c *Config) GetUsageConfig() UsageConfig {
 		cfg.FileInputTokenEstimatePerKB = 128
 	}
 	return cfg
+}
+
+// DefaultUsageLogResolved 返回全默认的日志策略：持久化开启、请求体上限
+// 1MiB、媒体外置开启、自动清理关闭。供无 config 的 Server（裸构造的测试）
+// 兜底，与历史版本行为一致。
+func DefaultUsageLogResolved() UsageLogResolved {
+	return UsageLogResolved{
+		PersistEnabled:   true,
+		BodyMaxBytes:     DefaultUsageBodyMaxKB * 1024,
+		ExternalizeMedia: true,
+		CleanupInterval:  time.Duration(DefaultUsageCleanupIntervalM) * time.Minute,
+	}
+}
+
+// clampIntPtr 返回钳为非负的指针副本；nil 透传。
+func clampIntPtr(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	n := *v
+	if n < 0 {
+		n = 0
+	}
+	return &n
+}
+
+// positiveOr 取指针正值；nil/非正返回 def（负数已在 setter 钳为 0，双保险）。
+func positiveOr(p *int, def int) int {
+	if p != nil && *p > 0 {
+		return *p
+	}
+	return def
+}
+
+// GetUsageLogConfig 返回归一化后的日志管理生效值：nil 指针走默认、
+// 显式 0 保留其「关闭」语义、负数钳为 0。旧扁平键仅在显式设置且新块
+// 对应字段未配置时回退（usagePersistMaxRecords 不套用历史 getter 的
+// 10000 默认——只有配置文件里真实写过的值才生效）。
+func (c *Config) GetUsageLogConfig() UsageLogResolved {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.resolveUsageLogLocked()
+}
+
+// resolveUsageLogLocked 在已持读/写锁时归一化日志配置。Save 持写锁时复用。
+func (c *Config) resolveUsageLogLocked() UsageLogResolved {
+	cfg := c.UsageLog
+	res := UsageLogResolved{
+		PersistEnabled:   cfg.PersistEnabled == nil || *cfg.PersistEnabled,
+		BodyOnErrorOnly:  cfg.BodyOnErrorOnly != nil && *cfg.BodyOnErrorOnly,
+		ExternalizeMedia: cfg.ExternalizeMedia == nil || *cfg.ExternalizeMedia,
+		CleanupInterval:  time.Duration(DefaultUsageCleanupIntervalM) * time.Minute,
+	}
+	res.RetentionDays = positiveOr(cfg.RetentionDays, 0)
+	if mb := positiveOr(cfg.MaxStorageMB, 0); mb > 0 {
+		res.MaxStorageBytes = int64(mb) * 1024 * 1024
+	}
+	res.MaxRecords = positiveOr(cfg.MaxRecords, 0)
+	// 旧扁平键回退（仅显式设置时）。
+	if cfg.PersistEnabled == nil && c.UsagePersistEnabled != nil {
+		res.PersistEnabled = *c.UsagePersistEnabled
+	}
+	if cfg.MaxRecords == nil && c.UsagePersistMaxRecords > 0 {
+		res.MaxRecords = c.UsagePersistMaxRecords
+	}
+	if cfg.BodyMaxKB == nil {
+		res.BodyMaxBytes = DefaultUsageBodyMaxKB * 1024
+	} else if *cfg.BodyMaxKB > 0 {
+		res.BodyMaxBytes = *cfg.BodyMaxKB * 1024
+	}
+	if cfg.CleanupIntervalMinutes != nil && *cfg.CleanupIntervalMinutes > 0 {
+		minutes := *cfg.CleanupIntervalMinutes
+		if minutes < MinUsageCleanupIntervalM {
+			minutes = MinUsageCleanupIntervalM
+		}
+		res.CleanupInterval = time.Duration(minutes) * time.Minute
+	}
+	return res
+}
+
+// GetUsageLogRaw 返回原始（未归一化）日志配置副本，供管理端展示
+// 「已配置值 vs 默认值」。
+func (c *Config) GetUsageLogRaw() UsageLogConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.UsageLog
+}
+
+// SetUsageLogConfig 运行时局部更新日志配置：仅覆盖 patch 中显式提供的字段
+// （指针非 nil，数值字段 0 也是显式值），未提供的字段保持现值。
+// 调用方随后调用 Save() 落盘；BodyMaxKB/开关对后续请求即时生效，
+// 清理参数由后台任务在下一巡检 tick 重新读取。
+func (c *Config) SetUsageLogConfig(patch UsageLogConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 局部更新：nil 字段保持现值；数值字段统一经 clampIntPtr 钳为非负
+	//（归一化语义集中在 resolveUsageLogLocked，setter 只做非负化）。
+	if patch.PersistEnabled != nil {
+		c.UsageLog.PersistEnabled = patch.PersistEnabled
+	}
+	if patch.RetentionDays != nil {
+		c.UsageLog.RetentionDays = clampIntPtr(patch.RetentionDays)
+	}
+	if patch.MaxStorageMB != nil {
+		c.UsageLog.MaxStorageMB = clampIntPtr(patch.MaxStorageMB)
+	}
+	if patch.MaxRecords != nil {
+		c.UsageLog.MaxRecords = clampIntPtr(patch.MaxRecords)
+	}
+	if patch.BodyMaxKB != nil {
+		c.UsageLog.BodyMaxKB = clampIntPtr(patch.BodyMaxKB)
+	}
+	if patch.BodyOnErrorOnly != nil {
+		c.UsageLog.BodyOnErrorOnly = patch.BodyOnErrorOnly
+	}
+	if patch.ExternalizeMedia != nil {
+		c.UsageLog.ExternalizeMedia = patch.ExternalizeMedia
+	}
+	if patch.CleanupIntervalMinutes != nil {
+		c.UsageLog.CleanupIntervalMinutes = clampIntPtr(patch.CleanupIntervalMinutes)
+	}
 }
 
 func init() {

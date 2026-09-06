@@ -6,16 +6,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"sort"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/elysia-api/backend/config"
 	"github.com/elysia-api/backend/relay"
+	"github.com/elysia-api/backend/storage"
 	"github.com/gin-gonic/gin"
 )
 
@@ -65,49 +69,76 @@ type retryEvent struct {
 }
 
 type usageRecord struct {
-	RequestID           string           `json:"requestId"`
-	StartedAt           time.Time        `json:"startedAt"`
-	EndedAt             time.Time        `json:"endedAt"`
-	KeyName             string           `json:"keyName"`
-	KeyHash             string           `json:"keyHash"`
-	RequestedModelGroup string           `json:"requestedModelGroup"`
-	GroupID             string           `json:"groupId"`
-	GroupName           string           `json:"groupName"`
-	ModelID             string           `json:"modelId"`
-	ModelName           string           `json:"modelName"`
-	SourceID            string           `json:"sourceId,omitempty"`
-	Platform            string           `json:"platform"`
-	InputFormat         string           `json:"inputFormat"`
-	TargetPlatform      string           `json:"targetPlatform"`
-	SourceFormat        string           `json:"sourceFormat,omitempty"`
-	TargetFormat        string           `json:"targetFormat,omitempty"`
-	SourceEndpoint      string           `json:"sourceEndpoint,omitempty"`
-	TargetEndpoint      string           `json:"targetEndpoint,omitempty"`
-	RelayMode           string           `json:"relayMode,omitempty"`
-	ResponsesMode       string           `json:"responsesMode,omitempty"`
-	ConversionChain     []string         `json:"conversionChain,omitempty"`
-	UsageSource         string           `json:"usageSource,omitempty"`
-	RequestWarnings     []string         `json:"requestWarnings,omitempty"`
-	Stream              bool             `json:"stream"`
-	StatusCode          int              `json:"statusCode"`
-	Error               string           `json:"error,omitempty"`
-	FirstByteMs         int64            `json:"firstByteMs"`
-	DurationMs          int64            `json:"durationMs"`
-	Usage               usageTokenUsage  `json:"usage"`
-	UsageDetail         usageDetail      `json:"usageDetail,omitempty"`
-	BuiltinToolUsage    builtinToolUsage `json:"builtinToolUsage,omitempty"`
-	RetryCount          int              `json:"retryCount"`
-	RetryEvents         []retryEvent     `json:"retryEvents"`
-	IncomingBody        usageBody        `json:"incomingBody"`
-	OutgoingBody        usageBody        `json:"outgoingBody"`
-	ProviderResponse    usageBody        `json:"providerResponse"`
-	DownstreamResponse  usageBody        `json:"downstreamResponse"`
+	RequestID           string    `json:"requestId"`
+	StartedAt           time.Time `json:"startedAt"`
+	EndedAt             time.Time `json:"endedAt"`
+	KeyName             string    `json:"keyName"`
+	KeyHash             string    `json:"keyHash"`
+	RequestedModelGroup string    `json:"requestedModelGroup"`
+	GroupID             string    `json:"groupId"`
+	GroupName           string    `json:"groupName"`
+	ModelID             string    `json:"modelId"`
+	ModelName           string    `json:"modelName"`
+	SourceID            string    `json:"sourceId,omitempty"`
+	Platform            string    `json:"platform"`
+	InputFormat         string    `json:"inputFormat"`
+	TargetPlatform      string    `json:"targetPlatform"`
+	SourceFormat        string    `json:"sourceFormat,omitempty"`
+	TargetFormat        string    `json:"targetFormat,omitempty"`
+	SourceEndpoint      string    `json:"sourceEndpoint,omitempty"`
+	TargetEndpoint      string    `json:"targetEndpoint,omitempty"`
+	RelayMode           string    `json:"relayMode,omitempty"`
+	ResponsesMode       string    `json:"responsesMode,omitempty"`
+	ConversionChain     []string  `json:"conversionChain,omitempty"`
+	UsageSource         string    `json:"usageSource,omitempty"`
+	RequestWarnings     []string  `json:"requestWarnings,omitempty"`
+	Stream              bool      `json:"stream"`
+	StatusCode          int       `json:"statusCode"`
+	Error               string    `json:"error,omitempty"`
+	// ErrorKind 是错误归类（ErrorKind* 常量），供面板筛选/展示；空表示未归类。
+	ErrorKind          string           `json:"errorKind,omitempty"`
+	FirstByteMs        int64            `json:"firstByteMs"`
+	DurationMs         int64            `json:"durationMs"`
+	Usage              usageTokenUsage  `json:"usage"`
+	UsageDetail        usageDetail      `json:"usageDetail,omitempty"`
+	BuiltinToolUsage   builtinToolUsage `json:"builtinToolUsage,omitempty"`
+	RetryCount         int              `json:"retryCount"`
+	RetryEvents        []retryEvent     `json:"retryEvents"`
+	IncomingBody       usageBody        `json:"incomingBody"`
+	OutgoingBody       usageBody        `json:"outgoingBody"`
+	ProviderResponse   usageBody        `json:"providerResponse"`
+	DownstreamResponse usageBody        `json:"downstreamResponse"`
 
 	// downstream 是写回下游客户端的 ResponseWriter 捕获器，运行期内部使用，
 	// 不参与 JSON 序列化。recordUsage 会从它回读 DownstreamResponse。
 	downstream *downstreamCaptureWriter `json:"-"`
 	// writeGen 与 Server.usageWriteGen 对齐；reset 递增后丢弃更早的写入。
 	writeGen uint64 `json:"-"`
+	// bodyOpts 是本条请求生效的日志内容策略（initUsageRecord 从配置快照一次，
+	// 四段 body 共用，避免热更新导致同一请求各段口径不一致）。
+	bodyOpts usageBodyOptions `json:"-"`
+	// assets 收集四段 body 中外置的 base64 媒体（捕获期登记、落库期写盘）。
+	assets assetSink `json:"-"`
+	// pendingStreamEvents 是流式请求捕获的上游事件（环形保留最后
+	// StreamEventsCacheMax 条），recordUsage 物化为 ProviderResponse。
+	pendingStreamEvents []json.RawMessage `json:"-"`
+}
+
+// usageBodyOptions 是单条请求生效的日志内容策略。initialized=false 表示
+// 未初始化（直接构造的裸记录，多见于测试），按历史默认 1MiB、不外置处理——
+// 不能靠 maxBytes 零值判断，因为 0 是显式的「不保存任何请求体」。
+type usageBodyOptions struct {
+	initialized bool
+	maxBytes    int
+	externalize bool
+}
+
+// effectiveMaxBytes 归一化上限：未初始化走 UsageBodyMaxBytes 历史默认。
+func (o usageBodyOptions) effectiveMaxBytes() int {
+	if !o.initialized {
+		return UsageBodyMaxBytes
+	}
+	return o.maxBytes
 }
 
 func shortTokenHash(token string) string {
@@ -116,15 +147,20 @@ func shortTokenHash(token string) string {
 }
 
 func (s *Server) initUsageRecord(c *gin.Context, start time.Time, body []byte, inputFormat relay.FormatType) *usageRecord {
-	return &usageRecord{
-		RequestID:    usageRequestID(start),
-		StartedAt:    start,
-		KeyName:      c.GetString("elysiaKeyName"),
-		KeyHash:      c.GetString("elysiaKeyHash"),
-		InputFormat:  string(inputFormat),
-		StatusCode:   http.StatusOK,
-		IncomingBody: sanitizeUsageBody(body),
+	cfg := s.usageLogConfig()
+	requestID := usageRequestID(start)
+	record := &usageRecord{
+		RequestID:   requestID,
+		StartedAt:   start,
+		KeyName:     c.GetString("elysiaKeyName"),
+		KeyHash:     c.GetString("elysiaKeyHash"),
+		InputFormat: string(inputFormat),
+		StatusCode:  http.StatusOK,
+		bodyOpts:    usageBodyOptions{initialized: true, maxBytes: cfg.BodyMaxBytes, externalize: cfg.ExternalizeMedia},
+		assets:      newAssetSink(requestID),
 	}
+	record.IncomingBody = record.sanitizeBody(body)
+	return record
 }
 
 // usageRequestID 生成带随机后缀的请求 ID：并发请求可能拿到相同的 UnixNano
@@ -137,21 +173,86 @@ func usageRequestID(start time.Time) string {
 	return fmt.Sprintf("req_%d_%x", start.UnixNano(), suffix)
 }
 
-func sanitizeUsageBody(data []byte) usageBody {
-	truncated := len(data) > UsageBodyMaxBytes
-	if truncated {
-		data = data[:UsageBodyMaxBytes]
+// sanitizeBody 是四段链路共用的请求体清洗入口：解析 → 脱敏 → 媒体外置 → 截断。
+// 顺序关键：外置必须先于截断，否则大请求体会被拦腰截成非法 JSON，其中的
+// base64 媒体也永远提不出来。maxBytes 显式为 0（不保存请求体）时返回空体；
+// JSON 不可解析（非 JSON body）时退化为字节截断，保持历史语义。
+func (r *usageRecord) sanitizeBody(data []byte) usageBody {
+	maxBytes := r.bodyOpts.effectiveMaxBytes()
+	if maxBytes == 0 || len(data) == 0 {
+		return usageBody{}
 	}
-
 	var value interface{}
 	if err := json.Unmarshal(data, &value); err == nil {
 		redactJSON(value)
+		if r.bodyOpts.externalize {
+			r.assets.extractFromValue(value)
+		}
 		if sanitized, err := json.Marshal(value); err == nil {
-			return usageBody{Content: string(sanitized), Truncated: truncated}
+			return truncateUsageBody(string(sanitized), maxBytes)
 		}
 	}
+	if len(data) > maxBytes {
+		return usageBody{Content: string(data[:maxBytes]), Truncated: true}
+	}
+	return usageBody{Content: string(data)}
+}
 
-	return usageBody{Content: string(data), Truncated: truncated}
+// finalizeDownstreamBody 处理第四段「返回下游」：tee 捕获的是流式原始字节，
+// 这里按「整体 JSON → SSE 逐行 → 字节截断」三级降级做外置与截断。
+// 与前三段不同，下游内容不做脱敏（沿用 downstreamBody 的既定语义）。
+func (r *usageRecord) finalizeDownstreamBody(body usageBody) usageBody {
+	maxBytes := r.bodyOpts.effectiveMaxBytes()
+	if maxBytes == 0 || body.Content == "" {
+		return usageBody{}
+	}
+	if !r.bodyOpts.externalize {
+		return truncateUsageBody(body.Content, maxBytes)
+	}
+	var value interface{}
+	if err := json.Unmarshal([]byte(body.Content), &value); err == nil {
+		r.assets.extractFromValue(value)
+		if sanitized, err := json.Marshal(value); err == nil {
+			return truncateUsageBody(string(sanitized), maxBytes)
+		}
+	}
+	// SSE 流：逐行 best-effort，仅解析 data: 前缀且含媒体标记的行。
+	externalized := r.assets.extractFromSSE(body.Content)
+	return truncateUsageBody(externalized, maxBytes)
+}
+
+// truncateUsageBody 按上限截断序列化后的文本。
+func truncateUsageBody(content string, maxBytes int) usageBody {
+	if len(content) <= maxBytes {
+		return usageBody{Content: content}
+	}
+	return usageBody{Content: content[:maxBytes], Truncated: true}
+}
+
+// appendStreamEvent 登记一条上游流事件：环形保留最后 StreamEventsCacheMax 条
+// （终态事件——最终 usage、finish 原因——在流尾部，保尾不保头），非法 JSON
+// 直接丢弃（坏片段混进数组会让整个事件数组的序列化永远失败）。
+// 序列化推迟到 recordUsage 一次性物化：旧实现每事件重编组整个数组并完整
+// 清洗，CPU 随事件数平方增长。
+func (r *usageRecord) appendStreamEvent(payload string) {
+	if !json.Valid([]byte(payload)) {
+		return
+	}
+	if len(r.pendingStreamEvents) >= StreamEventsCacheMax {
+		r.pendingStreamEvents = append(r.pendingStreamEvents[:0], r.pendingStreamEvents[1:]...)
+	}
+	r.pendingStreamEvents = append(r.pendingStreamEvents, json.RawMessage(payload))
+}
+
+// materializeStreamEvents 把捕获的流事件物化为 ProviderResponse（该记录
+// 未显式赋值过时）。非流式路径不受影响。
+func (r *usageRecord) materializeStreamEvents() {
+	if r.ProviderResponse.Content != "" || len(r.pendingStreamEvents) == 0 {
+		return
+	}
+	if eventBytes, err := json.Marshal(r.pendingStreamEvents); err == nil {
+		r.ProviderResponse = r.sanitizeBody(eventBytes)
+	}
 }
 
 func redactJSON(value interface{}) {
@@ -302,19 +403,7 @@ func usageResultFromOpenAICompatiblePayload(payload map[string]interface{}, sour
 
 func usageResultFromOpenAIUsage(raw map[string]interface{}, source string) providerUsageResult {
 	usage := usageFromOpenAIUsage(raw)
-	detail := usageDetail{}
-	if usage.InputTokens != nil {
-		detail.InputTokens = intPtr(getInt(usage.InputTokens))
-	}
-	if usage.OutputTokens != nil {
-		detail.OutputTokens = intPtr(getInt(usage.OutputTokens))
-	}
-	if usage.TotalTokens != nil {
-		detail.TotalTokens = intPtr(getInt(usage.TotalTokens))
-	}
-	if usage.CacheHitTokens != nil {
-		detail.CachedInputTokens = intPtr(getInt(usage.CacheHitTokens))
-	}
+	detail := detailFromTokenUsage(usage)
 	// completion/output 两个键是同一明细的两种命名（Responses 与 chat 兼容上游各用其一）。
 	for _, key := range []string{"completion_tokens_details", "output_tokens_details"} {
 		if details, ok := raw[key].(map[string]interface{}); ok {
@@ -378,19 +467,7 @@ func usageFromResponsesStreamPayload(payload map[string]interface{}, source stri
 
 func usageResultFromGeminiUsageMetadata(raw map[string]interface{}, source string) providerUsageResult {
 	usage := usageFromGeminiUsageMetadata(raw)
-	detail := usageDetail{}
-	if usage.InputTokens != nil {
-		detail.InputTokens = intPtr(getInt(usage.InputTokens))
-	}
-	if usage.OutputTokens != nil {
-		detail.OutputTokens = intPtr(getInt(usage.OutputTokens))
-	}
-	if usage.TotalTokens != nil {
-		detail.TotalTokens = intPtr(getInt(usage.TotalTokens))
-	}
-	if usage.CacheHitTokens != nil {
-		detail.CachedInputTokens = intPtr(getInt(usage.CacheHitTokens))
-	}
+	detail := detailFromTokenUsage(usage)
 	if rawValue, ok := raw["thoughtsTokenCount"]; ok && rawValue != nil {
 		detail.ReasoningTokens = intPtr(int(numberFromUsageMap(raw, "thoughtsTokenCount")))
 	}
@@ -402,19 +479,7 @@ func usageResultFromGeminiUsageMetadata(raw map[string]interface{}, source strin
 
 func usageResultFromClaudeUsage(raw map[string]interface{}, source string) providerUsageResult {
 	usage := usageFromClaudeUsage(raw)
-	detail := usageDetail{}
-	if usage.InputTokens != nil {
-		detail.InputTokens = intPtr(getInt(usage.InputTokens))
-	}
-	if usage.OutputTokens != nil {
-		detail.OutputTokens = intPtr(getInt(usage.OutputTokens))
-	}
-	if usage.TotalTokens != nil {
-		detail.TotalTokens = intPtr(getInt(usage.TotalTokens))
-	}
-	if usage.CacheHitTokens != nil {
-		detail.CachedInputTokens = intPtr(getInt(usage.CacheHitTokens))
-	}
+	detail := detailFromTokenUsage(usage)
 	cacheCreation := int(numberFromUsageMap(raw, "cache_creation_input_tokens"))
 	if creation, ok := raw["cache_creation"].(map[string]interface{}); ok && cacheCreation == 0 {
 		cacheCreation = int(numberFromUsageMap(creation, "ephemeral_5m_input_tokens")) + int(numberFromUsageMap(creation, "ephemeral_1h_input_tokens"))
@@ -617,8 +682,15 @@ func (s *Server) recordUsage(record *usageRecord) {
 	}
 	// 回读「返回下游」内容（第四段链路）。capture writer tee 了实际写给客户端的字节。
 	// 仅在还没显式设置过时回填，避免覆盖特殊路径手动赋的值。
+	// 物化后统一走 finalize（外置 + 最终截断）。
 	if record.downstream != nil && record.DownstreamResponse.Content == "" {
-		record.DownstreamResponse = record.downstream.downstreamBody()
+		record.DownstreamResponse = record.finalizeDownstreamBody(record.downstream.downstreamBody())
+	}
+	// 流式路径的 ProviderResponse 在此一次性物化（捕获期只登记事件）。
+	record.materializeStreamEvents()
+	// 日志持久化总开关（usageLog.persistEnabled，默认 true）：关闭后完全不落库。
+	if !s.usageLogConfig().PersistEnabled {
+		return
 	}
 	if record.EndedAt.IsZero() {
 		record.EndedAt = time.Now()
@@ -660,6 +732,13 @@ func (s *Server) resetUsage(c *gin.Context) {
 		if w != nil {
 			w.mu.Unlock()
 		}
+		// 回填进行中：绝不在此排队等锁（调用方已持有 writer/persist 锁，
+		// 排队会卡住全部请求的 usage 落库），转 409 让用户稍后重试。
+		if errors.Is(err, storage.ErrRollupBackfillInProgress) {
+			respondFail(c, http.StatusConflict, "backfill_in_progress",
+				"rollup backfill is running; retry after it completes")
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -667,6 +746,13 @@ func (s *Server) resetUsage(c *gin.Context) {
 	// 避免「先加 generation 再 drain」把 reset 之后、drain 之前入队的新记录丢掉。
 	s.drainUsageQueueFrom(w)
 	s.usageWriteGen.Add(1)
+	// 记录已全清：外置媒体资产目录一并清空。必须在 persist/write 锁释放前
+	// 执行——之后放行的新请求会重建自己的资产目录，不会误删。
+	if root := s.usageAssetsRoot(); root != "" {
+		if err := os.RemoveAll(root); err != nil {
+			log.Printf("usage reset: failed to remove assets root %s: %v", root, err)
+		}
+	}
 	s.usagePersistMu.Unlock()
 	if w != nil {
 		w.mu.Unlock()
@@ -692,112 +778,6 @@ func usageTimeRange(c *gin.Context) (time.Time, time.Time) {
 	return from, to
 }
 
-func usageValueMatches(filters []string, value string) bool {
-	if len(filters) == 0 {
-		return true
-	}
-	for _, filter := range filters {
-		if strings.TrimSpace(filter) == value {
-			return true
-		}
-	}
-	return false
-}
-
-func usageStatusMatches(statusCode int, filter string) bool {
-	switch strings.ToLower(strings.TrimSpace(filter)) {
-	case "":
-		return true
-	case "success":
-		return statusCode >= 200 && statusCode < 400
-	case "failed":
-		return statusCode < 200 || statusCode >= 400
-	default:
-		code, err := strconv.Atoi(filter)
-		return err == nil && statusCode == code
-	}
-}
-
-func avgInt64(values []int64) float64 {
-	var total int64
-	for _, value := range values {
-		total += value
-	}
-	return float64(total) / float64(len(values))
-}
-
-func percentileInt64(values []int64, percentile float64) int64 {
-	if len(values) == 0 {
-		return 0
-	}
-	sorted := append([]int64(nil), values...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	idx := int(float64(len(sorted)-1) * percentile)
-	return sorted[idx]
-}
-
-func nextUsageWindow(t time.Time, window string) time.Time {
-	switch window {
-	case "5m":
-		return t.Add(5 * time.Minute)
-	case "15m":
-		return t.Add(15 * time.Minute)
-	case "day":
-		return t.AddDate(0, 0, 1)
-	default:
-		return t.Add(time.Hour)
-	}
-}
-
-func aggregateKey(record usageRecord, dimension string, window string) string {
-	switch dimension {
-	case "key":
-		if record.KeyName != "" {
-			return record.KeyName + " (" + record.KeyHash + ")"
-		}
-		return record.KeyHash
-	case "modelGroup":
-		return record.GroupName
-	case "model":
-		return record.GroupName + " / " + record.ModelName
-	case "sourceFormat":
-		if record.SourceFormat != "" {
-			return record.SourceFormat
-		}
-		return record.InputFormat
-	case "targetFormat":
-		return record.TargetFormat
-	case "relayMode":
-		return record.RelayMode
-	case "usageSource":
-		return record.UsageSource
-	case "window":
-		return truncateUsageWindow(record.StartedAt, window).Format(time.RFC3339)
-	default:
-		return ""
-	}
-}
-
-func truncateUsageWindow(t time.Time, window string) time.Time {
-	// 按本地时钟对齐窗口边界：t.Truncate 按 Unix 纪元取整，在非整小时时区
-	//（如 UTC+5:30）会把"小时"桶切在半点上，图表标签与数据错位。
-	location := t.Location()
-	switch window {
-	case "5m":
-		minute := t.Minute() - t.Minute()%5
-		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), minute, 0, 0, location)
-	case "15m":
-		minute := t.Minute() - t.Minute()%15
-		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), minute, 0, 0, location)
-	case "minute":
-		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, location)
-	case "day":
-		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, location)
-	default:
-		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, location)
-	}
-}
-
 func parsePositiveInt(raw string, fallback int) int {
 	value, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || value < 0 {
@@ -806,13 +786,16 @@ func parsePositiveInt(raw string, fallback int) int {
 	return value
 }
 
+// observingStreamWriter 是下游观察者：包裹写回客户端的流式 writer，仅负责
+// 首字节计时与输出文本累积（本地 token 估算用）。事件捕获与 usage 提取由
+// 上游观察者（upstreamUsageObservingBody）承担——若两者都写 ProviderResponse，
+// transform 模式下最终值取决于读写交错且记录的是下游渲染格式而非上游原文。
 type observingStreamWriter struct {
 	inner        relay.StreamResponseWriter
 	record       *usageRecord
 	startTime    time.Time
-	events       []json.RawMessage
 	responseText strings.Builder
-	observeUsage bool
+	lines        sseLineSplitter
 }
 
 func (w *observingStreamWriter) Write(data []byte) (int, error) {
@@ -826,6 +809,8 @@ func (w *observingStreamWriter) WriteString(data string) (int, error) {
 }
 
 func (w *observingStreamWriter) Flush() error {
+	// SSE 以空行分帧，Flush 时行必完整；冲刷残余缓冲防止最后一行丢失。
+	w.lines.flushRemainder(w.observeLine)
 	return w.inner.Flush()
 }
 
@@ -836,28 +821,57 @@ func (w *observingStreamWriter) observe(data []byte) {
 	if w.record.FirstByteMs == 0 && len(strings.TrimSpace(string(data))) > 0 {
 		w.record.FirstByteMs = time.Since(w.startTime).Milliseconds()
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		w.responseText.WriteString(extractOutputTextFromStreamPayload(payload))
-		if !w.observeUsage {
-			continue
-		}
-		if len(w.events) < 50 {
-			w.events = append(w.events, json.RawMessage(payload))
-			if eventBytes, err := json.Marshal(w.events); err == nil {
-				w.record.ProviderResponse = sanitizeUsageBody(eventBytes)
-			}
-		}
-		result := extractProviderUsageFromStreamEvent("", relay.FormatResponses, payload)
-		applyProviderUsageToRecord(w.record, result)
+	// 行缓冲：data: 载荷可能跨多次 Write 到达，按单次调用切行会把半截 JSON
+	// 当完整事件处理（详见 sseLineSplitter 注释）。
+	w.lines.feed(data, w.observeLine)
+}
+
+func (w *observingStreamWriter) observeLine(line string) {
+	if !strings.HasPrefix(line, "data:") {
+		return
 	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return
+	}
+	w.responseText.WriteString(extractOutputTextFromStreamPayload(payload))
+}
+
+// sseLineSplitter 缓冲跨 Read/Write 到达的字节，按完整行回调 onLine。
+// 观察者逐行解析 SSE，若直接对每次到达的字节片段 Split("\n")，一个跨两次
+// Write 的 data: 载荷会被当成两条（半截）事件处理——坏 JSON 混进事件数组
+// 后，json.Marshal 对内嵌 RawMessage 的校验会让之后的所有序列化全部失败。
+// 互斥保护：上游观察者的 Close（flushRemainder）与扫描 goroutine 解除
+// 阻塞后的最后一次 feed 可能并发（inner.Close 先唤醒阻塞中的 Read）；
+// 回调作为参数传入而非结构体字段，避免回调字段自身的读写竞争。
+type sseLineSplitter struct {
+	mu     sync.Mutex
+	buffer []byte
+}
+
+func (s *sseLineSplitter) feed(data []byte, onLine func(line string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buffer = append(s.buffer, data...)
+	for {
+		idx := bytes.IndexByte(s.buffer, '\n')
+		if idx < 0 {
+			return
+		}
+		line := strings.TrimSpace(string(s.buffer[:idx]))
+		s.buffer = s.buffer[idx+1:]
+		onLine(line)
+	}
+}
+
+func (s *sseLineSplitter) flushRemainder(onLine func(line string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if line := strings.TrimSpace(string(s.buffer)); line != "" {
+		s.buffer = nil
+		onLine(line)
+	}
+	s.buffer = nil
 }
 
 type upstreamUsageObservingBody struct {
@@ -865,8 +879,7 @@ type upstreamUsageObservingBody struct {
 	record   *usageRecord
 	platform relay.Platform
 	format   relay.FormatType
-	buffer   []byte
-	events   []json.RawMessage
+	lines    sseLineSplitter
 }
 
 func observeUpstreamUsage(resp *http.Response, record *usageRecord, platform relay.Platform, formats ...relay.FormatType) {
@@ -889,26 +902,15 @@ func (b *upstreamUsageObservingBody) Read(p []byte) (int, error) {
 }
 
 func (b *upstreamUsageObservingBody) Close() error {
-	if line := strings.TrimSpace(string(b.buffer)); line != "" {
-		b.observeLine(line)
-		b.buffer = nil
-	}
+	b.lines.flushRemainder(b.observeLine)
 	return b.inner.Close()
 }
 
 func (b *upstreamUsageObservingBody) observe(data []byte) {
-	b.buffer = append(b.buffer, data...)
-	for {
-		idx := bytes.IndexByte(b.buffer, '\n')
-		if idx < 0 {
-			return
-		}
-		line := strings.TrimSpace(string(b.buffer[:idx]))
-		b.buffer = b.buffer[idx+1:]
-		b.observeLine(line)
-	}
+	b.lines.feed(data, b.observeLine)
 }
 
+// observeLine 是 ProviderResponse 流事件与 usage 增量的唯一来源（上游线格式）。
 func (b *upstreamUsageObservingBody) observeLine(line string) {
 	if !strings.HasPrefix(line, "data:") {
 		return
@@ -917,14 +919,28 @@ func (b *upstreamUsageObservingBody) observeLine(line string) {
 	if payload == "" || payload == "[DONE]" {
 		return
 	}
-	if len(b.events) < 50 {
-		b.events = append(b.events, json.RawMessage(payload))
-		if eventBytes, err := json.Marshal(b.events); err == nil {
-			b.record.ProviderResponse = sanitizeUsageBody(eventBytes)
-		}
-	}
+	b.record.appendStreamEvent(payload)
 	result := extractProviderUsageFromStreamEvent(b.platform, b.format, payload)
 	applyProviderUsageToRecord(b.record, result)
+}
+
+// detailFromTokenUsage 把顶层 token 计数镜像为明细字段（三个平台解析器的
+// 共同前奏：detail 的四项基础字段与 usage 保持同源）。
+func detailFromTokenUsage(usage usageTokenUsage) usageDetail {
+	detail := usageDetail{}
+	if usage.InputTokens != nil {
+		detail.InputTokens = intPtr(getInt(usage.InputTokens))
+	}
+	if usage.OutputTokens != nil {
+		detail.OutputTokens = intPtr(getInt(usage.OutputTokens))
+	}
+	if usage.TotalTokens != nil {
+		detail.TotalTokens = intPtr(getInt(usage.TotalTokens))
+	}
+	if usage.CacheHitTokens != nil {
+		detail.CachedInputTokens = intPtr(getInt(usage.CacheHitTokens))
+	}
+	return detail
 }
 
 func usageFromOpenAIUsage(raw map[string]interface{}) usageTokenUsage {
@@ -1080,7 +1096,7 @@ func applyLocalResponseEstimate(record *usageRecord, responseText string, cfg co
 func estimateTextTokens(text string, cfg config.UsageConfig) int {
 	charsPerToken := cfg.CharsPerToken
 	if charsPerToken <= 0 {
-		charsPerToken = 4
+		charsPerToken = DefaultCharsPerToken
 	}
 	chars := len([]rune(text))
 	if chars == 0 {
@@ -1122,6 +1138,32 @@ func extractOutputTextFromStreamPayload(payload string) string {
 	return extractOutputTextFromPayload(event)
 }
 
+// geminiTextFromCandidates 拼接 Gemini candidates[].content.parts[].text。
+func geminiTextFromCandidates(payload map[string]interface{}) string {
+	candidates, ok := payload["candidates"].([]interface{})
+	if !ok {
+		return ""
+	}
+	var builder strings.Builder
+	for _, candidate := range candidates {
+		candMap, _ := candidate.(map[string]interface{})
+		content, ok := candMap["content"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		parts, ok := content["parts"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, part := range parts {
+			if partMap, ok := part.(map[string]interface{}); ok {
+				builder.WriteString(stringValueFromMap(partMap, "text"))
+			}
+		}
+	}
+	return builder.String()
+}
+
 func extractOutputTextFromPayload(payload map[string]interface{}) string {
 	var builder strings.Builder
 	if choices, ok := payload["choices"].([]interface{}); ok {
@@ -1156,20 +1198,7 @@ func extractOutputTextFromPayload(payload map[string]interface{}) string {
 			}
 		}
 	}
-	if candidates, ok := payload["candidates"].([]interface{}); ok {
-		for _, candidate := range candidates {
-			candMap, _ := candidate.(map[string]interface{})
-			if content, ok := candMap["content"].(map[string]interface{}); ok {
-				if parts, ok := content["parts"].([]interface{}); ok {
-					for _, part := range parts {
-						if partMap, ok := part.(map[string]interface{}); ok {
-							builder.WriteString(stringValueFromMap(partMap, "text"))
-						}
-					}
-				}
-			}
-		}
-	}
+	builder.WriteString(geminiTextFromCandidates(payload))
 	return builder.String()
 }
 

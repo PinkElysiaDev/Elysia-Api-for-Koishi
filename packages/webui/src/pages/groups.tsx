@@ -9,6 +9,7 @@ import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/compon
 import { AsyncState } from '@/components/ui/states'
 import { ExpandRow } from '@/components/expand-row'
 import { CapChip, Dot, StrategyBadge } from '@/components/badges'
+import { ToolbarSummary } from '@/components/toolbar-summary'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { useToast } from '@/components/ui/use-toast'
 import { useGroups, revalidate } from '@/lib/hooks'
@@ -113,22 +114,14 @@ export function GroupsPage() {
             <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">调度策略</span>
             <Seg aria-label="策略筛选" options={STRATEGY_OPTIONS} value={strategyFilter} onChange={setStrategyFilter} />
           </div>
-          <div className="flex items-center gap-4 text-xs">
-            <span className="tnum flex items-center gap-3 text-muted-foreground font-mono">
-              <span className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-jade" />
-                <b className="font-semibold text-foreground">{enabledCount}</b> 启用
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-ember" />
-                <b className="font-semibold text-foreground">{(data ?? []).length - enabledCount}</b> 停用
-              </span>
-            </span>
-            <span className="h-3 w-px bg-border/70" />
-            <span className="text-muted-foreground font-mono">
-              共 <b className="tnum font-semibold text-foreground">{(data ?? []).length}</b> 个模型组
-            </span>
-          </div>
+          <ToolbarSummary
+            items={[
+              { label: '启用', value: enabledCount, tone: 'jade' },
+              { label: '停用', value: (data ?? []).length - enabledCount, tone: 'ember' },
+            ]}
+            total={(data ?? []).length}
+            unit="个模型组"
+          />
         </div>
 
         <AsyncState
@@ -169,12 +162,12 @@ export function GroupsPage() {
                     return (
                       <Fragment key={group.id}>
                         {/* border-b-0：行间分隔线只由 divide-y 的 /30 淡线承担 */}
-                        <TableRow className="border-b-0 transition-colors hover:bg-secondary/30">
+                        <TableRow className="border-b-0">
                           <TableCell className="w-[38px] px-0 text-center">
                             <button
                               type="button"
                               onClick={() => setExpanded((p) => ({ ...p, [group.id]: !p[group.id] }))}
-                              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:text-foreground hover:bg-secondary"
+                              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-wash hover:text-rose"
                               aria-label={isOpen ? '收起' : '展开'}
                             >
                               <ChevronRight className={cn('h-4 w-4 transition-transform duration-300 ease-smooth', isOpen && 'rotate-90 text-primary')} />

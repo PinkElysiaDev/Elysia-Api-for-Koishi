@@ -24,7 +24,7 @@ import { useToast } from '@/components/ui/use-toast'
 import { CapChip } from '@/components/badges'
 import { api } from '@/lib/api'
 import { revalidate, useModels, useSources } from '@/lib/hooks'
-import { cn } from '@/lib/utils'
+import { cn, matchesModelKeyword } from '@/lib/utils'
 import type { GroupStrategy, Model, ModelGroup, ModelType } from '@/lib/types'
 
 function emptyGroup(): ModelGroup {
@@ -44,6 +44,16 @@ function emptyGroup(): ModelGroup {
     visionCapable: false,
     toolsCapable: false,
   }
+}
+
+function sourceIdFromKey(key: string): string {
+  const idx = key.indexOf(':')
+  return idx >= 0 ? key.slice(0, idx) : ''
+}
+
+function modelIdFromKey(key: string): string {
+  const idx = key.indexOf(':')
+  return idx >= 0 ? key.slice(idx + 1) : key
 }
 
 export function GroupFormDialog({
@@ -120,10 +130,13 @@ export function GroupFormDialog({
   }
 
   const filteredModels = useMemo(() => {
-    const list = (models ?? []).filter((m) => !m.sourceId || enabledSourceIds.has(m.sourceId))
+    // 排除禁用模型（enabled=false 不参与调度，选进组是无效配置）与停用源下的模型。
+    const list = (models ?? []).filter(
+      (m) => m.enabled !== false && (!m.sourceId || enabledSourceIds.has(m.sourceId)),
+    )
     const kw = modelSearch.trim().toLowerCase()
     const matched = list.filter((m) => {
-      if (kw && !`${m.id} ${m.name} ${m.sourceName ?? ''}`.toLowerCase().includes(kw)) return false
+      if (kw && !matchesModelKeyword(kw, m)) return false
       if (sourceFilter !== 'all' && (m.sourceId ?? '') !== sourceFilter) return false
       if (capFilter === 'vision' && !m.visionCapable) return false
       if (capFilter === 'tools' && !m.toolsCapable) return false
@@ -139,6 +152,34 @@ export function GroupFormDialog({
     }
     return [...chosen, ...rest]
   }, [models, enabledSourceIds, modelSearch, capFilter, sourceFilter, form.models])
+
+  // 已选但被上方过滤隐藏的模型：模型级停用，或所属源已停用。
+  // ListModels 不返回停用源下的模型，因此除缓存命中外，还要用 sources 判断
+  // 复合键里的 sourceId 是否已停用，否则编辑页会把这些引用当成「不在缓存」。
+  const excludedSelected = useMemo(() => {
+    const items: { key: string; label: string }[] = []
+    for (const key of form.models) {
+      const model = (models ?? []).find((m) => modelKey(m) === key)
+      if (model) {
+        if (model.enabled === false || (!!model.sourceId && !enabledSourceIds.has(model.sourceId))) {
+          items.push({ key, label: model.name || model.id })
+        }
+        continue
+      }
+      const sourceId = sourceIdFromKey(key)
+      if (sourceId && (sources ?? []).some((s) => s.id === sourceId && !s.enabled)) {
+        items.push({ key, label: modelIdFromKey(key) })
+      }
+    }
+    return items
+  }, [models, sources, enabledSourceIds, form.models])
+
+  const missingSelected = useMemo(() => {
+    const excluded = new Set(excludedSelected.map((e) => e.key))
+    return form.models.filter(
+      (key) => !excluded.has(key) && !(models ?? []).some((m) => modelKey(m) === key),
+    )
+  }, [form.models, models, excludedSelected])
 
   // 模型源筛选项：启用源（与列表可选范围一致）。
   const sourceOptions = useMemo(
@@ -262,15 +303,28 @@ export function GroupFormDialog({
               ))}
             </div>
             {/* 已选但不在缓存中的模型（例如手动模型 / 已删除源），按复合键比对 */}
-            {form.models.filter((key) => !(models ?? []).some((m) => modelKey(m) === key)).length > 0 && (
+            {missingSelected.length > 0 && (
               <div className="flex flex-wrap gap-1.5 pt-1">
-                {form.models
-                  .filter((key) => !(models ?? []).some((m) => modelKey(m) === key))
-                  .map((key) => (
-                    <Badge key={key} variant="outline" className="cursor-pointer" onClick={() => toggleModel(key)}>
-                      {key.includes(':') ? key.slice(key.indexOf(':') + 1) : key} ✕
-                    </Badge>
-                  ))}
+                {missingSelected.map((key) => (
+                  <Badge key={key} variant="outline" className="cursor-pointer" onClick={() => toggleModel(key)}>
+                    {modelIdFromKey(key)} ✕
+                  </Badge>
+                ))}
+              </div>
+            )}
+            {/* 已选但已停用（模型级停用或所属源停用）：不进可选列表，但保留徽标供查看/移除 */}
+            {excludedSelected.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {excludedSelected.map((item) => (
+                  <Badge
+                    key={item.key}
+                    variant="outline"
+                    className="cursor-pointer text-muted-foreground"
+                    onClick={() => toggleModel(item.key)}
+                  >
+                    {item.label}（已停用）✕
+                  </Badge>
+                ))}
               </div>
             )}
           </div>
@@ -352,7 +406,7 @@ export function GroupFormDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
             取消
           </Button>
-          <Button onClick={handleSave} disabled={saving}>
+          <Button variant="primary" onClick={handleSave} disabled={saving}>
             {saving ? '保存中…' : '保存'}
           </Button>
         </DialogFooter>
@@ -376,12 +430,12 @@ function ModelOption({
       onClick={onToggle}
       className={cn(
         'flex w-full items-center gap-3 rounded-lg px-2.5 py-2 text-left text-sm transition-colors',
-        selected ? 'bg-primary/12 text-primary' : 'hover:bg-accent',
+        selected ? 'bg-primary/10 text-primary' : 'hover:bg-accent',
       )}
     >
       <span
         className={cn(
-          'flex h-4 w-4 shrink-0 items-center justify-center rounded border',
+          'flex h-4 w-4 shrink-0 items-center justify-center rounded-[3px] border',
           selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border',
         )}
       >
