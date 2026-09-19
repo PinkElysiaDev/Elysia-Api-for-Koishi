@@ -31,50 +31,21 @@ import { RoleWatermark } from '@/components/role-watermark'
 import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { ErrorState } from '@/components/ui/states'
 import { LegendChip } from '@/components/ui/legend-chip'
-import { UsageFilterBar, type RangeKey } from '@/components/usage-filter-bar'
+import { UsageFilterBar } from '@/components/usage-filter-bar'
 import { ModelBreakdownTooltip } from '@/components/model-breakdown-tooltip'
-import {
-  useUsageStats,
-  useUsageTrend,
-  useUsageByModel,
-  useUsageFilterOptions,
-  useMinuteTick,
-  useSources,
-} from '@/lib/hooks'
-import { bucketedTimeISO, CHART_TICK, compactNumber, formatDuration, formatHitRate, formatNumber, percent, startOfRange, USAGE_BUCKET_MS } from '@/lib/utils'
+import { useUsageStats, useUsageTrend, useUsageByModel, useMinuteTick } from '@/lib/hooks'
+import { useUsageFilters } from '@/lib/usage-filters'
+import { CHART_TICK, compactNumber, formatDuration, formatHitRate, formatNumber, percent } from '@/lib/utils'
+import { CHART_TOOLTIP_Z } from '@/lib/z-index'
+
+const TOP_MODELS_BAR = 8
 
 export function UsageStatsPage() {
-  const [range, setRange] = useState<RangeKey>('7d')
-  const [groupNames, setGroupNames] = useState<string[]>([])
-  const [modelNames, setModelNames] = useState<string[]>([])
-  const [sourceIds, setSourceIds] = useState<string[]>([])
-  const [keyNames, setKeyNames] = useState<string[]>([])
+  const filters = useUsageFilters()
+  const { params } = filters
+  const minuteTick = useMinuteTick()
   const [showReqLine, setShowReqLine] = useState(true)
   const [showTokBar, setShowTokBar] = useState(true)
-  const minuteTick = useMinuteTick()
-
-  const { groupOptions, modelOptions, keyOptions } = useUsageFilterOptions()
-  const { data: sources } = useSources()
-
-  const sourceOptions = useMemo(
-    () => (sources ?? []).filter((s) => s.enabled).map((s) => ({ value: s.id, label: s.name || s.id })),
-    [sources],
-  )
-
-  const params = useMemo(() => {
-    // to 取下一 5 分钟边界：缓存键稳定，且当前桶内新记录能进半开区间。
-    // 日历日 / 相对窗起点用 now，避免临近午夜时 from 被推到次日。
-    const nowMs = minuteTick * 60_000
-    const to = bucketedTimeISO(nowMs, USAGE_BUCKET_MS)
-    return {
-      from: startOfRange(range, new Date(nowMs).toISOString()),
-      to,
-      groupNames: groupNames.length ? groupNames : undefined,
-      modelNames: modelNames.length ? modelNames : undefined,
-      sourceIds: sourceIds.length ? sourceIds : undefined,
-      keyNames: keyNames.length ? keyNames : undefined,
-    }
-  }, [range, groupNames, modelNames, sourceIds, keyNames, minuteTick])
 
   const { data: stats, isLoading, error, mutate, isValidating } = useUsageStats(params)
 
@@ -141,20 +112,7 @@ export function UsageStatsPage() {
 
         {/* 共用筛选条（含模型源维度）+ 更新指示 */}
         <UsageFilterBar
-          range={range}
-          onRangeChange={setRange}
-          groupOptions={groupOptions}
-          modelOptions={modelOptions}
-          keyOptions={keyOptions}
-          sourceOptions={sourceOptions}
-          groupNames={groupNames}
-          onGroupNamesChange={setGroupNames}
-          modelNames={modelNames}
-          onModelNamesChange={setModelNames}
-          sourceIds={sourceIds}
-          onSourceIdsChange={setSourceIds}
-          keyNames={keyNames}
-          onKeyNamesChange={setKeyNames}
+          {...filters.barProps}
           right={
             updating ? (
               <span className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
@@ -266,7 +224,7 @@ export function UsageStatsPage() {
                         />
                         <Tooltip
                           content={<ModelBreakdownTooltip />}
-                          wrapperStyle={{ zIndex: 50 }}
+                          wrapperStyle={{ zIndex: CHART_TOOLTIP_Z }}
                           cursor={{ fill: 'var(--wash)' }}
                         />
                         {showTokBar && (
@@ -366,7 +324,7 @@ export function UsageStatsPage() {
                       <>
                         <div className="h-[220px]">
                           <ResponsiveContainer width="100%" height="100%">
-                            <BarChart data={byModel.slice(0, 8)} margin={{ top: 8, right: 8, bottom: 0, left: 4 }}>
+                            <BarChart data={byModel.slice(0, TOP_MODELS_BAR)} margin={{ top: 8, right: 8, bottom: 0, left: 4 }}>
                               <CartesianGrid stroke="hsl(var(--border) / 0.45)" strokeDasharray="3 3" vertical={false} />
                               <XAxis
                                 dataKey="model"
@@ -386,9 +344,9 @@ export function UsageStatsPage() {
                                 width={40}
                                 allowDecimals={false}
                               />
-                              <Tooltip cursor={{ fill: 'var(--wash)' }} wrapperStyle={{ zIndex: 50 }} content={<ModelBarTooltip />} />
+                              <Tooltip cursor={{ fill: 'var(--wash)' }} wrapperStyle={{ zIndex: CHART_TOOLTIP_Z }} content={<ModelBarTooltip />} />
                               <Bar dataKey="requests" name="请求数" radius={[4, 4, 0, 0]} maxBarSize={36}>
-                                {byModel.slice(0, 8).map((entry) => (
+                                {byModel.slice(0, TOP_MODELS_BAR).map((entry) => (
                                   <Cell key={entry.model || '__unknown__'} fill="var(--rose)" fillOpacity={0.65} />
                                 ))}
                               </Bar>

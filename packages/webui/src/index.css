@@ -67,6 +67,8 @@
   --halo-a: rgba(220, 24, 93, 0.06);    /* 弱化全局光晕扩散，避免全屏泛色 */
   --btn-inset-hi: rgba(255, 255, 255, 0.22); /* 主按钮顶边高光（暗色下减弱） */
   --halo-b: rgba(99, 102, 241, 0.04);
+  /* 左下兰紫:与登录页 garden-aurora::after 同色系,控制台常态承接该角光泽 */
+  --halo-c: rgba(176, 141, 238, 0.05);
 
   --grad-a: var(--rose);                /* 品牌渐变：瑰梅 → 明艳粉 */
   --grad-b: #F43F85;
@@ -148,6 +150,7 @@
   --halo-a: rgba(251, 77, 136, 0.08);
   --btn-inset-hi: rgba(255, 255, 255, 0.08);
   --halo-b: rgba(129, 140, 248, 0.05);
+  --halo-c: rgba(176, 141, 238, 0.06);
 
   --grad-a: var(--rose);                /* 品牌渐变：霓虹梅粉 → 兰花紫 */
   --grad-b: #C084FC;
@@ -181,6 +184,11 @@
 }
 
 html {
+  /* 视口滚动条整体隐藏（滚动能力保留；内部弹层/抽屉的美化滚动条不受影响）。
+   * 滚动条槽在日夜切换的 View Transitions 期间实时换色（快照不含滚动条），
+   * 会比页面主体领先变色形成右缘竖条；隐藏后该槽不存在，且登录页与控制台
+   * 的布局宽度天然逐像素一致——原 scrollbar-gutter: stable 的目的随之达成。 */
+  scrollbar-width: none;
   /* 流式根字号：≤1536px 时 16px，随视口平滑增至 2560px 的 18px——全站 rem（含图表刻度）统一跟随。
    * 下限用 1rem 而非 16px：尊重浏览器「字号」偏好（Josh Comeau, Pixels and Accessibility）。
    * 插值配比：16 = 0.8125×16 + 0.1953125%×1536，18 = 0.8125×16 + 0.1953125%×2560。
@@ -189,6 +197,9 @@ html {
   /* 立绘水印右缘出血会撑出 8px 横向滚动：clip 必须设在根元素上——
    * Chrome 不把 body 的 overflow 传播到视口。clip 不产生滚动容器，sticky 侧栏不受影响 */
   overflow-x: clip;
+}
+html::-webkit-scrollbar {
+  display: none;
 }
 
 /* 刻度字重大屏阶梯：缩放缓和后 1920px 时刻度仅 ~11.5px，w500 观感足够；
@@ -224,8 +235,20 @@ body::before {
   background:
     radial-gradient(52rem 36rem at 85% 15%, var(--halo-a), transparent 65%),
     radial-gradient(42rem 28rem at 5% -4%, var(--halo-a), transparent 60%),
-    radial-gradient(40rem 30rem at 98% 106%, var(--halo-b), transparent 60%);
+    radial-gradient(40rem 30rem at 98% 106%, var(--halo-b), transparent 60%),
+    radial-gradient(40rem 30rem at 8% 104%, var(--halo-c), transparent 60%);
 }
+
+/* 确认弹窗期间淡出全局立绘水印/光环/到达残影:半透明遮罩+毛玻璃会让水印
+ * 透出,成为页面上最显眼的竖向色块(用户观感即「右侧功能未知的竖条」)。 */
+html[data-confirm-open] .role-fig,
+html[data-confirm-open] .elysia-arrive-aura,
+html[data-confirm-open] .arrival-echo {
+  opacity: 0 !important;
+  animation: none !important;
+  transition: opacity 200ms ease-out;
+}
+
 
 ::selection {
   background: var(--wash);
@@ -279,6 +302,22 @@ body::before {
     transform: translateX(100%);
   }
 }
+
+/*
+ * 弹窗纯透明度开关动画：tailwindcss-animate 的 enter/exit keyframes 自带
+ * transform from 帧会覆盖 -translate-x-1/2 居中定位，表现为从右下角飞入。
+ */
+@keyframes dialog-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes dialog-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
 
 /*
  * 主题切换的「光线转场」：
@@ -346,7 +385,8 @@ html.theme-transitioning :where(body, #root, #root *):not(.theme-sun):not(.theme
   }
 }
 
-.theme-toggle::after {
+/* 图标钮的一次性品牌光晕涟漪（.icon-toggle：主题切换与登录页动效开关共用）。 */
+.icon-toggle::after {
   content: '';
   position: absolute;
   left: 50%;
@@ -359,10 +399,10 @@ html.theme-transitioning :where(body, #root, #root *):not(.theme-sun):not(.theme
   background: radial-gradient(circle, color-mix(in srgb, var(--rose) 14%, transparent), transparent 65%);
   transform: translate(-50%, -50%) scale(0.2);
 }
-.theme-toggle.is-switching::after {
+.icon-toggle.is-switching::after {
   animation: theme-ripple 560ms ease-out;
 }
-.dark .theme-toggle.is-switching::after {
+.dark .icon-toggle.is-switching::after {
   background: radial-gradient(circle, color-mix(in srgb, var(--orchid) 20%, transparent), transparent 65%);
 }
 @keyframes theme-ripple {
@@ -379,6 +419,112 @@ html.theme-transitioning :where(body, #root, #root *):not(.theme-sun):not(.theme
 :focus-visible {
   outline: 2px solid hsl(var(--ring));
   outline-offset: 2px;
+}
+
+/*
+ * 登录页以中等浓度（0.45）预印的侧面线稿
+ * 原地交接。交接残影顶住外壳渐显期后线性淡出，真实水印同窗线性淡入——
+ * 两者之和恒为 0.45，刻印感知亮度全程无跳变；稳住等看板元素齐现后，
+ * 再缓缓淡入水印常驻浓度（0.09 / 0.14），像被时间慢慢收藏进面板。
+ * 标记由登录页写入 sessionStorage，ElysiaStage 挂载时读后即删：刷新与
+ * 普通路由跳转不重播。
+ * 100% 关键帧留空 = 回落到类定义的基准透明度（明暗主题各自适配）；
+ * 刻意不用 forwards 填充，动画结束回归自然状态，不残留 filter。
+ */
+@keyframes watermark-settle {
+  0% {
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.45;
+  }
+  40% {
+    opacity: 0.45;
+    animation-timing-function: ease-out;
+  }
+  100% {
+    opacity: var(--wm-base, 0.09);
+  }
+}
+@keyframes watermark-settle-dark {
+  0% {
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.4;
+  }
+  40% {
+    opacity: 0.4;
+    animation-timing-function: ease-out;
+  }
+  100% {
+    opacity: var(--wm-base, 0.12);
+  }
+}
+.elysia-arrive .role-fig {
+  --wm-base: 0.09;
+  animation: watermark-settle 4s linear 1s both;
+}
+/* 夜间:15%/40% 帧的交接浓度随 canvas 预印降到 0.40,常驻浓度略降至 0.12。 */
+.dark .elysia-arrive .role-fig {
+  --wm-base: 0.12;
+  animation-name: watermark-settle-dark;
+}
+
+/* 登录到达时的氛围光环：随线稿入场序列一同淡入（非到达时保持静态渐变）。 */
+.elysia-arrive .elysia-arrive-aura {
+  animation: aura-rise 2.4s ease-out 1.2s both;
+}
+@keyframes aura-rise {
+  from {
+    opacity: 0;
+  }
+}
+
+/* 外壳渐显：仅在登录到达时套用（AppLayout 按到达标记决定），让控制台
+ * 整体柔柔显影而非突然出现；平时刷新与路由跳转不套用、完全无动画。 */
+@keyframes app-fade {
+  from {
+    opacity: 0;
+  }
+}
+.app-fade {
+  animation: app-fade 0.8s ease-out backwards;
+}
+
+/* 页面包装层的防护：任何未来加回的 enter/slide 类动画都会让该层在动画期
+ * 成为 fixed 后代（到达刻印）的包含块，造成锚点滑移。显式锁死 transform
+ * （!important 声明优先于动画关键帧），保证到达刻印的视口锚定全程稳定。 */
+.page-enter {
+  transform: none !important;
+}
+
+/* 交接残影（AppLayout 的 ArrivalEcho）：登录页线稿 0.45 原地交接时，
+ * 顶住外壳 0.8s 渐显期，让刻印的感知亮度全程不断；随后自行淡出卸载。 */
+.arrival-echo {
+  aspect-ratio: 760 / 808;
+  background: linear-gradient(172deg, var(--grad-a) 8%, var(--grad-b) 92%);
+  animation: arrival-echo-hold 1.6s linear forwards;
+}
+@keyframes arrival-echo-hold {
+  0%, 62% {
+    opacity: 0.45;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+/* 夜间:canvas 预印浓度 0.40(见 login-renderer),交接两端对齐防浓度跳变。 */
+@keyframes arrival-echo-hold-dark {
+  0%, 62% {
+    opacity: 0.4;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.dark .arrival-echo {
+  animation-name: arrival-echo-hold-dark;
 }
 
 /* 源健康轮播：双份内容无缝上滚（hover 暂停由 group-hover 控制；
@@ -399,6 +545,7 @@ html.theme-transitioning :where(body, #root, #root *):not(.theme-sun):not(.theme
   *::after {
     scroll-behavior: auto !important;
     animation-duration: 0.01ms !important;
+    animation-delay: 0s !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }

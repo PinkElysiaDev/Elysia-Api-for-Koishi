@@ -1,4 +1,5 @@
 import { NavLink } from 'react-router-dom'
+import { useSWRConfig } from 'swr'
 import {
   Activity,
   Database,
@@ -9,11 +10,13 @@ import {
   Terminal,
   Settings,
   Stethoscope,
+  Puzzle,
   LogOut,
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { clearToken } from '@/lib/auth'
+import { clearAssetCache } from '@/lib/asset-blob-cache'
 import { useConfirm } from './ui/confirm-dialog'
 import { Button } from './ui/button'
 import { ThemeToggle } from './theme-toggle'
@@ -33,15 +36,18 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/groups', label: '模型组', icon: Layers, group: '网关配置' },
   { to: '/tokens', label: '访问令牌', icon: KeyRound, group: '网关配置' },
   { to: '/usage', label: 'Usage 统计', icon: BarChart3, group: '观测' },
+  { to: '/protocols', label: '协议设计器', icon: Puzzle, group: '系统' },
   { to: '/logs', label: '系统日志', icon: Terminal, group: '系统' },
   { to: '/runtime', label: '运行配置', icon: Settings, group: '系统' },
   { to: '/diagnostics', label: '诊断', icon: Stethoscope, group: '系统' },
 ]
 
-const GROUP_ORDER = ['监控', '网关配置', '观测', '系统']
+// 分组顺序从导航项声明派生:新增分组零维护,不会因漏改而静默消失。
+const GROUP_ORDER = [...new Set(NAV_ITEMS.map((item) => item.group))]
 
-export function Sidebar() {
+export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const { confirm, dialog } = useConfirm()
+  const { mutate } = useSWRConfig()
   const grouped = GROUP_ORDER.map((group) => ({
     group,
     items: NAV_ITEMS.filter((item) => item.group === group),
@@ -54,11 +60,16 @@ export function Sidebar() {
       description: '将清除本地保存的 Panel Access Token，重新输入令牌后才能进入控制台。',
       confirmText: '退出',
     })
-    if (ok) clearToken()
+    if (!ok) return
+    clearToken()
+    // 清空 SWR 全局缓存与媒体 LRU：令牌轮换后重新登录不应看到上一会话的数据。
+    // filter 匹配所有 key，data=undefined 即删除对应缓存条目。
+    void mutate(() => true, undefined, { revalidate: false })
+    clearAssetCache()
   }
 
   return (
-    <div className="flex h-full flex-col gap-[22px] bg-rail-fade py-[22px] pb-[18px] text-sidebar-foreground max-rail:bg-background">
+    <div className="flex h-full flex-col gap-[22px] bg-rail-fade py-[22px] pb-[max(18px,env(safe-area-inset-bottom))] text-sidebar-foreground max-rail:bg-background">
       <BrandMark className="px-[22px]" />
 
       <nav aria-label="主导航" className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-3 pb-2">
@@ -73,9 +84,10 @@ export function Sidebar() {
                 <NavLink
                   key={item.to}
                   to={item.to}
+                  onClick={onNavigate}
                   className={({ isActive }) =>
                     cn(
-                      'relative flex w-full items-center gap-[11px] rounded-md px-3 py-[9px] text-sm transition-colors duration-200',
+                      'relative flex w-full items-center gap-[11px] rounded-md px-3 py-[9px] text-sm transition-colors duration-200 max-rail:min-h-11',
                       isActive
                         ? 'bg-wash font-semibold text-rose'
                         : 'text-muted-foreground hover:bg-wash hover:text-foreground',

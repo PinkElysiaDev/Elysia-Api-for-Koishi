@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,9 +18,8 @@ import (
 func (s *Server) responses(c *gin.Context) {
 	startTime := time.Now()
 
-	bodyBytes, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
+	bodyBytes, ok := s.readRequestBody(c)
+	if !ok {
 		return
 	}
 
@@ -30,197 +30,125 @@ func (s *Server) responses(c *gin.Context) {
 
 	responsesCfg := s.config.GetResponsesConfig()
 	if responsesCfg.Enabled != nil && !*responsesCfg.Enabled {
-		s.failRequestTyped(c, record, startTime, http.StatusNotFound, "unsupported_endpoint", "Responses API is disabled")
+		s.failRequestError(c, record, startTime, relay.FormatResponses, &relay.MaheshvaraError{
+			Class: relay.ErrorClassInvalidRequest, Status: http.StatusNotFound,
+			Code: "unsupported_endpoint", Message: "Responses API is disabled",
+		})
 		return
 	}
 
 	maheshvaraReq, originalResponsesReq, err := relay.OpenAIResponsesToMaheshvara(bodyBytes)
 	if err != nil {
-		s.failRequestTypedKind(c, record, startTime, http.StatusBadRequest, "invalid_request_error", ErrorKindConversion, err.Error())
+		s.failRequestError(c, record, startTime, relay.FormatResponses, &relay.MaheshvaraError{
+			Class: relay.ErrorClassInvalidRequest, Message: err.Error(),
+		})
 		return
 	}
 
 	// 共用前置阶段（与 chatCompletions 同一实现）：鉴权 → 组校验 → 候选 →
 	// 能力约束 → 预估 → 限流。组级 MaxTokens 覆盖维持 chat 线制独有的行为。
-	plan, ok := s.prepareRelayPlan(c, record, startTime, maheshvaraReq, relayFailer{s: s, c: c, record: record, startTime: startTime, typed: true}, false)
+	plan, ok := s.prepareRelayPlan(c, record, startTime, maheshvaraReq, relayFailer{s: s, c: c, record: record, startTime: startTime, format: relay.FormatResponses}, false)
 	if !ok {
 		return
 	}
 	group, candidates := plan.group, plan.candidates
 	filteredVision := plan.filtered
-	estimatedTokens := plan.estimatedTokens
 	defer plan.releaseLimiter()
 
-	attempts := maxAttempts(group.MaxRetries, len(candidates))
-	var lastStatus int
-	var lastErr string
-	committed := false
+	s.runRelayAttempts(c, record, startTime, group, candidates, relay.FormatResponses,
+		func(attempt int, selectedModel config.ModelRef, isLast bool) relayAttemptStep {
+			targetPlatform := relay.DetectPlatform(selectedModel.BaseURL, selectedModel.Platform)
+			setRecordModel(record, selectedModel, targetPlatform)
+			maheshvaraReq.Model = selectedModel.Name
 
-	for attempt := 0; attempt < attempts; attempt++ {
-		// 循环顶部拦截客户端取消：interval=0 时无等待期可拦截。
-		if attempt > 0 && s.abortRetryOnClientCancel(c, record, startTime) {
-			committed = true
-			return
-		}
-		selectedModel := candidates[attempt]
-		isLast := attempt == attempts-1
-
-		// SSRF 出站校验（连接时还会再校验一次实际 IP，见 secureControl）。
-		if err := s.validateOutbound(selectedModel.BaseURL); err != nil {
-			lastStatus = http.StatusForbidden
-			lastErr = fmt.Sprintf("target baseUrl rejected: %v", err)
-			s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
-			if isLast {
-				s.commitLastAttemptFailure(c, record, startTime, lastStatus, "", lastErr, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
-				committed = true
-			}
-			continue
-		}
-
-		targetPlatform := relay.DetectPlatform(selectedModel.BaseURL, selectedModel.Platform)
-		setRecordModel(record, selectedModel, targetPlatform)
-		maheshvaraReq.Model = selectedModel.Name
-
-		targetFormat, responsesMode, err := selectResponsesTargetFormat(selectedModel, targetPlatform, responsesCfg)
-		if err != nil {
-			// 该候选不支持 Responses（或转换目标）——其他候选可能支持，故可重试。
-			lastStatus = http.StatusBadRequest
-			lastErr = err.Error()
-			record.ResponsesMode = responsesMode
-			s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
-			if isLast {
-				s.commitLastAttemptFailure(c, record, startTime, lastStatus, "", lastErr, gin.H{"error": gin.H{"message": lastErr, "type": "unsupported_endpoint", "code": "responses_api_not_supported"}})
-				committed = true
-			}
-			continue
-		}
-		if filteredVision && targetFormat == relay.FormatResponses {
-			transformedFormat, ok := transformedResponsesTargetFormat(selectedModel, targetPlatform)
-			if !ok || transformedFormat == relay.FormatResponses {
-				lastStatus = http.StatusBadRequest
-				lastErr = "Responses target cannot represent the filtered maheshvara vision input"
-				s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
-				if isLast {
-					s.commitLastAttemptFailure(c, record, startTime, lastStatus, ErrorKindConversion, lastErr, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
-					committed = true
+			targetFormat, responsesMode, err := selectResponsesTargetFormat(selectedModel, targetPlatform, responsesCfg)
+			if err != nil {
+				// 该候选不支持 Responses（或转换目标）——其他候选可能支持，故可重试。
+				record.ResponsesMode = responsesMode
+				return relayAttemptStep{
+					skipErr:    err,
+					skipStatus: http.StatusBadRequest,
+					skipClass:  relay.ErrorClassInvalidRequest,
 				}
-				continue
 			}
-			targetFormat = transformedFormat
-			responsesMode = ResponsesModeTransformed
-		}
+			if filteredVision && targetFormat == relay.FormatResponses {
+				transformedFormat, ok := transformedResponsesTargetFormat(selectedModel, targetPlatform)
+				if !ok || transformedFormat == relay.FormatResponses {
+					skipErr := fmt.Errorf("Responses target cannot represent the filtered maheshvara vision input")
+					return relayAttemptStep{
+						skipErr:    skipErr,
+						skipStatus: http.StatusBadRequest,
+						skipClass:  relay.ErrorClassInvalidRequest,
+					}
+				}
+				targetFormat = transformedFormat
+				responsesMode = ResponsesModeTransformed
+			}
 
-		if relay.IsCustomPlatform(targetPlatform) {
-			record.TargetFormat = string(targetPlatform)
-			if protocol, exists := relay.GetCustomProtocol(relay.CustomProtocolID(targetPlatform)); exists {
-				record.TargetEndpoint = protocol.Request.PathTemplate
+			if relay.IsCustomPlatform(targetPlatform) {
+				record.TargetFormat = string(targetPlatform)
+				if protocol, exists := relay.GetCustomProtocol(relay.CustomProtocolID(targetPlatform)); exists {
+					record.TargetEndpoint = protocol.Request.PathTemplate
+				}
+			} else {
+				record.TargetFormat = string(targetFormat)
+				record.TargetEndpoint = targetEndpointForFormat(targetFormat)
 			}
-		} else {
-			record.TargetFormat = string(targetFormat)
-			record.TargetEndpoint = targetEndpointForFormat(targetFormat)
-		}
-		record.RelayMode = responsesMode
-		record.ResponsesMode = responsesMode
-		record.ConversionChain = []string{"openai_responses_request", "maheshvara_request", string(targetFormat) + "_request"}
+			record.RelayMode = responsesMode
+			record.ResponsesMode = responsesMode
+			record.ConversionChain = []string{"openai_responses_request", "maheshvara_request", string(targetFormat) + "_request"}
 
-		// 上游原生支持 Responses API（targetFormat == responses，即同协议）且未发生
-		// 视觉过滤时，以原始请求体为基底零转换透传，保留 reasoning/function_call 等富字段。
-		var targetBody []byte
-		var customRequest *relay.CustomProtocolRequestResult
-		if relay.IsCustomPlatform(targetPlatform) {
-			customRequest, err = relay.RenderRegisteredCustomProtocolRequest(maheshvaraReq, relay.CustomProtocolID(targetPlatform))
-			if customRequest != nil {
-				targetBody = customRequest.Body
+			// 上游原生支持 Responses API（targetFormat == responses，即同协议）且未发生
+			// 视觉过滤时，以原始请求体为基底零转换透传，保留 reasoning/function_call 等富字段。
+			var targetBody []byte
+			var customRequest *relay.CustomProtocolRequestResult
+			if relay.IsCustomPlatform(targetPlatform) {
+				customRequest, err = relay.RenderRegisteredCustomProtocolRequest(maheshvaraReq, relay.CustomProtocolID(targetPlatform))
+				if customRequest != nil {
+					targetBody = customRequest.Body
+				}
+			} else if targetFormat == relay.FormatResponses && !filteredVision {
+				targetBody, err = relay.ResponsesPassthroughBody(bodyBytes, selectedModel.Name)
+				if err == nil {
+					record.RelayMode = RelayModePassthrough
+				}
+			} else {
+				targetBody, err = relay.MaheshvaraToTargetRequest(maheshvaraReq, targetFormat, originalResponsesReq)
+				if err == nil {
+					record.RelayMode = RelayModeTransform
+				}
 			}
-		} else if targetFormat == relay.FormatResponses && !filteredVision {
-			targetBody, err = relay.ResponsesPassthroughBody(bodyBytes, selectedModel.Name)
-			if err == nil {
-				record.RelayMode = RelayModePassthrough
+			if err != nil {
+				return relayAttemptStep{
+					skipErr:    err,
+					skipStatus: http.StatusBadRequest,
+					skipClass:  relay.ErrorClassInvalidRequest,
+				}
 			}
-		} else {
-			targetBody, err = relay.MaheshvaraToTargetRequest(maheshvaraReq, targetFormat, originalResponsesReq)
-			if err == nil {
-				record.RelayMode = RelayModeTransform
-			}
-		}
-		if err != nil {
-			lastStatus = http.StatusBadRequest
-			lastErr = err.Error()
-			s.appendRetryEvent(record, attempt, selectedModel.Name, lastErr)
-			if isLast {
-				s.commitLastAttemptFailure(c, record, startTime, lastStatus, ErrorKindConversion, lastErr, gin.H{"error": gin.H{"message": lastErr, "type": "invalid_request_error"}})
-				committed = true
-			}
-			continue
-		}
-		record.OutgoingBody = record.sanitizeBody(targetBody)
+			record.OutgoingBody = record.sanitizeBody(targetBody)
 
-		var outcome relayOutcome
-		if maheshvaraReq.Stream {
-			record.Stream = true
-			outcome = s.handleResponsesStream(c, group, selectedModel, targetBody, customRequest, targetPlatform, targetFormat, startTime, estimatedTokens, record, isLast)
-		} else {
-			outcome = s.handleResponsesNormal(c, group, selectedModel, targetBody, customRequest, targetPlatform, targetFormat, startTime, estimatedTokens, record, isLast)
-		}
-
-		if outcome.committed {
-			committed = true
-			if outcome.statusCode >= 200 && outcome.statusCode < 300 {
-				s.affinity.set(record.KeyHash, group.ID, selectedModel.Name, startTime)
+			if maheshvaraReq.Stream {
+				record.Stream = true
+				return relayAttemptStep{outcome: s.handleResponsesStream(c, group, selectedModel, targetBody, customRequest, targetPlatform, targetFormat, startTime, record, isLast)}
 			}
-			break
-		}
-
-		lastStatus = outcome.statusCode
-		lastErr = outcome.errMsg
-		s.appendRetryEvent(record, attempt, selectedModel.Name, outcome.errMsg)
-		if !isLast && group.RetryInterval > 0 {
-			// 尊重客户端取消：被放弃的请求不再空耗等待 + 对剩余候选扇出
-			//（取消同样落库留痕，499 为 nginx 惯例的 client closed）。
-			if !waitForRetryOrCancel(c, group.RetryInterval) {
-				committed = true
-				s.abortRetryOnClientCancel(c, record, startTime)
-				return
-			}
-		}
-	}
-
-	if !committed {
-		// 防御未来路径回归；与 chat 入口对齐：零守卫防 c.JSON(0,…) panic，
-		// 回传真实状态与记录一致（旧实现记录 429 却恒回 502）。
-		if lastStatus <= 0 {
-			lastStatus = http.StatusBadGateway
-		}
-		record.StatusCode = lastStatus
-		record.Error = firstNonEmpty(lastErr, "all upstream attempts failed")
-		record.ErrorKind = ErrorKindUpstream
-		record.EndedAt = time.Now()
-		record.DurationMs = time.Since(startTime).Milliseconds()
-		c.JSON(lastStatus, gin.H{"error": gin.H{"message": record.Error, "type": "api_error"}})
-		s.recordUsage(record)
-	}
+			return relayAttemptStep{outcome: s.handleResponsesNormal(c, group, selectedModel, targetBody, customRequest, targetPlatform, targetFormat, startTime, record, isLast)}
+		})
 }
 
-func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupConfig, selectedModel config.ModelRef, targetBody []byte, customRequest *relay.CustomProtocolRequestResult, targetPlatform relay.Platform, targetFormat relay.FormatType, startTime time.Time, estimatedTokens int, record *usageRecord, isLast bool) relayOutcome {
+func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupConfig, selectedModel config.ModelRef, targetBody []byte, customRequest *relay.CustomProtocolRequestResult, targetPlatform relay.Platform, targetFormat relay.FormatType, startTime time.Time, record *usageRecord, isLast bool) relayOutcome {
 	if relay.IsCustomPlatform(targetPlatform) {
 		return s.handleCustomResponsesNormal(c, group, selectedModel, customRequest, targetPlatform, startTime, record, isLast)
 	}
 	// failResult 决定：最后一次尝试或不可重试状态码 → 向客户端提交错误响应；
 	// 否则返回 committed=false 让上层故障转移到下一个候选。
 	failResult := func(statusCode int, errMsg string, respBody []byte) relayOutcome {
-		retryable := shouldRetryStatus(statusCode)
-		if isLast || !retryable {
-			record.StatusCode = statusCode
-			record.Error = errMsg
-			record.ErrorKind = ErrorKindUpstream
+		return relayFailOutcome(record, isLast, shouldRetryStatus(statusCode), statusCode, errMsg, func() {
 			if respBody != nil {
-				c.Data(statusCode, contentTypeJSON, respBody)
-			} else {
-				c.JSON(statusCode, gin.H{"error": gin.H{"message": errMsg, "type": "api_error"}})
+				writeUpstreamError(c, relay.FormatResponses, targetPlatform, statusCode, respBody, contentTypeJSON)
+				return
 			}
-			return relayOutcome{committed: true, statusCode: statusCode, errMsg: errMsg}
-		}
-		return relayOutcome{committed: false, statusCode: statusCode, errMsg: errMsg}
+			writeProtocolError(c, relay.FormatResponses, &relay.MaheshvaraError{Class: relay.ErrorClassUpstream, Status: statusCode, Message: errMsg})
+		})
 	}
 
 	var result relayOutcome
@@ -236,110 +164,28 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 		s.recordUsage(record)
 	}()
 
-	var maheshvaraResp *relay.MaheshvaraResponse
-
-	switch targetFormat {
-	case relay.FormatResponses:
-		responsesResp, respBody, upstreamStatus, err := s.openaiAdapter.SendResponsesRawWithBody(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
-		record.ProviderResponse = record.sanitizeBody(respBody)
-		if err != nil {
-			status := upstreamStatus
-			if status <= 0 {
-				status = http.StatusBadGateway
-			}
-			result = failResult(status, err.Error(), respBody)
-			return result
-		}
-		maheshvaraResp, err = relay.OpenAIResponsesResponseToMaheshvara(responsesResp)
-		if err != nil {
-			result = failResult(http.StatusInternalServerError, err.Error(), nil)
-			return result
-		}
-		record.ConversionChain = append(record.ConversionChain, "openai_responses_response")
-		updateRecordUsageFromMaheshvara(record, maheshvaraResp.Usage)
-		applyLocalResponseEstimate(record, extractOutputTextFromMaheshvaraResponse(maheshvaraResp), s.config.GetUsageConfig())
-		actualTokens := getInt(record.Usage.TotalTokens)
-		s.adjustTokenUsage(group.ID, actualTokens)
-		record.StatusCode = http.StatusOK
-		c.Data(http.StatusOK, contentTypeJSON, respBody)
-		result = relayOutcome{committed: true, statusCode: http.StatusOK}
-		return result
-
-	case relay.FormatClaude:
-		httpResp, err := s.claudeAdapter.SendRequest(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody, false)
-		if err != nil {
-			result = failResult(http.StatusBadGateway, err.Error(), nil)
-			return result
-		}
-		defer httpResp.Body.Close()
-		if httpResp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(httpResp.Body)
-			result = failResult(httpResp.StatusCode, string(respBody), respBody)
-			return result
-		}
-		var claudeResp relay.ClaudeResponse
-		respBody, err := readBodyAndJSON(httpResp, &claudeResp)
-		record.ProviderResponse = record.sanitizeBody(respBody)
-		if err != nil {
-			result = failResult(http.StatusInternalServerError, err.Error(), nil)
-			return result
-		}
-		maheshvaraResp, err = relay.AnthropicResponseToMaheshvara(&claudeResp)
-		if err != nil {
-			result = failResult(http.StatusInternalServerError, err.Error(), nil)
-			return result
-		}
-
-	case relay.FormatGemini:
-		httpResp, err := s.geminiAdapter.SendRequest(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, selectedModel.Name, targetBody, false)
-		if err != nil {
-			result = failResult(http.StatusBadGateway, err.Error(), nil)
-			return result
-		}
-		defer httpResp.Body.Close()
-		if httpResp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(httpResp.Body)
-			result = failResult(httpResp.StatusCode, string(respBody), respBody)
-			return result
-		}
-		var geminiResp relay.GeminiResponse
-		respBody, err := readBodyAndJSON(httpResp, &geminiResp)
-		record.ProviderResponse = record.sanitizeBody(respBody)
-		if err != nil {
-			result = failResult(http.StatusInternalServerError, err.Error(), nil)
-			return result
-		}
-		maheshvaraResp, err = relay.GeminiResponseToMaheshvara(&geminiResp)
-		if err != nil {
-			result = failResult(http.StatusInternalServerError, err.Error(), nil)
-			return result
-		}
-
-	default:
-		openAIResp, respBody, statusCode, err := s.openaiAdapter.SendRequestRawWithBody(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
-		record.ProviderResponse = record.sanitizeBody(respBody)
-		if err != nil {
-			if statusCode <= 0 {
-				statusCode = http.StatusBadGateway
-			}
-			result = failResult(statusCode, err.Error(), respBody)
-			return result
-		}
-		maheshvaraResp, err = relay.OpenAIChatResponseToMaheshvara(openAIResp)
-		if err != nil {
-			result = failResult(http.StatusInternalServerError, err.Error(), nil)
-			return result
-		}
+	// 统一取回:四类上游分支的「发送→判错→非 2xx 读体→转 Maheshvara」
+	// 骨架收敛于 fetchAsMaheshvara(与 chat 入口同一实现)。
+	fetched, err := s.fetchAsMaheshvara(c.Request.Context(), selectedModel, targetFormat, targetBody)
+	if fetched.respBody != nil {
+		record.ProviderResponse = record.sanitizeBody(fetched.respBody)
 	}
+	if err != nil {
+		status := fetched.status
+		if status <= 0 {
+			status = http.StatusBadGateway
+		}
+		result = failResult(status, err.Error(), fetched.respBody)
+		return result
+	}
+	maheshvaraResp := fetched.maheshvara
+	record.ConversionChain = append(record.ConversionChain, string(targetFormat)+"_response")
 
 	if maheshvaraResp.Model == "" {
 		maheshvaraResp.Model = selectedModel.Name
 	}
-	record.ConversionChain = append(record.ConversionChain, string(targetFormat)+"_response", "maheshvara_response", "openai_responses_response")
-	updateRecordUsageFromMaheshvara(record, maheshvaraResp.Usage)
-	applyLocalResponseEstimate(record, extractOutputTextFromMaheshvaraResponse(maheshvaraResp), s.config.GetUsageConfig())
-	actualTokens := getInt(record.Usage.TotalTokens)
-	s.adjustTokenUsage(group.ID, actualTokens)
+	record.ConversionChain = append(record.ConversionChain, "maheshvara_response", "openai_responses_response")
+	s.settleMaheshvaraUsage(group, record, startTime, maheshvaraResp)
 
 	responsesResp, err := relay.MaheshvaraToOpenAIResponsesResponse(maheshvaraResp)
 	if err != nil {
@@ -353,7 +199,7 @@ func (s *Server) handleResponsesNormal(c *gin.Context, group *config.ModelGroupC
 	return result
 }
 
-func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupConfig, selectedModel config.ModelRef, targetBody []byte, customRequest *relay.CustomProtocolRequestResult, targetPlatform relay.Platform, targetFormat relay.FormatType, startTime time.Time, estimatedTokens int, record *usageRecord, isLast bool) relayOutcome {
+func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupConfig, selectedModel config.ModelRef, targetBody []byte, customRequest *relay.CustomProtocolRequestResult, targetPlatform relay.Platform, targetFormat relay.FormatType, startTime time.Time, record *usageRecord, isLast bool) relayOutcome {
 	if relay.IsCustomPlatform(targetPlatform) {
 		return s.handleCustomStreamRequest(c, group, selectedModel, customRequest, targetPlatform, relay.FormatResponses, startTime, record, isLast)
 	}
@@ -372,26 +218,20 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 	// connFail 处理「SSE 尚未开始」的上游建连失败：可重试且非最后一次 →
 	// committed=false 让上层换下一个候选；否则写出 JSON 错误并提交。
 	connFail := func(statusCode int, errMsg string, respBody []byte) relayOutcome {
-		retryable := shouldRetryStatus(statusCode)
-		if isLast || !retryable {
-			record.StatusCode = statusCode
-			record.Error = errMsg
-			record.ErrorKind = ErrorKindUpstream
+		return relayFailOutcome(record, isLast, shouldRetryStatus(statusCode), statusCode, errMsg, func() {
 			if respBody != nil {
-				c.Data(statusCode, contentTypeJSON, respBody)
-			} else {
-				c.AbortWithStatusJSON(statusCode, gin.H{"error": gin.H{"message": errMsg, "type": "api_error"}})
+				writeUpstreamError(c, relay.FormatResponses, targetPlatform, statusCode, respBody, contentTypeJSON)
+				return
 			}
-			return relayOutcome{committed: true, statusCode: statusCode, errMsg: errMsg}
-		}
-		return relayOutcome{committed: false, statusCode: statusCode, errMsg: errMsg}
+			writeProtocolError(c, relay.FormatResponses, &relay.MaheshvaraError{Class: relay.ErrorClassUpstream, Status: statusCode, Message: errMsg})
+		})
 	}
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		record.StatusCode = http.StatusInternalServerError
 		record.Error = "Streaming not supported"
-		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": "Streaming not supported", "type": "api_error"}})
+		writeProtocolError(c, relay.FormatResponses, &relay.MaheshvaraError{Class: relay.ErrorClassServer, Message: "streaming is not supported on this connection"})
 		result = relayOutcome{committed: true, statusCode: http.StatusInternalServerError}
 		return result
 	}
@@ -407,10 +247,7 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 		if sseStarted {
 			return
 		}
-		c.Writer.Header().Set("Content-Type", "text/event-stream")
-		c.Writer.Header().Set("Cache-Control", "no-cache")
-		c.Writer.Header().Set("Connection", "keep-alive")
-		c.Writer.Header().Set("X-Accel-Buffering", "no")
+		writeSSEHeaders(c.Writer)
 		sseStarted = true
 	}
 
@@ -425,7 +262,7 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 	case relay.FormatResponses:
 		resp, err := s.openaiAdapter.SendResponsesStream(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
 		if err != nil {
-			result = connFail(upstreamErrorStatus(err, http.StatusBadGateway), err.Error(), nil)
+			result = connFail(upstreamErrorStatus(err, http.StatusBadGateway), err.Error(), upstreamErrorBody(err))
 			return result
 		}
 		startSSE()
@@ -472,7 +309,8 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 	default:
 		resp, err := s.openaiAdapter.SendRequestStream(c.Request.Context(), selectedModel.BaseURL, selectedModel.APIKey, targetBody)
 		if err != nil {
-			result = connFail(upstreamErrorStatus(err, http.StatusBadGateway), err.Error(), nil)
+			// 上游错误体经 UpstreamStatusError 携带,交给 connFail 解析渲染。
+			result = connFail(upstreamErrorStatus(err, http.StatusBadGateway), err.Error(), upstreamErrorBody(err))
 			return result
 		}
 		startSSE()
@@ -490,7 +328,12 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 		if record.StatusCode < 400 {
 			record.StatusCode = http.StatusBadGateway
 		}
-		writeResponsesStreamError(writer, streamErr)
+		// 转换路径的 renderer.Abort 已写出规范收尾帧(error + response.failed,
+		// 事件携带 sequence_number),重复补写会打乱事件序;仅纯转发失败需要补帧。
+		var rendered *relay.MaheshvaraError
+		if !errors.As(streamErr, &rendered) {
+			writeResponsesStreamError(writer, streamErr)
+		}
 	} else if streamYieldedNothing(record, writer) {
 		// 上游返回 200 但既无输出文本也无 usage —— 实际空响应，纠正为失败。
 		log.Printf("Upstream Responses stream returned empty response (no content, no usage)")
@@ -499,9 +342,7 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 		writeResponsesStreamError(writer, fmt.Errorf("upstream returned empty response"))
 	}
 
-	applyLocalResponseEstimate(record, writer.responseText.String(), s.config.GetUsageConfig())
-	actualTokens := getInt(record.Usage.TotalTokens)
-	s.adjustTokenUsage(group.ID, actualTokens)
+	s.settleStreamUsage(group, record, startTime)
 	// SSE 已开始即无法再改 HTTP 状态码/换上游，本次必然提交（无论流中途是否出错）。
 	result = relayOutcome{committed: true, statusCode: record.StatusCode}
 	return result
@@ -510,12 +351,12 @@ func (s *Server) handleResponsesStream(c *gin.Context, group *config.ModelGroupC
 // writeResponsesStreamError 向已开始的 SSE 流写一个 error 事件作为收尾，
 // 用于上游中途断流等场景，避免下游看到"无收尾的突然断开"。
 func writeResponsesStreamError(writer relay.StreamResponseWriter, err error) {
+	// 官方规范:Responses 流的错误事件是平铺对象(无 error 包裹)。
 	payload, merr := json.Marshal(map[string]any{
-		"type": "error",
-		"error": map[string]any{
-			"type":    "upstream_stream_error",
-			"message": err.Error(),
-		},
+		"type":    "error",
+		"code":    nil,
+		"message": err.Error(),
+		"param":   nil,
 	})
 	if merr != nil {
 		return

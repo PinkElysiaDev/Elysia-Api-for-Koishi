@@ -103,6 +103,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS model_group_models (group_id TEXT NOT NULL, model_id TEXT NOT NULL, source_id TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (group_id, model_id, source_id), FOREIGN KEY(group_id) REFERENCES model_groups(id) ON DELETE CASCADE)`,
 		`CREATE TABLE IF NOT EXISTS usage_records (request_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT NOT NULL, key_name TEXT NOT NULL DEFAULT '', key_hash TEXT NOT NULL DEFAULT '', requested_model_group TEXT NOT NULL DEFAULT '', group_id TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', model_name TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL DEFAULT '', source_format TEXT NOT NULL DEFAULT '', target_format TEXT NOT NULL DEFAULT '', relay_mode TEXT NOT NULL DEFAULT '', responses_mode TEXT NOT NULL DEFAULT '', usage_source TEXT NOT NULL DEFAULT '', stream INTEGER NOT NULL DEFAULT 0, status_code INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', first_byte_ms INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, request_truncated INTEGER NOT NULL DEFAULT 0, response_truncated INTEGER NOT NULL DEFAULT 0, record_json TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL, fields_json TEXT NOT NULL DEFAULT '{}')`,
+		// 自定义协议（协议设计器）：config 列保留原始 JSON，其余列用于列表。
+		`CREATE TABLE IF NOT EXISTS custom_protocols (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT 'llm', config TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		// 外置媒体引用计数：文件按内容哈希扁平存放（全局去重），本表追踪
 		// 「哪个记录引用了哪个文件」，记录删除时据此判断文件是否还能删。
 		`CREATE TABLE IF NOT EXISTS usage_asset_refs (
@@ -502,7 +504,7 @@ func (s *Store) UpsertAPIToken(ctx context.Context, item APIToken) error {
 		var existingName string
 		err := s.db.QueryRowContext(ctx, `SELECT name FROM api_tokens WHERE token_hash = ? AND name != ?`, tokenHash, item.Name).Scan(&existingName)
 		if err == nil {
-			return fmt.Errorf("该 token 已被 API Key %q 使用，请更换", existingName)
+			return fmt.Errorf("token already used by API key %q, choose a different value", existingName)
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
@@ -683,7 +685,7 @@ func (s *Store) ReplaceSourceModels(ctx context.Context, source ModelSource, mod
 	if _, err := tx.ExecContext(ctx, `DELETE FROM models WHERE source_id = ?`, source.ID); err != nil {
 		return err
 	}
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO models(id, source_id, name, source_name, base_url, api_key, platform, type, max_tokens, vision_capable, tools_capable, structured_output, thinking_mode, available, enabled, origin, capability_source, last_checked_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.PrepareContext(ctx, insertModelSQL)
 	if err != nil {
 		return err
 	}
@@ -703,7 +705,7 @@ func (s *Store) ReplaceSourceModels(ctx context.Context, source ModelSource, mod
 		if strings.TrimSpace(platform) == "" {
 			platform = source.Platform
 		}
-		if _, err := stmt.ExecContext(ctx, model.ID, source.ID, model.Name, source.Name, model.BaseURL, storedKey, normalizePlatform(platform), model.Type, model.MaxTokens, sqlBoolToInt(model.VisionCapable), sqlBoolToInt(model.ToolsCapable), sqlBoolToInt(model.StructuredOutput), model.ThinkingMode, sqlBoolToInt(true), sqlBoolToInt(model.Enabled), model.Origin, model.CapabilitySource, checked); err != nil {
+		if _, err := stmt.ExecContext(ctx, model.ID, source.ID, model.Name, source.Name, model.BaseURL, storedKey, NormalizePlatform(platform), model.Type, model.MaxTokens, sqlBoolToInt(model.VisionCapable), sqlBoolToInt(model.ToolsCapable), sqlBoolToInt(model.StructuredOutput), model.ThinkingMode, sqlBoolToInt(true), sqlBoolToInt(model.Enabled), model.Origin, model.CapabilitySource, checked); err != nil {
 			return err
 		}
 	}
@@ -719,7 +721,13 @@ func firstEffectiveKey(source ModelSource) string {
 	return ""
 }
 
-func normalizePlatform(platform string) string {
+// insertModelSQL 是 models 表 18 列的统一 INSERT(ReplaceSourceModels 与
+// MergeSourceModels 共用;列清单与 modelColumns 常量保持同步)。
+const insertModelSQL = `INSERT INTO models(id, source_id, name, source_name, base_url, api_key, platform, type, max_tokens, vision_capable, tools_capable, structured_output, thinking_mode, available, enabled, origin, capability_source, last_checked_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+// NormalizePlatform 把历史别名 openai-compatible 归一为 openai（server 侧
+// 同名逻辑已删除，统一从这里调用）。
+func NormalizePlatform(platform string) string {
 	if platform == "openai-compatible" {
 		return "openai"
 	}
@@ -741,8 +749,21 @@ type ModelMergeResult struct {
 //   - 能力字段（vision/tools/structured/thinking/maxTokens/type）：incoming 携带
 //     capability_source='manual'（用户在 UI 编辑过）的行保留现有值，否则用
 //     incoming 值（目录回填或上游解析）覆盖；
-//   - 上游消失的 fetched 行删除并同步清理组内引用；manual 行即使上游消失也保留。
+//   - 上游消失的 fetched 行删除并同步清理组内引用；manual 行即使上游消失也保留
+//     （手动同步路径用 SyncManualSourceModels，其 manual 语义不同）。
 func (s *Store) MergeSourceModels(ctx context.Context, source ModelSource, incoming []Model) (ModelMergeResult, error) {
+	return s.mergeSourceModels(ctx, source, incoming, false)
+}
+
+// SyncManualSourceModels 以源配置里的手动模型集为权威同步 models 表：
+// 除 MergeSourceModels 的合并语义外，缺席于 manual 集的 manual 行删除并清理
+// 组内引用——用户在源编辑里删除的手动模型必须从表中消失，外层页面读的正是
+// 这张表。空集合法（清空全部手动模型）。
+func (s *Store) SyncManualSourceModels(ctx context.Context, source ModelSource, manual []Model) (ModelMergeResult, error) {
+	return s.mergeSourceModels(ctx, source, manual, true)
+}
+
+func (s *Store) mergeSourceModels(ctx context.Context, source ModelSource, incoming []Model, deleteMissingManual bool) (ModelMergeResult, error) {
 	result := ModelMergeResult{Added: []string{}, Removed: []string{}}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -782,7 +803,7 @@ func (s *Store) MergeSourceModels(ctx context.Context, source ModelSource, incom
 	if err != nil {
 		return result, err
 	}
-	insertStmt, err := tx.PrepareContext(ctx, `INSERT INTO models(id, source_id, name, source_name, base_url, api_key, platform, type, max_tokens, vision_capable, tools_capable, structured_output, thinking_mode, available, enabled, origin, capability_source, last_checked_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	insertStmt, err := tx.PrepareContext(ctx, insertModelSQL)
 	if err != nil {
 		return result, err
 	}
@@ -799,8 +820,16 @@ func (s *Store) MergeSourceModels(ctx context.Context, source ModelSource, incom
 		incomingIDs[model.ID] = struct{}{}
 		prev, existed := existing[model.ID]
 		if existed && prev.origin == "manual" {
-			// manual 行完全保留（含能力与启停），只刷新检查时间。
-			if _, err := tx.ExecContext(ctx, `UPDATE models SET last_checked_at = ? WHERE id = ? AND source_id = ?`, checked, model.ID, source.ID); err != nil {
+			// manual 行保留能力与启停，但 base_url/api_key/platform 是源身份的
+			// 快照（产品面不存在逐模型覆盖地址/密钥的语义），随源保存刷新——
+			// 否则改源 url/key 后既有手动模型仍按旧配置请求。源 BaseURL 为空的
+			// legacy 导入源跳过（其 models 行携带逐模型地址，见 ImportLegacyConfig）。
+			if source.BaseURL != "" {
+				if _, err := tx.ExecContext(ctx, `UPDATE models SET base_url = ?, api_key = ?, platform = ?, last_checked_at = ? WHERE id = ? AND source_id = ?`,
+					source.BaseURL, storedKey, NormalizePlatform(source.Platform), checked, model.ID, source.ID); err != nil {
+					return result, err
+				}
+			} else if _, err := tx.ExecContext(ctx, `UPDATE models SET last_checked_at = ? WHERE id = ? AND source_id = ?`, checked, model.ID, source.ID); err != nil {
 				return result, err
 			}
 			continue
@@ -815,21 +844,25 @@ func (s *Store) MergeSourceModels(ctx context.Context, source ModelSource, incom
 				thinking, maxTokens = prev.thinking, prev.maxTokens
 				capabilitySource = "manual"
 			}
-			if _, err := updateStmt.ExecContext(ctx, model.Name, source.Name, source.BaseURL, storedKey, normalizePlatform(source.Platform), modelType, maxTokens, sqlBoolToInt(vision), sqlBoolToInt(tools), sqlBoolToInt(structured), thinking, capabilitySource, checked, model.ID, source.ID); err != nil {
+			if _, err := updateStmt.ExecContext(ctx, model.Name, source.Name, source.BaseURL, storedKey, NormalizePlatform(source.Platform), modelType, maxTokens, sqlBoolToInt(vision), sqlBoolToInt(tools), sqlBoolToInt(structured), thinking, capabilitySource, checked, model.ID, source.ID); err != nil {
 				return result, err
 			}
 			continue
 		}
 		// 新模型默认启用（已确认的默认值），available 初始为 true 由健康检测接管。
 		result.Added = append(result.Added, model.ID)
-		if _, err := insertStmt.ExecContext(ctx, model.ID, source.ID, model.Name, source.Name, source.BaseURL, storedKey, normalizePlatform(source.Platform), model.Type, model.MaxTokens, sqlBoolToInt(model.VisionCapable), sqlBoolToInt(model.ToolsCapable), sqlBoolToInt(model.StructuredOutput), model.ThinkingMode, sqlBoolToInt(true), sqlBoolToInt(model.Enabled), model.Origin, model.CapabilitySource, checked); err != nil {
+		if _, err := insertStmt.ExecContext(ctx, model.ID, source.ID, model.Name, source.Name, source.BaseURL, storedKey, NormalizePlatform(source.Platform), model.Type, model.MaxTokens, sqlBoolToInt(model.VisionCapable), sqlBoolToInt(model.ToolsCapable), sqlBoolToInt(model.StructuredOutput), model.ThinkingMode, sqlBoolToInt(true), sqlBoolToInt(model.Enabled), model.Origin, model.CapabilitySource, checked); err != nil {
 			return result, err
 		}
 	}
 
-	// 上游消失的 fetched 行删除（manual 行保留）；同步清理组内引用防悬空。
+	// 上游消失的 fetched 行删除；手动同步路径（deleteMissingManual）下，
+	// 缺席于权威集的 manual 行同样删除——fetch 路径维持 manual 行保留语义。
+	// 删除同步清理组内引用防悬空。
 	for id, prev := range existing {
-		if _, stillPresent := incomingIDs[id]; stillPresent || prev.origin == "manual" {
+		_, stillPresent := incomingIDs[id]
+		isManual := prev.origin == "manual"
+		if stillPresent || (isManual && !deleteMissingManual) {
 			continue
 		}
 		result.Removed = append(result.Removed, id)

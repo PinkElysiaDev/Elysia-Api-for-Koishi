@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -339,8 +340,8 @@ func TestRateLimitSettlesToActualOnSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire should succeed: %v", err)
 	}
-	s.adjustTokenUsage("g1", 320) // 拿到实际值后累加
-	release()                     // 退还预留
+	s.adjustTokenUsage("g1", 320, "") // 拿到实际值后累加
+	release()                         // 退还预留
 
 	if got := s.rateLimits["g1"].Tokens; got != 320 {
 		t.Fatalf("daily tokens should net to actual usage 320, got %d", got)
@@ -357,6 +358,20 @@ func TestExtractAccessToken(t *testing.T) {
 		{"x-api-key", func(r *http.Request) { r.Header.Set("x-api-key", "key789") }, "key789"},
 		{"x-goog", func(r *http.Request) { r.Header.Set("x-goog-api-key", "goog1") }, "goog1"},
 		{"query", func(r *http.Request) { r.URL.RawQuery = "key=qk" }, "qk"},
+		// cookie 路径：前端 encodeURIComponent 写入、此处 QueryUnescape 还原。
+		{"cookie", func(r *http.Request) {
+			r.AddCookie(&http.Cookie{Name: "panel_access_token", Value: "ck123"})
+		}, "ck123"},
+		{"cookie encoded", func(r *http.Request) {
+			r.AddCookie(&http.Cookie{Name: "panel_access_token", Value: url.QueryEscape("面板 令牌/4+2==")})
+		}, "面板 令牌/4+2=="},
+		{"cookie invalid escape falls back", func(r *http.Request) {
+			r.AddCookie(&http.Cookie{Name: "panel_access_token", Value: "%zz"})
+		}, "%zz"},
+		{"bearer beats cookie", func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer abc123")
+			r.AddCookie(&http.Cookie{Name: "panel_access_token", Value: "ck123"})
+		}, "abc123"},
 		{"none", func(r *http.Request) {}, ""},
 	}
 	for _, tc := range cases {

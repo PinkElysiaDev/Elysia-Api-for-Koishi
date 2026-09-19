@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -43,6 +44,15 @@ func (s *Server) setupAdminRoutes(admin *gin.RouterGroup) {
 	admin.PATCH("/model-sources/:id/enabled", s.adminSetSourceEnabled)
 	admin.GET("/model-catalog/status", s.adminModelCatalogStatus)
 	admin.POST("/model-catalog/refresh", s.adminModelCatalogRefresh)
+	// 协议设计器：协议 CRUD（SQLite）+ 字段目录 + 渲染预览 + 真实测试 + AI 助手。
+	admin.GET("/custom-protocols", s.adminListCustomProtocols)
+	admin.GET("/custom-protocols/schema", s.adminCustomProtocolSchema)
+	admin.PUT("/custom-protocols/:id", s.adminUpsertCustomProtocol)
+	admin.DELETE("/custom-protocols/:id", s.adminDeleteCustomProtocol)
+	admin.POST("/custom-protocols/preview", s.adminPreviewCustomProtocol)
+	admin.POST("/custom-protocols/test", s.adminTestCustomProtocol)
+	admin.POST("/custom-protocols/test-models", s.adminTestCustomProtocolModels)
+	admin.POST("/custom-protocols/assist", s.adminAssistCustomProtocol)
 	admin.GET("/models", s.adminListModels)
 	admin.POST("/models/refresh", s.adminRefreshModels)
 	// modelId 走 query 而非路径段：模型 ID 常含 "/"（如 org/model），路径参数
@@ -348,6 +358,22 @@ func (s *Server) adminUpsertSource(c *gin.Context) {
 		}
 		if found {
 			item.APIKey = existing.APIKey
+			// 多 key 池同理:部分更新式 PUT(不回传 apiKeys)会把整池清空
+			// (UpsertSource 空列表=清空),静默降级为单 key。
+			if len(item.APIKeys) == 0 {
+				item.APIKeys = existing.APIKeys
+			}
+		}
+	}
+	// 保存前预校验出站地址(请求与拉取都会走该地址):内网/云元数据目标
+	// 在保存时即拒绝,与拨号级校验形成双层防护。
+	for _, raw := range []string{strings.TrimSpace(item.BaseURL), strings.TrimSpace(item.FetchBaseURL)} {
+		if raw == "" {
+			continue
+		}
+		if err := s.validateOutbound(raw); err != nil {
+			respondFail(c, 400, "invalid_base_url", fmt.Sprintf("base url rejected: %v", err))
+			return
 		}
 	}
 	if err := store.UpsertSource(c.Request.Context(), item); err != nil {
@@ -385,11 +411,12 @@ func validateCustomSourceProtocol(item *storage.ModelSource) error {
 		return nil
 	}
 	protocolID := strings.TrimPrefix(platform, "custom:")
-	if _, ok := relay.GetCustomProtocol(protocolID); !ok {
-		return fmt.Errorf("custom protocol %q is not registered in config.json", protocolID)
+	protocol, ok := relay.GetCustomProtocol(protocolID)
+	if !ok {
+		return fmt.Errorf("custom protocol %q is not registered", protocolID)
 	}
-	if item.AutoFetchModels {
-		return fmt.Errorf("custom protocol sources require autoFetchModels=false and manualModels")
+	if item.AutoFetchModels && protocol.Models == nil {
+		return fmt.Errorf("custom protocol %q does not define model discovery (models.path/listPath); disable autoFetchModels or declare models discovery in the protocol designer", protocolID)
 	}
 	item.Platform = platform
 	return nil
@@ -721,13 +748,19 @@ func (s *Server) adminDeleteGroup(c *gin.Context) {
 	if !okStore {
 		return
 	}
-	if err := store.DeleteGroup(c.Request.Context(), c.Param("id")); err != nil {
+	disabledTokens, err := store.DeleteGroup(c.Request.Context(), c.Param("id"))
+	if err != nil {
 		respondFail(c, 500, "delete_group_failed", err.Error())
 		return
 	}
 	s.invalidateRouteCache()
 	s.forgetGroupRuntimeState(c.Param("id"))
-	respondOK(c, gin.H{"deleted": true})
+	if len(disabledTokens) > 0 {
+		// 授权列表被清空的 token 已随删除级联禁用（空列表=不限制，静默保留
+		// 会扩权），名单透出给管理员以便后续处置。
+		log.Printf("group %s deleted; disabled %d token(s) whose only allowed group it was: %v", c.Param("id"), len(disabledTokens), disabledTokens)
+	}
+	respondOK(c, gin.H{"deleted": true, "disabledTokens": disabledTokens})
 }
 
 func (s *Server) adminListTokens(c *gin.Context) {
@@ -1157,11 +1190,11 @@ func usageQueryFromRequest(c *gin.Context) storage.UsageQuery {
 		ModelName:  c.Query("modelName"),
 		Status:     status,
 		StatusCode: parsePositiveInt(c.Query("statusCode"), 0),
-		KeyNames:   c.QueryArray("keyName"),
-		GroupNames: firstNonEmptyArray(c.QueryArray("groupName"), c.QueryArray("modelGroup")),
-		ModelNames: c.QueryArray("modelName"),
+		KeyNames:   compactQueryArray(c.QueryArray("keyName")),
+		GroupNames: compactQueryArray(firstNonEmptyArray(c.QueryArray("groupName"), c.QueryArray("modelGroup"))),
+		ModelNames: compactQueryArray(c.QueryArray("modelName")),
 		SourceID:   c.Query("sourceId"),
-		SourceIDs:  c.QueryArray("sourceId"),
+		SourceIDs:  compactQueryArray(c.QueryArray("sourceId")),
 	}
 }
 
@@ -1214,4 +1247,16 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// compactQueryArray 过滤空串元素:客户端带 ?keyName= 的空值参数时
+// QueryArray 返回 [""],IN (”) 会恒空结果(旧语义是空=不过滤)。
+func compactQueryArray(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }

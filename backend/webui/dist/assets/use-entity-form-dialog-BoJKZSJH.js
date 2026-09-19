@@ -1,0 +1,1 @@
+import{r as e}from"./vendor-CXBObVrp.js";function C(s){const[n,a]=e.useState(s),[r,t]=e.useState(!1),[u,o]=e.useState(!0),c=e.useCallback(()=>{a(s),o(!0),t(!0)},[s]),l=e.useCallback(f=>{a(f),o(!1),t(!0)},[]),i=e.useCallback(()=>t(!1),[]);return{item:n,setItem:a,open:r,setOpen:t,isNew:u,openCreate:c,openEdit:l,close:i}}export{C as u};

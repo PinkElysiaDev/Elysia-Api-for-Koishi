@@ -1,7 +1,6 @@
 package relay
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -11,6 +10,10 @@ type Platform string
 
 const (
 	PlatformOpenAI    Platform = "openai"
+	// PlatformResponses 是 responses 线路(apiFormat=responses 的模型源)的
+	// 独立平台值:请求/响应走 Responses 协议端点(区别于 APIFormatResponses
+	// 这个 apiFormat 字符串)。
+	PlatformResponses Platform = "responses"
 	PlatformDeepSeek  Platform = "deepseek"
 	PlatformAnthropic Platform = "anthropic"
 	PlatformGemini    Platform = "gemini"
@@ -66,7 +69,11 @@ func DetectPlatform(baseURL, platform string) Platform {
 	// 首先检查明确的 platform / apiFormat 字段。
 	// 同时识别新的 apiFormat 值（responses/chat_completions）与旧值（openai 等）。
 	switch strings.ToLower(strings.TrimSpace(platform)) {
-	case "openai", "chat_completions", "responses", "openai_responses", "openai-compatible":
+	case "responses", "openai_responses":
+		// Responses 型上游是独立线路:请求/响应走 Responses 协议端点
+		//(TargetFormatForPlatform 映射 FormatResponses),不并入 OpenAI 系。
+		return PlatformResponses
+	case "openai", "chat_completions", "openai-compatible":
 		return PlatformOpenAI
 	case "deepseek":
 		return PlatformDeepSeek
@@ -111,6 +118,12 @@ func CustomProtocolID(platform Platform) string {
 }
 
 func TargetFormatForPlatform(platform Platform) (FormatType, error) {
+	// responses 线路(apiFormat=responses 的模型源)原生走 Responses 协议,
+	// 而非静默降级为 Chat Completions——跨协议客户端的工具定义/结果回传
+	// 经 Maheshvara 转换内核在两条线制间等价互转。
+	if platform == PlatformResponses {
+		return FormatResponses, nil
+	}
 	if IsCustomPlatform(platform) {
 		return FormatUnknown, fmt.Errorf("custom platform %q requires a registered protocol renderer", platform)
 	}
@@ -159,33 +172,6 @@ func FormatMatchesPlatform(inputFormat FormatType, platform Platform) bool {
 	}
 }
 
-// DetectInputFormat 检测输入请求的格式
-func DetectInputFormat(body []byte) FormatType {
-	var req map[string]interface{}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return FormatUnknown
-	}
-
-	// 检查 Gemini 特有字段
-	if _, hasContents := req["contents"]; hasContents {
-		return FormatGemini
-	}
-
-	// 检查 Claude 特有字段
-	if _, hasSystem := req["system"]; hasSystem {
-		if _, hasMaxTokens := req["max_tokens"]; hasMaxTokens {
-			return FormatClaude
-		}
-	}
-
-	// 默认为 OpenAI 格式
-	return FormatOpenAI
-}
-
-// UnifiedRequest 统一的内部请求格式
-// 这是所有格式的"全集"，包含所有可能的字段
-// Deprecated: use MaheshvaraRequest (MaheshvaraRequest).
-
 type GeminiContent struct {
 	Role  string       `json:"role"`
 	Parts []GeminiPart `json:"parts"`
@@ -212,11 +198,18 @@ func extractTextFromContent(content interface{}) string {
 	}
 	if arr, ok := content.([]interface{}); ok {
 		var textBuilder strings.Builder
+		wrote := false
 		for _, item := range arr {
 			if itemMap, ok := item.(map[string]interface{}); ok {
 				if itemMap["type"] == "text" {
 					if text, ok := itemMap["text"].(string); ok {
+						// 块间补空行分隔:与 Responses 侧多 system 消息的连接
+						// 一致——直接拼接会把相邻块的词粘连。
+						if wrote {
+							textBuilder.WriteString("\n\n")
+						}
 						textBuilder.WriteString(text)
+						wrote = true
 					}
 				}
 			}

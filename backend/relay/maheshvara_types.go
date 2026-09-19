@@ -39,6 +39,10 @@ const (
 	MaheshvaraInputItemReference      = "item_reference"
 
 	MaheshvaraToolFunction           = "function"
+
+	// Maheshvara 响应状态字面量(此前在自定义协议层以裸字符串散布)。
+	MaheshvaraStatusCompleted  = "completed"
+	MaheshvaraStatusInProgress = "in_progress"
 	MaheshvaraToolWebSearchPreview   = "web_search_preview"
 	MaheshvaraToolFileSearch         = "file_search"
 	MaheshvaraToolComputerUsePreview = "computer_use_preview"
@@ -373,13 +377,24 @@ type MaheshvaraUsage struct {
 	Provider string         `json:"provider,omitempty"`
 }
 
+func (e *MaheshvaraError) Error() string {
+	if e == nil {
+		return "maheshvara error"
+	}
+	return e.Message
+}
+
 type MaheshvaraError struct {
-	Message string         `json:"message"`
-	Type    string         `json:"type,omitempty"`
-	Param   string         `json:"param,omitempty"`
-	Code    string         `json:"code,omitempty"`
-	Details any            `json:"details,omitempty"`
-	Raw     map[string]any `json:"raw,omitempty"`
+	Message string `json:"message"`
+	Type    string `json:"type,omitempty"`
+	Param   string `json:"param,omitempty"`
+	Code    string `json:"code,omitempty"`
+	// Class 是错误的稳定分类(四线制渲染的权威来源,见 error_protocol.go);
+	// Status 为上游真实 HTTP 状态(跨协议翻译时携带,0 表示按分类推导)。
+	Class  ErrorClass     `json:"class,omitempty"`
+	Status int            `json:"status,omitempty"`
+	Details any           `json:"details,omitempty"`
+	Raw    map[string]any `json:"raw,omitempty"`
 }
 
 type MaheshvaraStreamEvent struct {
@@ -799,13 +814,18 @@ func interfaceToContentParts(content any) []MaheshvaraContentPart {
 			}
 		case "image_url", "input_image", "image":
 			url := ""
+			detail := ""
 			if imageURL, ok := m["image_url"].(map[string]any); ok {
 				url, _ = imageURL["url"].(string)
+				detail, _ = imageURL["detail"].(string)
 			}
 			if url == "" {
 				url, _ = m["image_url"].(string)
 			}
-			parts = append(parts, MaheshvaraContentPart{Type: MaheshvaraContentImage, ImageURL: url, Raw: m})
+			if detail == "" {
+				detail, _ = m["detail"].(string)
+			}
+			parts = append(parts, MaheshvaraContentPart{Type: MaheshvaraContentImage, ImageURL: url, Detail: detail, Raw: m})
 		case "input_audio", "audio", "audio_url", "output_audio":
 			nested, _ := m["input_audio"].(map[string]any)
 			if nested == nil {
@@ -886,4 +906,17 @@ func contentValueToString(value any) string {
 
 func newMaheshvaraResponseID(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+}
+
+// toolOutputsText 拼接消息里 tool_output parts 的载荷(工具结果的纯文本
+// 形态)。Chat role:"tool" 消息解析后 content 即单个 tool_output part,
+// maheshvaraText 只认 text part,需经此取回。
+func toolOutputsText(content []MaheshvaraContentPart) string {
+	var builder strings.Builder
+	for _, part := range content {
+		if part.Type == MaheshvaraContentToolOutput && part.ToolOutput != "" {
+			builder.WriteString(part.ToolOutput)
+		}
+	}
+	return builder.String()
 }

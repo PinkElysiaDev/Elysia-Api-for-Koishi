@@ -53,7 +53,7 @@ Legacy `server`, `dashboardToken`, `tokens`, and `modelGroups` fields are still 
 
 ### `GET /api/admin/runtime-config`
 
-Returns current bootstrap runtime values. Tokens are not returned in plaintext. `webuiDir`, `enablePprof`, and `maxBodyBytes` are bootstrap-only fields and normally changed by restarting the backend or through the standalone Koishi entry plugin.
+Returns current bootstrap runtime values. Tokens are not returned in plaintext. `webuiDir`, `enablePprof`, and `maxBodyBytes` are bootstrap-only fields and normally changed by restarting the backend.
 
 ### `PUT /api/admin/runtime-config`
 
@@ -61,7 +61,24 @@ Returns current bootstrap runtime values. Tokens are not returned in plaintext. 
 { "host": "127.0.0.1", "port": 8765, "logLevel": "debug", "httpTimeout": 120 }
 ```
 
-Returns `restartRequired: true` when host or port changes. Persisting bootstrap config to disk can be handled by the Koishi entry plugin or an installer tool.
+Accepts an optional `usageLog` block (all fields partial; numeric `0` is an explicit value):
+
+```json
+{
+  "usageLog": {
+    "persistEnabled": true,
+    "retentionDays": 30,
+    "maxStorageMB": 1024,
+    "maxRecords": 0,
+    "bodyMaxKB": 1024,
+    "bodyOnErrorOnly": false,
+    "externalizeMedia": true,
+    "cleanupIntervalMinutes": 60
+  }
+}
+```
+
+`usageLog` changes apply immediately: body cap / switches take effect for subsequent requests, retention parameters are re-read by the background cleanup loop on its next tick. Returns `restartRequired: true` when host or port changes. Persisting bootstrap config to disk is handled by the backend `config.Save()` path; process restarts should be handled by the operator or service manager.
 
 ## Model Sources
 
@@ -161,7 +178,18 @@ List responses mask tokens; create/update accepts plaintext.
 
 ### `GET /api/admin/usage/stats`
 
-Query params: `from`, `to` as RFC3339 timestamps; optional `keyName`, `keyHash`, `groupName`, `modelGroup`, `modelName`, `statusCode`.
+Query params: `from`, `to` as RFC3339 timestamps; optional `keyName`, `keyHash`, `groupName`, `modelGroup`, `modelName`, `sourceId`, `statusCode`. Repeated params (`keyName`, `groupName`, `modelName`, `sourceId`) are treated as multi-select.
+
+### `GET /api/admin/usage/pulse`
+
+Query params: same time filters as stats, plus `utcOffsetMinutes` and `bucketMinutes` (`1`, `5`, or `15`).
+`from` is required; `[from, to)` must be at most 48 hours (`to` omitted uses now).
+Returns `{ points, window }` where `points` is `{ t, requests, avgDurationMs, p95DurationMs }[]` (`t` is the bucket start in Unix milliseconds) and `window` is `{ requests, avgDurationMs, p95DurationMs, totalTokens }`. Window `requests` / `avgDurationMs` are exact. Window and bucket `p95DurationMs` are exact up to 16384 samples, then a reservoir-sampling estimate. They are not a mean of bucket P95s.
+
+### `GET /api/admin/usage/by-model-daily`
+
+Query params: same time filters as stats, plus `utcOffsetMinutes` and optional `top` (1–20, default 8).
+Returns `{ date, model, requests, isOther }[]`. Models outside the top-N by request count are merged into one row with `isOther: true` and empty `model`; the client chooses the display label.
 
 ### `GET /api/admin/usage/logs`
 
@@ -173,7 +201,19 @@ Returns the full stored usage record JSON.
 
 ### `POST /api/admin/usage/reset`
 
-Deletes all usage records.
+Deletes all usage records. Externalized media assets under the `usage-assets/` directory are removed as well.
+
+### `GET /api/admin/usage/assets/:requestId/:file`
+
+Serves an externalized media asset for a usage record (images / audio / video / files captured from logged bodies; the body itself stores a `__ELYSIA_ASSET__:<requestId>/<hash>.<ext>` placeholder instead of the base64 payload). `file` must match `<16-hex>.<ext>`; requests are admin-authenticated like all other admin endpoints.
+
+### `GET /api/admin/usage/storage`
+
+Returns log storage status: `db` (`totalBytes`, `logicalBytes`, `pageCount`, `pageSize`, `freePages`), `recordCount`, `assets` (`bytes`, `files`, `dirs`), the effective `config` (usageLog block), and `lastCleanup` (result of the most recent retention pass).
+
+### `POST /api/admin/usage/cleanup`
+
+Triggers one retention pass asynchronously (TTL / record-count / storage-cap cleanup plus orphan asset sweep). Returns `{ accepted }`; `false` means a pass is already running.
 
 ## Logs and Health
 

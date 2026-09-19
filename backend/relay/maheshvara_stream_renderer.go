@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"context"
 	"fmt"
 	"net/http"
@@ -91,7 +92,7 @@ func (renderer *MaheshvaraStreamRenderer) WriteResponse(response *MaheshvaraResp
 		return fmt.Errorf("nil Maheshvara stream response")
 	}
 	if response.Error != nil {
-		return renderer.Abort(fmt.Errorf("%s", response.Error.Message))
+		return renderer.AbortWithError(response.Error)
 	}
 	if response.ID != "" {
 		renderer.responseID = response.ID
@@ -189,24 +190,39 @@ func (renderer *MaheshvaraStreamRenderer) Finish() error {
 	return err
 }
 
+// Abort 以核心错误中止流;携带完整分类/细分码的错误会按客户端线制渲染
+// 出对应 type/code(而非一律 upstream_stream_error)。
 func (renderer *MaheshvaraStreamRenderer) Abort(streamErr error) error {
+	var mErr *MaheshvaraError
+	if errors.As(streamErr, &mErr) {
+		return renderer.AbortWithError(mErr)
+	}
+	message := "upstream stream failed"
+	if streamErr != nil {
+		message = streamErr.Error()
+	}
+	return renderer.AbortWithError(&MaheshvaraError{Class: ErrorClassUpstream, Message: message})
+}
+
+func (renderer *MaheshvaraStreamRenderer) AbortWithError(mErr *MaheshvaraError) error {
 	if renderer == nil || renderer.finished || renderer.aborted {
 		return nil
 	}
-	if streamErr == nil {
-		streamErr = fmt.Errorf("upstream stream failed")
+	if mErr == nil {
+		mErr = &MaheshvaraError{Class: ErrorClassUpstream, Message: "upstream stream failed"}
 	}
+	mErr.Class = mErr.Class.OrDefault()
 	renderer.aborted = true
 	var err error
 	switch renderer.format {
 	case FormatClaude:
-		err = renderer.abortClaude(streamErr)
+		err = renderer.abortClaude(mErr)
 	case FormatGemini:
-		err = renderer.abortGemini(streamErr)
+		err = renderer.abortGemini(mErr)
 	case FormatResponses:
-		err = renderer.abortResponses(streamErr)
+		err = renderer.abortResponses(mErr)
 	default:
-		err = renderer.abortOpenAIChat(streamErr)
+		err = renderer.abortOpenAIChat(mErr)
 	}
 	if err == nil && renderer.writer != nil {
 		err = renderer.writer.Flush()
@@ -247,11 +263,10 @@ func TransformStreamViaMaheshvara(ctx context.Context, response *http.Response, 
 		for index := range events {
 			event := events[index]
 			if event.Type == MaheshvaraEventResponseFailed || event.Error != nil {
-				message := "upstream stream failed"
-				if event.Error != nil && event.Error.Message != "" {
-					message = event.Error.Message
+				if event.Error != nil {
+					return abort(event.Error)
 				}
-				return abort(fmt.Errorf("%s", message))
+				return abort(fmt.Errorf("upstream stream failed"))
 			}
 			if event.Type == MaheshvaraEventResponseCompleted {
 				terminalEvents = append(terminalEvents, event)

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { useTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 
 /**
  * 主题切换钮（侧栏底部 / 登录页右上角复用）。
@@ -18,7 +19,8 @@ const SUN_RAYS = [
   'M3.7 3.7 6.2 6.2',
 ] as const
 
-export function ThemeToggle() {
+export function ThemeToggle({ tooltip = false }: { tooltip?: boolean } = {}) {
+  const clipId = useId()
   const { theme, toggleTheme } = useTheme()
   const dark = theme === 'dark'
   const [switching, setSwitching] = useState(false)
@@ -33,22 +35,22 @@ export function ThemeToggle() {
     timer.current = window.setTimeout(() => setSwitching(false), 560)
   }
 
-  return (
+  const button = (
     <button
       type="button"
       onClick={handleClick}
       aria-label={dark ? '切换到浅色模式' : '切换到深色模式'}
       aria-pressed={dark}
-      title={dark ? '浅色模式' : '深色模式'}
+      title={tooltip ? undefined : dark ? '浅色模式' : '深色模式'}
       className={cn(
-        'theme-toggle relative inline-flex h-8 w-8 items-center justify-center overflow-hidden rounded-full text-muted-foreground',
+        'theme-toggle icon-toggle relative inline-flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground max-rail:h-11 max-rail:w-11',
         'transition-colors duration-300 hover:bg-wash hover:text-rose',
         switching && 'is-switching',
       )}
     >
       <svg viewBox="0 0 24 24" className="theme-sun" aria-hidden="true">
         <defs>
-          <clipPath id="theme-sun-clip">
+          <clipPath id={clipId}>
             <path className="sun-clip-path" d="M0 0h25a1 1 0 0010 10v14H0Z" />
           </clipPath>
         </defs>
@@ -59,11 +61,17 @@ export function ThemeToggle() {
             cy="12"
             r="5"
             fill="currentColor"
-            clipPath="url(#theme-sun-clip)"
+            clipPath={`url(#${clipId})`}
           />
           <path className="sun-ray" d={SUN_RAYS.join(' ')} fill="none" strokeWidth={2} />
         </g>
       </svg>
     </button>
   )
+  return tooltip ? (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent>{dark ? '切换到浅色模式' : '切换到深色模式'}</TooltipContent>
+    </Tooltip>
+  ) : button
 }

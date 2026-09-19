@@ -33,3 +33,7 @@ package-lock.json
 # Go 后端二进制：体积过大，不入 git。发布前本地运行 scripts/build-backend.sh
 # 交叉编译生成，npm publish 仍会通过 package.json 的 files 字段打包。
 packages/*/assets/bin/
+
+# Playwright E2E 测试产物
+packages/webui/test-results/
+packages/webui/playwright-report/

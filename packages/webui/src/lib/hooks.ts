@@ -10,6 +10,8 @@ export const POLL = {
   LIST: 60_000,
   USAGE: 30_000,
   HEALTH_SLOW: 10_000,
+  /** 总览页健康卡:含 DB 子状态展示,比诊断页的 HEALTH_SLOW 更新更快一档。 */
+  HEALTH_FAST: 15_000,
   SEQ: 2_000,
   SOURCE_FAST: 3_000,
 } as const
@@ -133,14 +135,10 @@ export function useUsageStats(params: UsageQueryParams) {
 
 /**
  * 按日趋势聚合（后端按固定 UTC offset 换算为本地日，不受明细 limit 钳制影响）。
- * 查询参数只有 from（日内内容稳定，SWR 键全天不变），由 usageConfig 轮询
- * 刷新当日桶；如需不同节奏可显式传 refreshInterval 覆盖。
+ * 查询参数只有 from（日内内容稳定，SWR 键全天不变），由 usageConfig 轮询刷新当日桶。
  */
-export function useUsageTrend(params: UsageQueryParams & { utcOffsetMinutes: number }, refreshInterval?: number) {
-  return useSWR(['usage-trend', params], () => api.usageTrend(params), {
-    ...usageConfig,
-    ...(refreshInterval ? { refreshInterval } : {}),
-  })
+export function useUsageTrend(params: UsageQueryParams & { utcOffsetMinutes: number }) {
+  return useSWR(['usage-trend', params], () => api.usageTrend(params), usageConfig)
 }
 
 /** 按模型聚合（热门模型 / 明细表）。 */
@@ -163,7 +161,12 @@ export function useUsageLogs(params: UsageQueryParams) {
 
 /** 系统日志分页。 */
 export function useSystemLogs(params: { limit?: number; offset?: number; level?: string }) {
-  return useSWR(['system-logs', params], () => api.systemLogs(params), defaultConfig)
+  return useSWR(['system-logs', params], () => api.systemLogs(params), {
+    ...defaultConfig,
+    keepPreviousData: true,
+    // 日志裁剪后可能立即回到刚访问过的页，必须重新获取该页总数。
+    dedupingInterval: 0,
+  })
 }
 
 /** 数据变更后批量刷新缓存。 */
@@ -171,10 +174,8 @@ export const revalidate = {
   sources: () => globalMutate('model-sources'),
   models: () => globalMutate('models'),
   groups: () => globalMutate('model-groups'),
-  tokens: () => globalMutate('api-tokens'),
   runtimeConfig: () => globalMutate('runtime-config'),
   modelCatalogStatus: () => globalMutate('model-catalog-status'),
-  health: () => globalMutate('health'),
   usage: () =>
     globalMutate(
       (key) =>

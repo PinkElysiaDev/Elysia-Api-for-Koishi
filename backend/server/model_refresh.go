@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -55,10 +56,9 @@ func (s *Server) refreshSourceByValue(ctx context.Context, source storage.ModelS
 			model.Enabled = true
 			models = append(models, model)
 		}
-		if len(models) == 0 {
-			return empty, nil
-		}
-		result, err := s.store.MergeSourceModels(ctx, source, models)
+		// 手动集即权威:用户在源编辑里删除的手动模型随之从表中删除(空集
+		// 合法——清空全部手动模型也必须落库生效,不再提前返回)。
+		result, err := s.store.SyncManualSourceModels(ctx, source, models)
 		return refreshSummary{Count: len(models), Added: result.Added, Removed: result.Removed}, err
 	}
 
@@ -186,7 +186,7 @@ func (s *Server) enrichModelFromCatalog(model *storage.Model) {
 func (s *Server) fetchModelsFromSource(ctx context.Context, source storage.ModelSource, apiKey string) ([]storage.Model, error) {
 	apiFormat := relay.NormalizeAPIFormat(source.Platform)
 	if strings.HasPrefix(apiFormat, "custom:") {
-		return nil, fmt.Errorf("custom protocol source %q does not define model discovery; disable autoFetchModels and configure manual models", source.Platform)
+		return s.fetchCustomProtocolModels(ctx, source, apiKey)
 	}
 	switch apiFormat {
 	case relay.APIFormatAnthropic:
@@ -199,6 +199,46 @@ func (s *Server) fetchModelsFromSource(ctx context.Context, source storage.Model
 		// responses / chat_completions 都用 OpenAI 风格 /v1/models 拉取。
 		return s.fetchOpenAIModels(ctx, source, apiKey)
 	}
+}
+
+// fetchCustomProtocolModels 按协议声明的发现端点（protocol.models）拉取模型
+// 列表：请求构造与鉴权注入复用自定义协议管线（适配器客户端与转发同级，自带
+// 拨号级 SSRF 校验），响应经 listPath/idPath 解析。协议未声明 models 配置时
+// 返回可操作错误。
+func (s *Server) fetchCustomProtocolModels(ctx context.Context, source storage.ModelSource, apiKey string) ([]storage.Model, error) {
+	platform := relay.NormalizeAPIFormat(source.Platform)
+	protocolID := strings.TrimPrefix(platform, "custom:")
+	protocol, ok := relay.GetCustomProtocol(protocolID)
+	if !ok || protocol.Models == nil {
+		return nil, fmt.Errorf("custom protocol %q does not define model discovery (models.path/listPath); disable autoFetchModels and configure manual models", protocolID)
+	}
+	rendered, err := relay.RenderCustomProtocolModelsRequest(protocol)
+	if err != nil {
+		return nil, err
+	}
+	response, err := s.openaiAdapter.SendCustomProtocolRequest(ctx, sourceFetchBase(source), apiKey, rendered, false)
+	if err != nil {
+		return nil, fmt.Errorf("fetch models via custom protocol: %w", err)
+	}
+	defer response.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, relay.MaxUpstreamBodyBytes))
+	if readErr != nil {
+		return nil, readErr
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("model fetch failed: %s: %s", response.Status, truncateForDisplay(string(body), 512))
+	}
+	infos, err := relay.ParseCustomProtocolModels(body, protocol)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]storage.Model, 0, len(infos))
+	for _, info := range infos {
+		model := inferredModel(source, info.ID, info.Name)
+		s.enrichModelFromCatalog(&model)
+		models = append(models, model)
+	}
+	return models, nil
 }
 
 // sourceFetchBase 解析模型列表拉取用的 base（方向5）：fetch_base_url 显式配置时
@@ -292,7 +332,7 @@ func (s *Server) fetchClaudeModels(ctx context.Context, source storage.ModelSour
 		}
 		return models, nil
 	}
-	return nil, fmt.Errorf("claude 模型拉取失败（已尝试 x-api-key 与 Bearer 两种鉴权）: %w", lastErr)
+	return nil, fmt.Errorf("failed to fetch claude models (tried both x-api-key and Bearer auth): %w", lastErr)
 }
 
 func (s *Server) fetchGeminiModels(ctx context.Context, source storage.ModelSource, apiKey string) ([]storage.Model, error) {
@@ -342,7 +382,9 @@ func (s *Server) fetchGeminiModels(ctx context.Context, source storage.ModelSour
 }
 
 func fetchAndDecodeJSON(req *http.Request, target any) error {
-	client := &http.Client{Timeout: 30 * time.Second}
+	// 模型列表拉取与转发路径同级的外部请求:必须走 secure transport
+	// (拨号级 SSRF 校验),否则拉取 URL 可被引向内网/云元数据端点。
+	client := &http.Client{Timeout: 30 * time.Second, Transport: relay.NewSecureTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -378,19 +420,12 @@ func inferredModel(source storage.ModelSource, id, name string) storage.Model {
 	return storage.Model{
 		ID:           id,
 		Name:         name,
-		Platform:     normalizeSourcePlatform(source.Platform),
+		Platform:     storage.NormalizePlatform(source.Platform),
 		Type:         inferModelType(id),
 		MaxTokens:    0,
 		ThinkingMode: "both",
 		Available:    true,
 	}
-}
-
-func normalizeSourcePlatform(platform string) string {
-	if platform == "openai-compatible" {
-		return "openai"
-	}
-	return platform
 }
 
 func inferModelType(modelID string) string {

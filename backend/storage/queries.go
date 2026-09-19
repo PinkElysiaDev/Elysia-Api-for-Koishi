@@ -180,6 +180,16 @@ func (s *Store) UpsertGroup(ctx context.Context, item ModelGroup) error {
 	if strings.TrimSpace(item.Name) == "" {
 		return errors.New("group name is required")
 	}
+	// 组名唯一:findGroupByName 按名路由永远命中首个,同名第二组的配置
+	// (限流/候选)全部静默失效。
+	var conflictingID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM model_groups WHERE name = ? AND id <> ? LIMIT 1`, item.Name, item.ID).Scan(&conflictingID)
+	if err == nil {
+		return fmt.Errorf("group name %q already used by group %q", item.Name, conflictingID)
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
 	if item.Strategy == "" {
 		item.Strategy = "round-robin"
 	}
@@ -414,39 +424,89 @@ func (s *Store) resolveModelRef(ctx context.Context, tx *sql.Tx, ref string) (mo
 	return model.ID, model.SourceID, nil
 }
 
-func (s *Store) DeleteGroup(ctx context.Context, id string) error {
+// DeleteGroup 删除模型组并级联清理 token 的组授权。返回因授权列表被清空而
+// 一并禁用的 token 名单（见 removeGroupFromTokens）。
+func (s *Store) DeleteGroup(ctx context.Context, id string) ([]string, error) {
 	if strings.TrimSpace(id) == "" {
-		return errors.New("group id is required")
+		return nil, errors.New("group id is required")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 
 	// 删除前读取组名，用于级联清理 token 的 allowed_groups_json 悬空引用。
 	var name string
 	if err := tx.QueryRowContext(ctx, `SELECT name FROM model_groups WHERE id = ?`, id).Scan(&name); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM model_groups WHERE id = ?`, id); err != nil {
-		return err
+		return nil, err
 	}
+	disabled := []string{}
 	if name != "" {
-		if err := removeGroupFromTokens(ctx, tx, name); err != nil {
-			return err
+		disabled, err = removeGroupFromTokens(ctx, tx, name)
+		if err != nil {
+			return nil, err
 		}
 	}
-	return tx.Commit()
+	return disabled, tx.Commit()
 }
 
 // removeGroupFromTokens 在删除模型组后，把所有 token 的 allowed_groups_json 里的
 // 该组名移除，避免残留成悬空引用。仅在 JSON 实际包含该组名时写回；与
 // renameGroupInTokens 一样，必须在删除组的事务内调用以保证原子性。
-func removeGroupFromTokens(ctx context.Context, tx *sql.Tx, groupName string) error {
-	return updateTokenGroupsTx(ctx, tx, func(groups []string) ([]string, bool) {
-		return removeGroupName(groups, groupName)
-	})
+//
+// 授权列表因此被清空的 token 一并禁用：空列表在鉴权语义中表示「不限制」，
+// 静默保留会让受限 token 因删除组而扩权为全部组可用。返回被禁用的 token
+// 名单，由调用方透出给管理员。
+func removeGroupFromTokens(ctx context.Context, tx *sql.Tx, groupName string) ([]string, error) {
+	type pendingToken struct {
+		name    string
+		groups  []string
+		emptied bool
+	}
+	var pending []pendingToken
+	rows, err := tx.QueryContext(ctx, `SELECT name, allowed_groups_json FROM api_tokens`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var name, raw string
+		if err := rows.Scan(&name, &raw); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		updated, changed := removeGroupName(decodeStringSlice(raw), groupName)
+		if changed {
+			pending = append(pending, pendingToken{name: name, groups: updated, emptied: len(updated) == 0})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	now := nowString()
+	disabled := []string{}
+	for _, t := range pending {
+		payload, err := json.Marshal(t.groups)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE api_tokens SET allowed_groups_json = ?, updated_at = ? WHERE name = ?`, string(payload), now, t.name); err != nil {
+			return nil, err
+		}
+		if t.emptied {
+			if _, err := tx.ExecContext(ctx, `UPDATE api_tokens SET enabled = 0, updated_at = ? WHERE name = ?`, now, t.name); err != nil {
+				return nil, err
+			}
+			disabled = append(disabled, t.name)
+		}
+	}
+	return disabled, nil
 }
 
 // removeGroupName 从切片中移除指定组名并保持原有顺序，返回新切片与是否发生变更。
@@ -639,7 +699,10 @@ func saveUsageRecordTx(ctx context.Context, tx *sql.Tx, payload []byte, summary 
 }
 
 func (s *Store) QueryUsageLogs(ctx context.Context, q UsageQuery) (int, []UsageLogItem, error) {
-	total, err := s.usageCount(ctx, q)
+	// logs 的 total 必须与 items 同口径(raw 行):rollup 计数包含已被 retention
+	// 清理的历史行,分页数会永久大于实际可翻页数(筛选旧窗口时 total>0 页空)。
+	// stats/trend 等聚合端点维持 rollup 口径不变。
+	total, err := usageCountRaw(ctx, s.db, q)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1264,7 +1327,7 @@ func (s *Store) DeleteUsageAssetRefs(ctx context.Context, requestIDs []string) (
 	}
 	var orphans []string
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		for start := 0; start < len(requestIDs); start += 500 {
+		for start := 0; start < len(requestIDs); start += retentionDeleteBatchLimit {
 			end := start + 500
 			if end > len(requestIDs) {
 				end = len(requestIDs)
@@ -1517,32 +1580,6 @@ func (s *Store) UsageDBPageStats(ctx context.Context) (UsageDBStats, error) {
 	return st, err
 }
 
-// UsageRecordIDsExist 批量判断 request_id 是否仍存在于日志表（孤儿资产清扫用）。
-func (s *Store) UsageRecordIDsExist(ctx context.Context, ids []string) (map[string]bool, error) {
-	result := make(map[string]bool, len(ids))
-	if len(ids) == 0 {
-		return result, nil
-	}
-	where := usageInClause("request_id", len(ids))
-	args := make([]interface{}, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT request_id FROM usage_records WHERE `+where, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		result[id] = true
-	}
-	return result, rows.Err()
-}
 
 // VacuumUsageDB 执行 VACUUM 回收空闲页并截断 WAL。需要短暂独占写锁、
 // 约双倍磁盘空间，调用方必须自行限频（见 usageRetention.maybeVacuum）。
@@ -1555,7 +1592,7 @@ func (s *Store) VacuumUsageDB(ctx context.Context) error {
 }
 
 func (s *Store) UsageTotals(ctx context.Context, q UsageQuery) (map[string]any, error) {
-	acc, err := s.usageTotalsAcc(ctx, q)
+	acc, err := s.computeUsageTotals(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -1604,7 +1641,8 @@ func (s *Store) UsageTotals(ctx context.Context, q UsageQuery) (map[string]any, 
 // usageTotalsAcc 计算 totals 的通用 accumulator：rollup 就绪时中段走预聚合
 // 表（单行聚合）、两侧边缘小时走 raw 单行聚合，在一个读事务内精确合并；
 // 否则整体 raw（阶段一的覆盖索引单行聚合路径）。
-func (s *Store) usageTotalsAcc(ctx context.Context, q UsageQuery) (*usageTotalsAcc, error) {
+// computeUsageTotals 在同读事务内聚合 totals(方法名曾与返回类型同名遮蔽)。
+func (s *Store) computeUsageTotals(ctx context.Context, q UsageQuery) (*usageTotalsAcc, error) {
 	acc := &usageTotalsAcc{}
 	fromHour, toHour, ok := s.rollupSplit(q, true)
 	if !ok {

@@ -6,6 +6,14 @@ import type {
   UsagePulseResult,
   UsageModelDailyPoint,
   ApiToken,
+  CustomProtocolAssistDocument,
+  CustomProtocolAssistResult,
+  CustomProtocolConfig,
+  CustomProtocolPreviewResult,
+  CustomProtocolSchema,
+  CustomProtocolSummary,
+  CustomProtocolTestResult,
+  CustomProtocolModelsTestResult,
   Health,
   Model,
   ModelGroup,
@@ -15,7 +23,6 @@ import type {
   RuntimeConfigUpdateResult,
   SystemLogsResult,
   UsageLogDetail,
-  UsageLogItem,
   UsageLogsResult,
   UsageQueryParams,
   UsageStats,
@@ -31,6 +38,12 @@ export class ApiError extends Error {
     this.code = code
     this.status = status
   }
+}
+
+/** 会话失效统一出口：清除本地令牌并抛 unauthorized（页面层订阅后踢回登录页）。 */
+function throwUnauthorized(): never {
+  clearToken()
+  throw new ApiError('unauthorized', '认证已失效，请重新登录', 401)
 }
 
 const ADMIN_BASE = '/api/admin'
@@ -79,12 +92,13 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       signal: options.signal,
     })
   } catch (err) {
+    // SWR 等调用方中止请求属正常取消，原样上抛，避免被当成网络错误落进错误态。
+    if (err instanceof DOMException && err.name === 'AbortError') throw err
     throw new ApiError('network_error', (err as Error).message || '网络请求失败', 0)
   }
 
   if (response.status === 401) {
-    clearToken()
-    throw new ApiError('unauthorized', '认证已失效，请重新登录', 401)
+    throwUnauthorized()
   }
 
   let payload: ApiResult<T> | { error?: string } | null = null
@@ -113,12 +127,27 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   return payload as T
 }
 
-/** 用 panel token 校验登录：命中受保护端点即视为有效。 */
-export async function verifyToken(token: string): Promise<boolean> {
-  const response = await fetch(`${ADMIN_BASE}/health`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  return response.ok
+/** 用 panel token 校验登录：命中受保护端点即视为有效。
+ * 失败时抛 ApiError 并区分令牌无效与服务异常，由登录页分流展示文案。 */
+export async function verifyToken(token: string): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch(`${ADMIN_BASE}/health`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'TimeoutError') {
+      throw new ApiError('timeout', '连接后端超时，请检查网络与服务状态', 0)
+    }
+    throw new ApiError('network_error', '无法连接到后端，请检查网络与服务状态', 0)
+  }
+  if (response.status === 401) {
+    throw new ApiError('unauthorized', 'Token 无效，请确认与后端 config.json 中的 panelAccessToken 一致', 401)
+  }
+  if (!response.ok) {
+    throw new ApiError('http_error', `后端服务异常（HTTP ${response.status}），请检查服务状态后重试`, response.status)
+  }
 }
 
 interface ListEnvelope<T> {
@@ -133,7 +162,7 @@ export const api = {
     request<RuntimeConfigUpdateResult>('/runtime-config', { method: 'PUT', body }),
   reload: () => request<unknown>('/reload', { method: 'POST' }),
 
-  listSources: () => request<ListEnvelope<ModelSource>>('/model-sources').then((r) => r.items ?? []),
+  listSources: () => request<ListEnvelope<ModelSource>>('/model-sources').then((r) => r.items),
   createSource: (body: ModelSource) => request<ModelSource>('/model-sources', { method: 'POST', body }),
   updateSource: (id: string, body: ModelSource) =>
     request<ModelSource>(`/model-sources/${encodeURIComponent(id)}`, { method: 'PUT', body }),
@@ -182,7 +211,7 @@ export const api = {
   listModels: (params?: { sourceId?: string; search?: string }) =>
     request<ListEnvelope<Model>>('/models', {
       query: params && { sourceId: params.sourceId, search: params.search },
-    }).then((r) => r.items ?? []),
+    }).then((r) => r.items),
   /** 为所有启用源发起后台拉取：立即返回启动数量，进度见各源 refreshState。 */
   refreshModels: () =>
     request<{ started: number; total: number }>('/models/refresh', { method: 'POST' }),
@@ -198,10 +227,7 @@ export const api = {
       method: 'DELETE',
     }),
 
-  listGroups: () =>
-    request<ListEnvelope<ModelGroup>>('/model-groups').then((r) =>
-      (r.items ?? []).map((group) => ({ ...group, models: group.models ?? [] })),
-    ),
+  listGroups: () => request<ListEnvelope<ModelGroup>>('/model-groups').then((r) => r.items),
   createGroup: (body: ModelGroup) => request<ModelGroup>('/model-groups', { method: 'POST', body }),
   updateGroup: (id: string, body: ModelGroup) =>
     request<ModelGroup>(`/model-groups/${encodeURIComponent(id)}`, { method: 'PUT', body }),
@@ -265,6 +291,10 @@ export const api = {
       buildUrl(`/usage/assets/${encodeURIComponent(requestId)}/${encodeURIComponent(file)}`),
       { headers },
     )
+    // 与 request() 保持一致：会话失效时踢回登录页，而非仅报媒体获取失败。
+    if (response.status === 401) {
+      throwUnauthorized()
+    }
     if (!response.ok) {
       throw new ApiError('asset_fetch_failed', `媒体文件获取失败（${response.status}）`, response.status)
     }
@@ -273,6 +303,51 @@ export const api = {
 
   systemLogs: (params: { limit?: number; offset?: number; level?: string }) =>
     request<SystemLogsResult>('/logs', { query: params }),
+
+  // ---- 协议设计器 ----
+  listCustomProtocols: () =>
+    request<ListEnvelope<CustomProtocolSummary>>('/custom-protocols').then((r) => r.items ?? []),
+  /** 字段目录与约束（UI 下拉与校验共用）。 */
+  customProtocolSchema: () => request<CustomProtocolSchema>('/custom-protocols/schema'),
+  upsertCustomProtocol: (protocol: CustomProtocolConfig) =>
+    request<{ saved: boolean; id: string; synced: boolean; warning?: string }>(
+      `/custom-protocols/${encodeURIComponent(protocol.id)}`,
+      { method: 'PUT', body: protocol },
+    ),
+  deleteCustomProtocol: (id: string) =>
+    request<{ deleted: boolean; synced: boolean }>(`/custom-protocols/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  /** 用样例 Maheshvara 请求渲染协议，预览真实发送形态（凭证打码）。 */
+  previewCustomProtocol: (body: { protocol: CustomProtocolConfig; sampleRequest?: unknown }, options?: { signal?: AbortSignal }) =>
+    request<CustomProtocolPreviewResult>('/custom-protocols/preview', { method: 'POST', body, signal: options?.signal }),
+  /** 向所选模型源或临时凭据（baseUrl+apiKey 直连）真实发送渲染后的请求。 */
+  testCustomProtocol: (body: {
+    protocol: CustomProtocolConfig
+    sourceId?: string
+    model: string
+    baseUrl?: string
+    apiKey?: string
+    stream?: boolean
+    sampleRequest?: unknown
+  }) => request<CustomProtocolTestResult>('/custom-protocols/test', { method: 'POST', body }),
+  /** 按协议 models 发现配置试拉模型列表（临时凭据，不落库）。 */
+  testCustomProtocolModels: (body: {
+    protocol: CustomProtocolConfig
+    baseUrl: string
+    apiKey?: string
+  }) => request<CustomProtocolModelsTestResult>('/custom-protocols/test-models', { method: 'POST', body }),
+  /** AI harness：读取文档/图片/文本生成草稿，服务端校验+自动修复+离线验证。 */
+  assistCustomProtocol: (body: {
+    sourceId: string
+    model: string
+    protocolType?: string
+    message?: string
+    documents?: CustomProtocolAssistDocument[]
+    currentConfig?: unknown
+    exampleResponse?: unknown
+    maxRepairRounds?: number
+  }) => request<CustomProtocolAssistResult>('/custom-protocols/assist', { method: 'POST', body }),
 }
 
 function serializeUsage(params: UsageQueryParams): Record<string, QueryValue> {
@@ -286,7 +361,7 @@ function serializeUsage(params: UsageQueryParams): Record<string, QueryValue> {
     groupName: params.groupName,
     modelName: params.modelName,
     status: params.status,
-    statusCode: params.statusCode || undefined,
+    statusCode: params.statusCode !== undefined ? params.statusCode : undefined,
     // 多选数组按重复参数发送（keyName/groupName/modelName），后端用 QueryArray 读取。
     ...(params.keyNames?.length ? { keyName: params.keyNames } : {}),
     ...(params.groupNames?.length ? { groupName: params.groupNames } : {}),
@@ -295,4 +370,3 @@ function serializeUsage(params: UsageQueryParams): Record<string, QueryValue> {
   }
 }
 
-export type { UsageLogItem }

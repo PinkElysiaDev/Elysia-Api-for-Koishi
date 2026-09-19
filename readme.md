@@ -58,14 +58,16 @@ elysia-api/
 
 - **模型组与负载均衡**：把模型组织成自定义组，支持轮询 / 顺序 / 随机策略，支持模型组级权限。
 - **多格式互转**：以 Maheshvara Request / Response / Usage 为中间表示，在 OpenAI Chat Completions、OpenAI Responses、Claude Messages、Gemini GenerateContent 之间自动转换。
+- **协议引擎数据化**：自定义协议全面可配置（Match 条件原语、键名别名、异构帧 / 分帧工具拼装、条件字段与双路径）；OpenAI / Claude / Gemini / Responses 四大协议预置入库，可编辑、可复制为定制基底；`config.json` 的 customProtocols 启动时自动迁移至 SQLite。
+- **协议设计器**：WebUI 内置 `/protocols` 页面——结构化编辑请求 / 响应映射、渲染预览、临时凭据真实测试、模型发现试拉；支持 AI 生成协议（上传文档 / 截图 / PDF，服务端闭环校验与自动修复）。
 - **Responses API**：`/v1/responses` 可原生转发，也可经 Maheshvara 中间层转换到 Chat / Claude / Gemini 上游。
-- **流式响应**：完整支持流式输出，并支持 Chat / Claude / Gemini 流转换为 Responses SSE 事件。
+- **流式响应**：完整支持流式输出，并支持 Chat / Claude / Gemini 流转换为 Responses SSE 事件；流式终止判定可配置，尾帧 / 复合帧用量不丢失。
 - **同源直发透传**：Claude / Gemini / Chat 同源请求可零损耗透传，避免不必要的格式往返。
 - **Token 计费**：跟踪缓存命中、推理 token、多模态 token、内置工具调用等用量明细。
 - **日志留存治理**：按保留天数 / 磁盘占用 / 条数上限自动清理调用日志，支持单条 body 截断、仅失败请求存正文。
 - **媒体外置去重**：日志中的 base64 图片 / 音频外置为内容寻址文件，相同媒体跨请求只存一份，WebUI 提供黑底全屏查看器（缩放 / 拖拽 / 缩略图条）。
 - **流量限制**：可选的请求频率控制与并发限制。
-- **安全加固**：密钥加密存储、SSRF 防护、常量时间 token 比较防时序侧信道。
+- **安全加固**：密钥加密存储、SSRF 防护、常量时间 token 比较防时序侧信道；删除唯一授权组自动禁用相关 token 防扩权，query 鉴权密钥不随错误外泄。
 - **运维诊断**：WebUI 内置健康检查、内存指标、pprof 性能分析；后端支持热重载与 daemon 化。
 - **多平台二进制**：内置 Windows / Linux（含 ARM64）与 macOS（Intel / Apple Silicon）六平台后端二进制。
 

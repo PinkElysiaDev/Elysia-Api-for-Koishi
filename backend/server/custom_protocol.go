@@ -14,19 +14,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// syncCustomProtocols 把 SQLite 中的自定义协议装配进 relay 注册表。协议不再
+// 随 config.json 热重载：管理端点每次写入后即时同步。
 func (s *Server) syncCustomProtocols() {
-	rawConfigs := s.config.GetCustomProtocols()
-	configs := make([]relay.CustomProtocolConfig, 0, len(rawConfigs))
-	for index, raw := range rawConfigs {
-		var protocol relay.CustomProtocolConfig
-		if err := json.Unmarshal(raw, &protocol); err != nil {
-			log.Printf("custom protocol config %d is invalid JSON: %v", index, err)
-			return
-		}
-		configs = append(configs, protocol)
-	}
-	if err := relay.ReplaceCustomProtocols(configs); err != nil {
-		log.Printf("custom protocol reload was rejected; keeping the previous registry: %v", err)
+	if err := s.syncCustomProtocolsQuiet(); err != nil {
+		log.Printf("custom protocol registry sync failed; keeping the previous registry: %v", err)
 	}
 }
 
@@ -140,27 +132,20 @@ func (s *Server) handleCustomNormal(
 	startTime time.Time,
 	record *usageRecord,
 	isLast bool,
-	typed bool,
+	inputFormat relay.FormatType,
 	render func(*relay.MaheshvaraResponse) (any, error),
 	renderErrLabel string,
 ) relayOutcome {
-	// fail 在转发失败时决定是提交错误响应（最后一次尝试或不可重试），
-	// 还是返回 committed=false 让上层故障转移到下一个候选模型。
+	// fail 与其他 handler 的 failResult 同语义,经 relayFailOutcome 统一
+	//(retryable 显式传入:自定义协议按业务错误分类决定可否重试)。
 	fail := func(status int, message string, body []byte, retryable bool) relayOutcome {
-		if retryable && !isLast {
-			return relayOutcome{committed: false, statusCode: status, errMsg: message}
-		}
-		record.StatusCode = status
-		record.Error = message
-		record.ErrorKind = ErrorKindUpstream
-		if body != nil {
-			c.Data(status, contentTypeJSON, body)
-		} else if typed {
-			c.JSON(status, gin.H{"error": gin.H{"message": message, "type": "api_error"}})
-		} else {
-			c.JSON(status, gin.H{"error": message})
-		}
-		return relayOutcome{committed: true, statusCode: status, errMsg: message}
+		return relayFailOutcome(record, isLast, retryable, status, message, func() {
+			if body != nil {
+				writeUpstreamError(c, inputFormat, targetPlatform, status, body, contentTypeJSON)
+				return
+			}
+			writeProtocolError(c, inputFormat, &relay.MaheshvaraError{Class: relay.ErrorClassUpstream, Status: status, Message: message})
+		})
 	}
 	// 仅在 committed 时记录 usage；未提交（将要重试）时不记录，
 	// 由最终成功/失败的那次尝试统一记录。
@@ -188,7 +173,7 @@ func (s *Server) handleCustomNormal(
 		return result
 	}
 	defer response.Body.Close()
-	body, readErr := io.ReadAll(response.Body)
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, relay.MaxUpstreamBodyBytes))
 	record.ProviderResponse = record.sanitizeBody(body)
 	if readErr != nil {
 		result = fail(http.StatusBadGateway, fmt.Sprintf("failed to read custom protocol response: %v", readErr), nil, true)
@@ -198,17 +183,31 @@ func (s *Server) handleCustomNormal(
 		result = fail(response.StatusCode, string(body), body, shouldRetryStatus(response.StatusCode))
 		return result
 	}
-	maheshvaraResponse, err := relay.CustomProtocolResponseToMaheshvara(body, protocol)
+	maheshvaraResponse, err := relay.CustomProtocolResponseToMaheshvaraRegistered(body, protocol)
 	if err != nil {
 		result = fail(http.StatusBadGateway, fmt.Sprintf("failed to parse custom protocol response: %v", err), nil, false)
+		return result
+	}
+	// HTTP 200 携带业务错误（ErrorPath 显式映射）时不得包装成空答案的成功
+	// 响应：按上游错误渲染协议化错误并落失败记录。原始错误对象原样透传，
+	// 不重试——业务语义错误重试无益。
+	if maheshvaraResponse.Error != nil {
+		status := maheshvaraResponse.Error.Class.HTTPStatus()
+		message := maheshvaraResponse.Error.Message
+		if message == "" {
+			message = "custom protocol upstream returned an error"
+		}
+		if raw, marshalErr := json.Marshal(maheshvaraResponse.Error.Raw); marshalErr == nil && len(maheshvaraResponse.Error.Raw) > 0 {
+			result = fail(status, message, raw, false)
+			return result
+		}
+		result = fail(status, message, nil, false)
 		return result
 	}
 	if maheshvaraResponse.Model == "" {
 		maheshvaraResponse.Model = selectedModel.Name
 	}
-	updateRecordUsageFromMaheshvara(record, maheshvaraResponse.Usage)
-	applyLocalResponseEstimate(record, extractOutputTextFromMaheshvaraResponse(maheshvaraResponse), s.config.GetUsageConfig())
-	s.adjustTokenUsage(group.ID, getInt(record.Usage.TotalTokens))
+	s.settleMaheshvaraUsage(group, record, startTime, maheshvaraResponse)
 	output, err := render(maheshvaraResponse)
 	if err != nil {
 		result = fail(http.StatusInternalServerError, fmt.Sprintf("failed to render %s: %v", renderErrLabel, err), nil, false)
@@ -221,7 +220,7 @@ func (s *Server) handleCustomNormal(
 }
 
 func (s *Server) handleCustomNormalRequest(c *gin.Context, group *config.ModelGroupConfig, selectedModel config.ModelRef, request *relay.CustomProtocolRequestResult, targetPlatform relay.Platform, inputFormat relay.FormatType, startTime time.Time, record *usageRecord, isLast bool) relayOutcome {
-	return s.handleCustomNormal(c, group, selectedModel, request, targetPlatform, startTime, record, isLast, false,
+	return s.handleCustomNormal(c, group, selectedModel, request, targetPlatform, startTime, record, isLast, inputFormat,
 		func(resp *relay.MaheshvaraResponse) (any, error) {
 			return renderMaheshvaraChatResponse(resp, inputFormat)
 		},
@@ -229,7 +228,7 @@ func (s *Server) handleCustomNormalRequest(c *gin.Context, group *config.ModelGr
 }
 
 func (s *Server) handleCustomResponsesNormal(c *gin.Context, group *config.ModelGroupConfig, selectedModel config.ModelRef, request *relay.CustomProtocolRequestResult, targetPlatform relay.Platform, startTime time.Time, record *usageRecord, isLast bool) relayOutcome {
-	return s.handleCustomNormal(c, group, selectedModel, request, targetPlatform, startTime, record, isLast, true,
+	return s.handleCustomNormal(c, group, selectedModel, request, targetPlatform, startTime, record, isLast, relay.FormatResponses,
 		func(resp *relay.MaheshvaraResponse) (any, error) {
 			return relay.MaheshvaraToOpenAIResponsesResponse(resp)
 		},

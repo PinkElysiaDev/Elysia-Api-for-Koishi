@@ -366,7 +366,7 @@ func usageResultFromOpenAICompatiblePayload(payload map[string]interface{}, sour
 	if raw, ok := payload["usage"].(map[string]interface{}); ok {
 		result = usageResultFromOpenAIUsage(raw, source)
 	}
-	cacheHitTokens := getInt(result.Usage.CacheHitTokens)
+	cacheHitTokens := derefInt(result.Usage.CacheHitTokens)
 	cacheFieldSeen := result.Usage.CacheHitTokens != nil
 	if choices, ok := payload["choices"].([]interface{}); ok {
 		for _, choice := range choices {
@@ -509,9 +509,9 @@ func addGeminiTokenDetails(raw map[string]interface{}, key string, textTokens **
 	if !ok {
 		return
 	}
-	textTotal := getInt(*textTokens)
-	imageTotal := getInt(*imageTokens)
-	audioTotal := getInt(*audioTokens)
+	textTotal := derefInt(*textTokens)
+	imageTotal := derefInt(*imageTokens)
+	audioTotal := derefInt(*audioTokens)
 	seenText := *textTokens != nil
 	seenImage := *imageTokens != nil
 	seenAudio := *audioTokens != nil
@@ -655,12 +655,13 @@ func mergeUsage(existing usageTokenUsage, next usageTokenUsage) usageTokenUsage 
 		existing.Estimated = true
 	}
 	if existing.TotalTokens == nil && existing.InputTokens != nil && existing.OutputTokens != nil {
-		existing.TotalTokens = intPtr(getInt(existing.InputTokens) + getInt(existing.OutputTokens))
+		existing.TotalTokens = intPtr(derefInt(existing.InputTokens) + derefInt(existing.OutputTokens))
 	}
 	return existing
 }
 
-func getInt(v *int) int {
+// derefInt 解引用可空 int,零值兜底——usage 记录的数值字段全为指针。 */
+func derefInt(v *int) int {
 	if v == nil {
 		return 0
 	}
@@ -826,15 +827,24 @@ func (w *observingStreamWriter) observe(data []byte) {
 	w.lines.feed(data, w.observeLine)
 }
 
-func (w *observingStreamWriter) observeLine(line string) {
-	if !strings.HasPrefix(line, "data:") {
-		return
+// sseDataPayload 解析 SSE 的 data: 行:返回净载荷;空行/[DONE]/非 data 行
+// 返回 ok=false。容忍行首空白(外置资产扫描与流观察共用)。
+func sseDataPayload(line string) (string, bool) {
+	trimmed := strings.TrimLeft(line, " ")
+	if !strings.HasPrefix(trimmed, "data:") {
+		return "", false
 	}
-	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 	if payload == "" || payload == "[DONE]" {
-		return
+		return "", false
 	}
-	w.responseText.WriteString(extractOutputTextFromStreamPayload(payload))
+	return payload, true
+}
+
+func (w *observingStreamWriter) observeLine(line string) {
+	if payload, ok := sseDataPayload(line); ok {
+		w.responseText.WriteString(extractOutputTextFromStreamPayload(payload))
+	}
 }
 
 // sseLineSplitter 缓冲跨 Read/Write 到达的字节，按完整行回调 onLine。
@@ -912,16 +922,11 @@ func (b *upstreamUsageObservingBody) observe(data []byte) {
 
 // observeLine 是 ProviderResponse 流事件与 usage 增量的唯一来源（上游线格式）。
 func (b *upstreamUsageObservingBody) observeLine(line string) {
-	if !strings.HasPrefix(line, "data:") {
-		return
+	if payload, ok := sseDataPayload(line); ok {
+		b.record.appendStreamEvent(payload)
+		result := extractProviderUsageFromStreamEvent(b.platform, b.format, payload)
+		applyProviderUsageToRecord(b.record, result)
 	}
-	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-	if payload == "" || payload == "[DONE]" {
-		return
-	}
-	b.record.appendStreamEvent(payload)
-	result := extractProviderUsageFromStreamEvent(b.platform, b.format, payload)
-	applyProviderUsageToRecord(b.record, result)
 }
 
 // detailFromTokenUsage 把顶层 token 计数镜像为明细字段（三个平台解析器的
@@ -929,16 +934,16 @@ func (b *upstreamUsageObservingBody) observeLine(line string) {
 func detailFromTokenUsage(usage usageTokenUsage) usageDetail {
 	detail := usageDetail{}
 	if usage.InputTokens != nil {
-		detail.InputTokens = intPtr(getInt(usage.InputTokens))
+		detail.InputTokens = intPtr(derefInt(usage.InputTokens))
 	}
 	if usage.OutputTokens != nil {
-		detail.OutputTokens = intPtr(getInt(usage.OutputTokens))
+		detail.OutputTokens = intPtr(derefInt(usage.OutputTokens))
 	}
 	if usage.TotalTokens != nil {
-		detail.TotalTokens = intPtr(getInt(usage.TotalTokens))
+		detail.TotalTokens = intPtr(derefInt(usage.TotalTokens))
 	}
 	if usage.CacheHitTokens != nil {
-		detail.CachedInputTokens = intPtr(getInt(usage.CacheHitTokens))
+		detail.CachedInputTokens = intPtr(derefInt(usage.CacheHitTokens))
 	}
 	return detail
 }
@@ -988,7 +993,7 @@ func usageFromOpenAIUsage(raw map[string]interface{}) usageTokenUsage {
 		usage.CacheHitTokens = intPtr(cacheHitTokens)
 	}
 	if usage.TotalTokens == nil && usage.InputTokens != nil && usage.OutputTokens != nil {
-		usage.TotalTokens = intPtr(getInt(usage.InputTokens) + getInt(usage.OutputTokens))
+		usage.TotalTokens = intPtr(derefInt(usage.InputTokens) + derefInt(usage.OutputTokens))
 	}
 	return usage
 }
@@ -1030,7 +1035,7 @@ func usageFromGeminiUsageMetadata(raw map[string]interface{}) usageTokenUsage {
 		usage.CacheHitTokens = intPtr(int(numberFromUsageMap(raw, "cachedContentTokenCount")))
 	}
 	if usage.TotalTokens == nil && usage.InputTokens != nil && usage.OutputTokens != nil {
-		usage.TotalTokens = intPtr(getInt(usage.InputTokens) + getInt(usage.OutputTokens))
+		usage.TotalTokens = intPtr(derefInt(usage.InputTokens) + derefInt(usage.OutputTokens))
 	}
 	return usage
 }
@@ -1068,7 +1073,7 @@ func usageFromClaudeUsage(raw map[string]interface{}) usageTokenUsage {
 		usage.OutputTokens = intPtr(int(numberFromUsageMap(raw, "output_tokens")))
 	}
 	if usage.InputTokens != nil && usage.OutputTokens != nil {
-		usage.TotalTokens = intPtr(getInt(usage.InputTokens) + getInt(usage.OutputTokens))
+		usage.TotalTokens = intPtr(derefInt(usage.InputTokens) + derefInt(usage.OutputTokens))
 	}
 	return usage
 }
@@ -1083,11 +1088,11 @@ func applyLocalResponseEstimate(record *usageRecord, responseText string, cfg co
 	}
 	record.Usage.OutputTokens = intPtr(outputTokens)
 	if record.Usage.TotalTokens == nil {
-		record.Usage.TotalTokens = intPtr(getInt(record.Usage.InputTokens) + outputTokens)
+		record.Usage.TotalTokens = intPtr(derefInt(record.Usage.InputTokens) + outputTokens)
 	}
 	record.Usage.Estimated = true
 	if record.Usage.EstimatedTokens == 0 {
-		record.Usage.EstimatedTokens = getInt(record.Usage.TotalTokens)
+		record.Usage.EstimatedTokens = derefInt(record.Usage.TotalTokens)
 	}
 	record.UsageDetail = mergeUsageDetail(record.UsageDetail, usageDetail{OutputTokens: intPtr(outputTokens), TotalTokens: record.Usage.TotalTokens, Estimated: true})
 	record.UsageSource = "local_response_estimate"

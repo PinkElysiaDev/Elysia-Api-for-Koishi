@@ -29,18 +29,17 @@ func (s *Server) handleCustomStreamRequest(
 		return result
 	}
 	fail := func(status int, message string, body []byte, retryable bool) relayOutcome {
-		if retryable && !isLast {
-			return relayOutcome{committed: false, statusCode: status, errMsg: message}
+		outcome := relayFailOutcome(record, isLast, retryable, status, message, func() {
+			if body != nil {
+				writeUpstreamError(c, inputFormat, targetPlatform, status, body, contentTypeJSON)
+				return
+			}
+			writeProtocolError(c, inputFormat, &relay.MaheshvaraError{Class: relay.ErrorClassUpstream, Status: status, Message: message})
+		})
+		if outcome.committed {
+			return finish(outcome)
 		}
-		record.StatusCode = status
-		record.Error = message
-		record.ErrorKind = ErrorKindUpstream
-		if body != nil {
-			c.Data(status, contentTypeJSON, body)
-		} else {
-			c.JSON(status, gin.H{"error": message})
-		}
-		return finish(relayOutcome{committed: true, statusCode: status, errMsg: message})
+		return outcome
 	}
 
 	if request == nil {
@@ -50,7 +49,7 @@ func (s *Server) handleCustomStreamRequest(
 	if !ok {
 		return fail(http.StatusInternalServerError, fmt.Sprintf("custom protocol %q is not registered", relay.CustomProtocolID(targetPlatform)), nil, false)
 	}
-	decoder, err := relay.NewCustomProtocolStreamDecoder(protocol)
+	decoder, err := relay.NewRegisteredCustomProtocolStreamDecoder(protocol)
 	if err != nil {
 		return fail(http.StatusInternalServerError, fmt.Sprintf("custom protocol stream config is invalid: %v", err), nil, false)
 	}
@@ -68,10 +67,7 @@ func (s *Server) handleCustomStreamRequest(
 	if !ok {
 		return fail(http.StatusInternalServerError, "streaming is not supported", nil, false)
 	}
-	c.Writer.Header().Set("Content-Type", "text/event-stream")
-	c.Writer.Header().Set("Cache-Control", "no-cache")
-	c.Writer.Header().Set("Connection", "keep-alive")
-	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	writeSSEHeaders(c.Writer)
 
 	writer := &observingStreamWriter{
 		inner:     &ginStreamWriter{writer: c.Writer, flusher: flusher},
@@ -85,55 +81,48 @@ func (s *Server) handleCustomStreamRequest(
 	renderer := relay.NewMaheshvaraStreamRenderer(inputFormat, writer, selectedModel.Name)
 	reader := relay.NewSSEEventReader(response.Body)
 	defer reader.Close()
-	var streamErr error
 	var terminalEvents []relay.MaheshvaraStreamEvent
-	for {
-		wireEvent, hasMore, readErr := reader.Read(c.Request.Context(), relay.DefaultSSEIdleTimeout)
-		if readErr != nil {
-			streamErr = readErr
-			break
-		}
-		if !hasMore {
-			break
-		}
-		events, done, decodeErr := decoder.Decode(wireEvent)
-		if decodeErr != nil {
-			streamErr = decodeErr
-			break
-		}
+	streamErr := decoder.ForEachBatch(c.Request.Context(), reader, func(_ relay.SSEEvent, events []relay.MaheshvaraStreamEvent, terminalBeforeBatch bool) error {
 		for index := range events {
 			event := events[index]
 			if event.Usage != nil {
 				updateRecordUsageFromMaheshvara(record, event.Usage)
 			}
-			if event.Error != nil || event.Type == relay.MaheshvaraEventResponseFailed {
-				message := "custom protocol stream failed"
-				if event.Error != nil && event.Error.Message != "" {
-					message = event.Error.Message
+			if event.Error != nil {
+				return event.Error
+			}
+			if event.Type == relay.MaheshvaraEventResponseFailed {
+				return fmt.Errorf("custom protocol stream failed")
+			}
+			if terminalBeforeBatch {
+				// 终态后尾帧：usage 结算入记录并渲染（客户端最终用量以此
+				// 为准），其余增量/重复完成帧视为完成后的杂帧丢弃。
+				if event.Usage != nil {
+					if renderErr := renderer.Write(&event); renderErr != nil {
+						return renderErr
+					}
 				}
-				streamErr = fmt.Errorf("%s", message)
-				break
+				continue
 			}
 			if event.Type == relay.MaheshvaraEventResponseCompleted {
 				terminalEvents = append(terminalEvents, event)
 				continue
 			}
 			if renderErr := renderer.Write(&event); renderErr != nil {
-				streamErr = renderErr
-				break
+				return renderErr
 			}
 		}
-		if streamErr != nil || done {
-			break
-		}
-	}
+		return nil
+	})
 	if streamErr == nil {
-		// 终态校验按严重度排序：无终态 > 有终态但无可呈现输出。
+		// 终态校验按严重度排序：无终态 > 有终态但无可呈现输出。后者仅当
+		// 从未见过 finish reason 时报错——finish_reason 有值的空补全
+		// （内容过滤等）与内置路径一致放行，只有 [DONE] 兜底的空流才是异常。
 		switch {
 		case !decoder.TerminalReceived():
 			streamErr = fmt.Errorf("custom protocol stream ended before a configured terminal value or finish reason")
-		case !decoder.SawOutput():
-			streamErr = fmt.Errorf("custom protocol stream completed without representable output")
+		case !decoder.SawOutput() && !decoder.SawFinishReason():
+			streamErr = fmt.Errorf("custom protocol stream completed without representable output: no text, reasoning, or tool call was mapped from any stream event — check the stream mapping paths against upstream frames (the designer test tab shows raw events vs decoded)")
 		}
 	}
 	if streamErr == nil {
@@ -150,11 +139,11 @@ func (s *Server) handleCustomStreamRequest(
 		_ = renderer.Abort(streamErr)
 	}
 
-	applyLocalResponseEstimate(record, writer.responseText.String(), s.config.GetUsageConfig())
-	s.adjustTokenUsage(group.ID, getInt(record.Usage.TotalTokens))
+	s.settleStreamUsage(group, record, startTime)
 	record.StatusCode = http.StatusOK
 	if streamErr != nil {
 		record.StatusCode = http.StatusBadGateway
+		record.ErrorKind = ErrorKindUpstream
 		record.Error = streamErr.Error()
 	}
 	return finish(relayOutcome{committed: true, statusCode: record.StatusCode, errMsg: record.Error})

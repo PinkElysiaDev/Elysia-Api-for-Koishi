@@ -21,10 +21,18 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useToast } from '@/components/ui/use-toast'
+import { customPlatformValue, customProtocolID, isCustomPlatform } from '@/lib/protocol'
 import { api } from '@/lib/api'
 import { revalidate } from '@/lib/hooks'
 import { cn } from '@/lib/utils'
-import type { ManualModel, ModelSource, Platform, SourceAPIKey, SourceKeyStrategy } from '@/lib/types'
+import type {
+  CustomProtocolSummary,
+  ManualModel,
+  ModelSource,
+  Platform,
+  SourceAPIKey,
+  SourceKeyStrategy,
+} from '@/lib/types'
 
 // 按「线路 API 协议」命名，取代旧的厂商混称（openai/openai-compatible/claude/gemini）。
 // 选择 Responses API 表示上游端点类型；默认仍经过 Maheshvara，显式 relay.passthrough
@@ -34,7 +42,6 @@ const PLATFORMS: { value: string; label: string; hint: string }[] = [
   { value: 'chat_completions', label: 'Chat Completions API', hint: 'OpenAI 兼容协议，最通用' },
   { value: 'anthropic', label: 'Anthropic API', hint: 'Claude /v1/messages' },
   { value: 'gemini', label: 'Gemini API', hint: 'Gemini /v1beta generateContent' },
-  { value: 'custom', label: '自定义 Maheshvara 协议', hint: '使用 config.json 中注册的 customProtocols 协议 ID' },
 ]
 
 // 把历史 platform 值归一化到新的四个 apiFormat，使旧源在新下拉里正确回显
@@ -58,13 +65,6 @@ function normalizePlatform(raw: string | undefined): Platform {
   }
 }
 
-function isCustomPlatform(platform: string): platform is `custom:${string}` {
-  return platform.toLowerCase().startsWith('custom:')
-}
-
-function customProtocolID(platform: string): string {
-  return isCustomPlatform(platform) ? platform.slice('custom:'.length).trim() : ''
-}
 
 const KEY_STRATEGIES: { value: SourceKeyStrategy; label: string; hint: string }[] = [
   { value: 'round-robin', label: '轮询 Round-robin', hint: '每次请求按顺序轮换 Key' },
@@ -92,6 +92,55 @@ function normalizeKeyStrategy(raw: string | undefined): SourceKeyStrategy {
   return raw === 'random' || raw === 'priority' ? raw : 'round-robin'
 }
 
+/** 手动模式多 key 时,把「模型 ↔ key」选择编译为每个 key 的显式 allowedModels
+ * (无 nil 歧义);单 key 或自动模式保持原值。返回错误文案表示校验未过。 */
+function compileApiKeysPayload(
+  form: ModelSource,
+  manualKeySelection: Record<number, number[]>,
+  autoFetch: boolean,
+): { keys: SourceAPIKey[] } | { error: string } {
+  const initialKeys = form.apiKeys ?? []
+  let payloadKeys = initialKeys.filter((k) => k.value.trim())
+  if (autoFetch || payloadKeys.length <= 1) return { keys: payloadKeys }
+  const allManual = form.manualModels ?? []
+  for (const [index, model] of allManual.entries()) {
+    if (!model.id.trim()) continue
+    if ((manualKeySelection[index] ?? []).length === 0) {
+      return { error: `模型「${model.id}」没有任何可用 Key` }
+    }
+  }
+  // 有效 key 在原数组中的下标（manualKeySelection 记录的是原数组下标）。
+  const keyOriginalIndexes = (form.apiKeys ?? [])
+    .map((k, i) => (k.value.trim() ? i : -1))
+    .filter((i) => i >= 0)
+  payloadKeys = keyOriginalIndexes.map((originalIndex) => ({
+    ...(form.apiKeys ?? [])[originalIndex],
+    allowedModels: allManual
+      .filter((m, i) => m.id.trim() && (manualKeySelection[i] ?? []).includes(originalIndex))
+      .map((m) => m.id.trim()),
+  }))
+  return { keys: payloadKeys }
+}
+
+/** 组装提交后端的源 payload:平台规范化、手动模型裁剪与拉取地址开关联动。 */
+function buildSourcePayload(
+  form: ModelSource,
+  resolved: { protocolID: string; autoFetch: boolean; fetchUrlEnabled: boolean; apiKeys: SourceAPIKey[] },
+): ModelSource {
+  return {
+    ...form,
+    platform: resolved.protocolID
+      ? (customPlatformValue(resolved.protocolID) as ModelSource['platform'])
+      : form.platform,
+    autoFetchModels: resolved.autoFetch,
+    manualModels: resolved.autoFetch ? [] : (form.manualModels ?? []).filter((m) => m.id || m.name),
+    // 关闭「自定义模型拉取地址」时不提交地址（后端空值 = 跟随 baseUrl）。
+    fetchBaseUrl: resolved.fetchUrlEnabled ? form.fetchBaseUrl?.trim() ?? '' : '',
+    // key 始终走列表（配一个 key 即单 key）；空列表 = 无鉴权源。
+    apiKeys: resolved.apiKeys,
+  }
+}
+
 export function SourceFormDialog({
   open,
   onOpenChange,
@@ -106,11 +155,13 @@ export function SourceFormDialog({
   const [form, setForm] = useState<ModelSource>(emptySource())
   const [saving, setSaving] = useState(false)
   // 「自定义模型拉取地址」开关（默认关闭）：关闭 = 拉取走 API 地址。
-  const [customFetchEnabled, setCustomFetchEnabled] = useState(false)
+  const [fetchUrlEnabled, setFetchUrlEnabled] = useState(false)
   // a 方案：展开显示某个 key 拉取到的模型勾选面板（多 key 时）。
   const [expandedKey, setExpandedKey] = useState<number | null>(null)
   // b 方案：手动模式下每个手动模型选中的 key 下标集合（key 数 >1 时）。
   const [manualKeySelection, setManualKeySelection] = useState<Record<number, number[]>>({})
+  // 已注册的自定义协议（协议下拉选择用）；加载失败静默降级为纯手填。
+  const [registeredProtocols, setRegisteredProtocols] = useState<CustomProtocolSummary[]>([])
 
   const keyCount = (form.apiKeys ?? []).filter((k) => k.value.trim()).length
 
@@ -138,7 +189,7 @@ export function SourceFormDialog({
             }
           : emptySource(),
       )
-      setCustomFetchEnabled(!!(source?.fetchBaseUrl ?? '').trim())
+      setFetchUrlEnabled(!!(source?.fetchBaseUrl ?? '').trim())
       // b 方案初始化：手动模式的「模型 ↔ key」选择。任何 key 都有显式
       // allowedModels 时按其还原；否则视为未配置（全部 key 选中）。
       const allKeyIndexes = (source?.apiKeys ?? [])
@@ -259,43 +310,21 @@ export function SourceFormDialog({
       toast.error('请填写自定义协议 ID', '该 ID 必须与 config.json 的 customProtocols[].id 一致')
       return
     }
-    // b 方案：手动模式 + 多 key 时，把「模型 ↔ key」选择编译为每个 key 的显式
-    // allowedModels（无 nil 歧义）；单 key 或自动模式保持原值（自动模式的面板已
-    // 直接编辑 allowedModels）。选择状态下标基于未过滤的原始数组，这里保持一致。
-    let payloadKeys = (form.apiKeys ?? []).filter((k) => k.value.trim())
-    const manualMode = custom || !form.autoFetchModels
-    if (manualMode && payloadKeys.length > 1) {
-      const allManual = form.manualModels ?? []
-      for (const [index, model] of allManual.entries()) {
-        if (!model.id.trim()) continue
-        if ((manualKeySelection[index] ?? []).length === 0) {
-          toast.error('请为每个手动模型至少选择一个 Key', `模型「${model.id}」没有任何可用 Key`)
-          return
-        }
-      }
-      // 有效 key 在原数组中的下标（manualKeySelection 记录的是原数组下标）。
-      const keyOriginalIndexes = (form.apiKeys ?? [])
-        .map((k, i) => (k.value.trim() ? i : -1))
-        .filter((i) => i >= 0)
-      payloadKeys = keyOriginalIndexes.map((originalIndex) => ({
-        ...(form.apiKeys ?? [])[originalIndex],
-        allowedModels: allManual
-          .filter((m, i) => m.id.trim() && (manualKeySelection[i] ?? []).includes(originalIndex))
-          .map((m) => m.id.trim()),
-      }))
+    // 协议未声明模型发现配置时，custom 源强制手动模型（后端保存校验同样拒绝）。
+    const autoFetch = custom && !customDiscovery ? false : form.autoFetchModels
+    const keysResult = compileApiKeysPayload(form, manualKeySelection, autoFetch)
+    if ('error' in keysResult) {
+      toast.error('请为每个手动模型至少选择一个 Key', keysResult.error)
+      return
     }
     setSaving(true)
     try {
-      const payload: ModelSource = {
-        ...form,
-        platform: custom ? (`custom:${protocolID}` as Platform) : form.platform,
-        autoFetchModels: custom ? false : form.autoFetchModels,
-        manualModels: custom || !form.autoFetchModels ? (form.manualModels ?? []).filter((m) => m.id || m.name) : [],
-        // 关闭「自定义模型拉取地址」时不提交地址（后端空值 = 跟随 baseUrl）。
-        fetchBaseUrl: customFetchEnabled ? form.fetchBaseUrl?.trim() ?? '' : '',
-        // key 始终走列表（配一个 key 即单 key）；空列表 = 无鉴权源。
-        apiKeys: payloadKeys,
-      }
+      const payload = buildSourcePayload(form, {
+        protocolID: custom ? protocolID : '',
+        autoFetch,
+        fetchUrlEnabled,
+        apiKeys: keysResult.keys,
+      })
       // 编辑时若 apiKey 留空则不覆盖（作为旧数据的回退冗余字段，后端以 apiKeys 优先）。
       if (isEdit && !payload.apiKey) delete payload.apiKey
       if (isEdit && source) {
@@ -332,8 +361,48 @@ export function SourceFormDialog({
   }
 
   const custom = isCustomPlatform(form.platform)
-  const selectedPlatform = custom ? 'custom' : form.platform
+  // 协议是否声明模型发现配置(models.path):platform → 是否可自动拉取的唯一判据。
+  const hasDiscovery = (platform: string) =>
+    isCustomPlatform(platform)
+      ? !!registeredProtocols.find((item) => item.id === customProtocolID(platform))?.config.models?.path
+      : false
+  const customDiscovery = hasDiscovery(form.platform)
   const selectedStrategy = form.keyStrategy ?? 'round-robin'
+
+  // 弹窗打开即拉取已注册协议：自定义协议直接并入主协议下拉，无需二级选择。
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    api
+      .listCustomProtocols()
+      .then((items) => {
+        if (!cancelled) setRegisteredProtocols(items)
+      })
+      .catch(() => {
+        /* 静默：下拉仅剩内置协议 */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open])
+
+  // 协议选项 = 内置线路 + 已注册自定义协议（value 即 custom:<id>，选中即生效）。
+  const platformOptions: { value: string; label: string; hint: string }[] = [
+    ...PLATFORMS,
+    ...registeredProtocols.map((protocol) => ({
+      value: `custom:${protocol.id}`,
+      label: protocol.name?.trim() || protocol.id,
+      hint: `自定义协议 · ${protocol.id}${protocol.valid ? '' : '（校验失败）'}`,
+    })),
+  ]
+  // 编辑其协议已被删除的源：当前值不在选项中，追加占位项保证回显并提示重选。
+  if (custom && !platformOptions.some((option) => option.value === form.platform)) {
+    platformOptions.push({
+      value: form.platform,
+      label: `自定义协议（未注册）· ${customProtocolID(form.platform)}`,
+      hint: '该协议已不在注册表中，请重新选择协议',
+    })
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -358,20 +427,26 @@ export function SourceFormDialog({
             <div className="space-y-2">
               <Label required>API 协议</Label>
               <Select
-                value={selectedPlatform}
+                value={form.platform}
                 onValueChange={(value) =>
-                  setForm((previous) =>
-                    value === 'custom'
-                      ? { ...previous, platform: 'custom:', autoFetchModels: false }
-                      : { ...previous, platform: value as Platform },
-                  )
+                  setForm((previous) => {
+                    const nextPlatform = value as Platform
+                    // 切到未声明模型发现的自定义协议时关闭自动拉取
+                    //（无标准模型列表端点，后端保存校验同样拒绝）。
+                    const nextDiscovery = hasDiscovery(nextPlatform)
+                    return {
+                      ...previous,
+                      platform: nextPlatform,
+                      ...(isCustomPlatform(nextPlatform) && !nextDiscovery ? { autoFetchModels: false } : {}),
+                    }
+                  })
                 }
               >
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {PLATFORMS.map((p) => (
+                  {platformOptions.map((p) => (
                     <SelectItem key={p.value} value={p.value}>
                       {p.label}
                     </SelectItem>
@@ -379,18 +454,8 @@ export function SourceFormDialog({
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                {PLATFORMS.find((p) => p.value === selectedPlatform)?.hint}
+                {platformOptions.find((p) => p.value === form.platform)?.hint}
               </p>
-              {custom && (
-                <div className="space-y-2 pt-1">
-                  <Label required>自定义协议 ID</Label>
-                  <Input
-                    value={customProtocolID(form.platform)}
-                    placeholder="vendor-json"
-                    onChange={(event) => update('platform', `custom:${event.target.value}` as Platform)}
-                  />
-                </div>
-              )}
             </div>
           </div>
 
@@ -523,17 +588,17 @@ export function SourceFormDialog({
               <label className="flex items-center gap-3">
                 <Switch
                   checked={form.autoFetchModels}
-                  disabled={custom}
+                  disabled={custom && !customDiscovery}
                   onCheckedChange={(v) => update('autoFetchModels', v)}
                 />
                 <span className="text-sm font-medium">自动拉取模型</span>
               </label>
               <label className="flex items-center gap-3">
-                <Switch checked={customFetchEnabled} onCheckedChange={setCustomFetchEnabled} />
+                <Switch checked={fetchUrlEnabled} onCheckedChange={setFetchUrlEnabled} />
                 <span className="text-sm font-medium">自定义模型拉取地址</span>
               </label>
             </div>
-            {customFetchEnabled && (
+            {fetchUrlEnabled && (
               <div className="space-y-2">
                 <Label required>模型拉取 Base URL</Label>
                 <Input
@@ -542,8 +607,8 @@ export function SourceFormDialog({
                   onChange={(e) => update('fetchBaseUrl', e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
-                  仅用于拉取模型列表，请求转发仍走上方 API 地址；按所选协议的约定拼接路径（OpenAI 系补
-                  /models、Claude 补 /v1/models、Gemini 补 /v1beta/models），无需单独配置协议。
+                  仅用于拉取模型列表，请求转发仍走上方 API 地址；内置协议按约定拼接路径（OpenAI 系补
+                  /models、Claude 补 /v1/models、Gemini 补 /v1beta/models），自定义协议按协议「模型拉取」页签声明的路径拼接。
                 </p>
               </div>
             )}

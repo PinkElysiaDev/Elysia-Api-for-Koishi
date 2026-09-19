@@ -1,88 +1,21 @@
 package relay
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 )
 
-var protectedCustomHeaders = map[string]struct{}{
-	"authorization":       {},
-	"x-api-key":           {},
-	"x-goog-api-key":      {},
-	"host":                {},
-	"content-length":      {},
-	"transfer-encoding":   {},
-	"connection":          {},
-	"proxy-authorization": {},
-}
-
-func isValidCustomHeaderName(name string) bool {
-	if strings.TrimSpace(name) == "" {
-		return false
-	}
-	for _, char := range name {
-		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') {
-			continue
-		}
-		switch char {
-		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func isProtectedCustomHeader(name string) bool {
-	_, ok := protectedCustomHeaders[strings.ToLower(strings.TrimSpace(name))]
-	return ok
-}
-
-func validateCustomAuth(auth CustomProtocolAuth) error {
-	mode := strings.ToLower(strings.TrimSpace(auth.Mode))
-	if mode == "" {
-		mode = "bearer"
-	}
-	switch mode {
-	case "bearer", "none":
-		return nil
-	case "header":
-		header := firstNonEmptyString(strings.TrimSpace(auth.Header), "x-api-key")
-		if !isValidCustomHeaderName(header) || isUnsafeCustomAuthHeader(header) {
-			return fmt.Errorf("header auth requires a valid end-to-end header name")
-		}
-		if strings.ContainsAny(auth.Prefix, "\r\n") {
-			return fmt.Errorf("auth prefix contains a line break")
-		}
-		return nil
-	case "query":
-		if strings.TrimSpace(auth.Query) == "" {
-			return fmt.Errorf("query auth requires query")
-		}
-		if strings.ContainsAny(auth.Query, "\r\n") {
-			return fmt.Errorf("auth query contains a line break")
-		}
-		return nil
-	default:
-		return fmt.Errorf("unsupported auth mode %q", auth.Mode)
-	}
-}
-
-func isUnsafeCustomAuthHeader(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "host", "content-length", "transfer-encoding", "connection", "proxy-authorization":
-		return true
-	default:
-		return false
-	}
-}
-
 type customPathToken struct {
 	name  string
 	index *int
 }
+
+// customPathMaxIndex 限制 fieldMappings 目标路径中的数组下标:
+// setCustomPathValue 按需填充 nil 至目标下标,无界索引可在首个响应时 OOM。
+const customPathMaxIndex = 4096
 
 func parseCustomPath(path string) ([]customPathToken, error) {
 	path = strings.TrimSpace(path)
@@ -213,71 +146,6 @@ func setCustomPathValue(current any, tokens []customPathToken, value any) (any, 
 	return object, nil
 }
 
-func deleteCustomPath(root any, path string) any {
-	tokens, err := parseCustomPath(path)
-	if err != nil {
-		return root
-	}
-	updated, _ := deleteCustomPathValue(root, tokens)
-	return updated
-}
-
-// deleteCustomPathValue 按路径删除空值，返回（可能被替换的）新值与是否删除。
-// 删除数组元素会返回缩短后的新 slice——Go 无法原地缩短 slice 并让父容器感知，
-// 调用方必须用返回值替换旧值，否则 JSON 输出会留下 null 洞。
-func deleteCustomPathValue(current any, tokens []customPathToken) (any, bool) {
-	if len(tokens) == 0 {
-		return current, true
-	}
-	token := tokens[0]
-	if token.index != nil {
-		array, ok := current.([]any)
-		if !ok || *token.index >= len(array) {
-			return current, false
-		}
-		index := *token.index
-		if len(tokens) == 1 {
-			if customEmptyValue(array[index]) {
-				return append(array[:index], array[index+1:]...), true
-			}
-			return current, false
-		}
-		updated, ok := deleteCustomPathValue(array[index], tokens[1:])
-		if !ok {
-			return current, false
-		}
-		array[index] = updated
-		if customEmptyValue(array[index]) {
-			return append(array[:index], array[index+1:]...), true
-		}
-		return current, true
-	}
-	object, ok := current.(map[string]any)
-	if !ok {
-		return current, false
-	}
-	value, exists := object[token.name]
-	if !exists {
-		return current, false
-	}
-	if len(tokens) == 1 {
-		if customEmptyValue(value) {
-			delete(object, token.name)
-			return current, true
-		}
-		return current, false
-	}
-	updated, deleted := deleteCustomPathValue(value, tokens[1:])
-	if !deleted {
-		return current, false
-	}
-	object[token.name] = updated
-	if customEmptyValue(updated) {
-		delete(object, token.name)
-	}
-	return current, true
-}
-
 func applyCustomFieldMappings(response *MaheshvaraResponse, root any, mappings []CustomProtocolFieldMapping) (*MaheshvaraResponse, error) {
 	if response == nil || len(mappings) == 0 {
 		return response, nil
@@ -291,10 +159,9 @@ func applyCustomFieldMappings(response *MaheshvaraResponse, root any, mappings [
 		return nil, fmt.Errorf("prepare mapped Maheshvara response: %w", err)
 	}
 	for index, mapping := range mappings {
-		targetPath := strings.TrimSpace(strings.TrimPrefix(mapping.Target, "maheshvara."))
-		if err := validateCustomResponseTarget(targetPath); err != nil {
-			return nil, fmt.Errorf("fieldMappings[%d]: %w", index, err)
-		}
+		// 目标路径在注册/ValidateCustomProtocol 时已校验（两条入口均经校验），
+		// 逐事件重复校验属于双重保护。
+		targetPath := normalizeMaheshvaraPath(mapping.Target)
 		value, ok, err := customMappingValue(root, mapping)
 		if err != nil {
 			return nil, fmt.Errorf("fieldMappings[%d]: %w", index, err)
@@ -329,6 +196,13 @@ func validateCustomResponseTarget(path string) error {
 	if tokens[0].index != nil {
 		return fmt.Errorf("target must start with a Maheshvara response field")
 	}
+	// 数组下标上限:setCustomPathValue 会按需填充 nil 到目标下标,无界索引
+	// (如 output[2000000000])在首个上游响应映射时即 OOM。
+	for _, token := range tokens {
+		if token.index != nil && *token.index > customPathMaxIndex {
+			return fmt.Errorf("array index %d exceeds the limit %d in target %q", *token.index, customPathMaxIndex, path)
+		}
+	}
 	switch tokens[0].name {
 	case "id", "model", "created_at", "status", "stop_reason", "incomplete_details", "metadata", "service_tier", "system_fingerprint", "output", "usage", "error":
 		return nil
@@ -339,7 +213,7 @@ func validateCustomResponseTarget(path string) error {
 
 func customMappingValue(root any, mapping CustomProtocolFieldMapping) (any, bool, error) {
 	if len(mapping.Value) > 0 {
-		value, err := jsonRawToNumberValue(mapping.Value)
+		value, err := decodeJSONUseNumber(mapping.Value)
 		return value, err == nil, err
 	}
 	if source := strings.TrimSpace(mapping.Source); source != "" {
@@ -348,7 +222,7 @@ func customMappingValue(root any, mapping CustomProtocolFieldMapping) (any, bool
 		}
 	}
 	if len(mapping.Default) > 0 {
-		value, err := jsonRawToNumberValue(mapping.Default)
+		value, err := decodeJSONUseNumber(mapping.Default)
 		return value, err == nil, err
 	}
 	return nil, false, nil
@@ -394,7 +268,7 @@ func transformCustomMappingValue(value any, transform string) (any, error) {
 		return parsed, nil
 	case "json", "parse_json":
 		if text, ok := value.(string); ok {
-			return jsonRawToNumberValue(json.RawMessage(text))
+			return decodeJSONUseNumber(json.RawMessage(text))
 		}
 		return value, nil
 	case "json_string":
@@ -419,7 +293,7 @@ func transformCustomMappingValue(value any, transform string) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return jsonRawToNumberValue(encoded)
+		return decodeJSONUseNumber(encoded)
 	case "tool_calls":
 		return customToolOutputItems(value), nil
 	case "output_items":
@@ -430,6 +304,12 @@ func transformCustomMappingValue(value any, transform string) (any, error) {
 }
 
 func customTextValue(value any) string {
+	return customTextValueWithKeys(value, nil)
+}
+
+// customTextValueWithKeys 按给定魔键提取文本；keys 为空时用内置默认表
+// （可经 aliases.textKeys 整体替换）。
+func customTextValueWithKeys(value any, keys []string) string {
 	switch typed := value.(type) {
 	case nil:
 		return ""
@@ -442,12 +322,12 @@ func customTextValue(value any) string {
 	case []any:
 		var builder strings.Builder
 		for _, item := range typed {
-			builder.WriteString(customTextValue(item))
+			builder.WriteString(customTextValueWithKeys(item, keys))
 		}
 		return builder.String()
 	case map[string]any:
-		for _, key := range []string{"text", "content", "message", "value", "output"} {
-			if text := customTextValue(typed[key]); text != "" {
+		for _, key := range customEffectiveTextKeys(keys) {
+			if text := customTextValueWithKeys(typed[key], keys); text != "" {
 				return text
 			}
 		}
@@ -456,6 +336,13 @@ func customTextValue(value any) string {
 	default:
 		return customValueString(typed)
 	}
+}
+
+func customEffectiveTextKeys(keys []string) []string {
+	if len(keys) > 0 {
+		return keys
+	}
+	return []string{"text", "content", "message", "value", "output"}
 }
 
 func customUsageMap(value any) map[string]any {
@@ -491,12 +378,12 @@ func customToolOutputItems(value any) []any {
 	array := customArrayValue(value)
 	result := make([]any, 0, len(array))
 	for index, item := range array {
-		call := customToolCall(item, index)
+		call := customToolCallWithAliases(item, index, nil)
 		if call.Name == "" {
 			continue
 		}
 		result = append(result, map[string]any{
-			"id": call.ID, "type": MaheshvaraOutputFunctionCall, "status": "completed", "call_id": call.ID,
+			"id": call.ID, "type": MaheshvaraOutputFunctionCall, "status": MaheshvaraStatusCompleted, "call_id": call.ID,
 			"name": call.Name, "arguments": jsonRawToAny(call.Arguments),
 		})
 	}
@@ -510,7 +397,7 @@ func customOutputItems(value any) []any {
 		object, _ := item.(map[string]any)
 		if object == nil {
 			if text := customTextValue(item); text != "" {
-				result = append(result, map[string]any{"type": MaheshvaraOutputMessage, "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": MaheshvaraContentText, "text": text}}})
+				result = append(result, map[string]any{"type": MaheshvaraOutputMessage, "status": MaheshvaraStatusCompleted, "role": "assistant", "content": []any{map[string]any{"type": MaheshvaraContentText, "text": text}}})
 			}
 			continue
 		}
@@ -518,7 +405,7 @@ func customOutputItems(value any) []any {
 		if text != "" {
 			result = append(result, map[string]any{
 				"id":   firstNonEmptyString(stringValue(object["id"]), fmt.Sprintf("msg_%d", index)),
-				"type": MaheshvaraOutputMessage, "status": "completed", "role": "assistant",
+				"type": MaheshvaraOutputMessage, "status": MaheshvaraStatusCompleted, "role": "assistant",
 				"content": []any{map[string]any{"type": MaheshvaraContentText, "text": text}},
 			})
 		}
@@ -540,12 +427,73 @@ func customArrayValue(value any) []any {
 	return []any{value}
 }
 
-func jsonRawToNumberValue(raw json.RawMessage) (any, error) {
-	var value any
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+// decodeJSONUseNumber 是全引擎统一的 JSON→any 解码入口(UseNumber:大整数
+// 经 json.Number 保精度)。所有「解析载荷/规则值/渲染产物」的路径共用。
+func decodeJSONUseNumber(data []byte) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
+	var value any
 	if err := decoder.Decode(&value); err != nil {
 		return nil, err
 	}
 	return value, nil
+}
+
+// deleteCustomPathForce 无条件删除路径（空值/条件省略统一删除阶段用）：
+// 命中即删，值非空也删；子项删除后为空的父容器一并修剪（与 legacy 空值
+// 删除的清理语义一致）。数组元素删除返回缩短后的新 slice。
+func deleteCustomPathForce(root any, path string) any {
+	tokens, err := parseCustomPath(path)
+	if err != nil {
+		return root
+	}
+	updated, _ := deleteCustomPathValueForce(root, tokens)
+	return updated
+}
+
+func deleteCustomPathValueForce(current any, tokens []customPathToken) (any, bool) {
+	if len(tokens) == 0 {
+		return current, true
+	}
+	token := tokens[0]
+	if token.index != nil {
+		array, ok := current.([]any)
+		if !ok || *token.index >= len(array) {
+			return current, false
+		}
+		index := *token.index
+		if len(tokens) == 1 {
+			return append(array[:index], array[index+1:]...), true
+		}
+		updated, ok := deleteCustomPathValueForce(array[index], tokens[1:])
+		if !ok {
+			return current, false
+		}
+		array[index] = updated
+		if customEmptyValue(array[index]) {
+			return append(array[:index], array[index+1:]...), true
+		}
+		return array, true
+	}
+	object, ok := current.(map[string]any)
+	if !ok {
+		return current, false
+	}
+	value, exists := object[token.name]
+	if !exists {
+		return current, false
+	}
+	if len(tokens) == 1 {
+		delete(object, token.name)
+		return current, true
+	}
+	updated, deleted := deleteCustomPathValueForce(value, tokens[1:])
+	if !deleted {
+		return current, false
+	}
+	object[token.name] = updated
+	if customEmptyValue(updated) {
+		delete(object, token.name)
+	}
+	return current, true
 }
