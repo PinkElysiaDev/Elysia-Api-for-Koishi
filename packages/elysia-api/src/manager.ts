@@ -194,10 +194,45 @@ export class StandaloneBackendManager {
       if (!this.config.backendBinaryPath) throw new Error('backendBinaryPath is required when backendBinaryMode=custom')
       return this.resolvePath(this.config.backendBinaryPath)
     }
-    return join(__dirname, '../assets/bin', this.getBinaryName())
+    // 首选 npm 平台包（optionalDependencies 声明，npm 按 os/cpu 只安装匹配平台的一个，
+    // 可能被提升到 Koishi 根 node_modules）。
+    const packaged = this.findPlatformPackageBinary()
+    if (packaged) return packaged
+    // 回退：旧版本插件随包携带的 assets/bin 二进制（原地升级场景仍可用）。
+    const legacy = join(__dirname, '../assets/bin', this.getLegacyBinaryName())
+    if (existsSync(legacy)) return legacy
+    throw new Error(
+      `Elysia-API 后端二进制未找到：平台包 ${this.platformPackageName()} 未安装` +
+      '（可能是以 --no-optional / --ignore-optional 方式安装插件）。' +
+      '可在插件配置中将后端二进制来源改为「自定义」并指定路径。',
+    )
   }
 
-  private getBinaryName() {
+  private platformPackageName() {
+    return `elysia-api-backend-${this.platformSuffix()}`
+  }
+
+  private platformSuffix() {
+    if (process.platform === 'win32') return process.arch === 'arm64' ? 'windows-arm64' : 'windows-amd64'
+    if (process.platform === 'darwin') return process.arch === 'arm64' ? 'darwin-arm64' : 'darwin-amd64'
+    if (process.platform === 'linux') return process.arch === 'arm64' ? 'linux-arm64' : 'linux-amd64'
+    throw new Error(`不支持的平台: ${process.platform}/${process.arch}`)
+  }
+
+  private findPlatformPackageBinary() {
+    const binary = join('node_modules', this.platformPackageName(), 'bin', process.platform === 'win32' ? 'elysia-api.exe' : 'elysia-api')
+    // 从插件目录逐级向上查找 node_modules，覆盖提升安装与同目录安装两种布局。
+    let dir = __dirname
+    for (;;) {
+      const candidate = join(dir, binary)
+      if (existsSync(candidate)) return candidate
+      const parent = dirname(dir)
+      if (parent === dir) return undefined
+      dir = parent
+    }
+  }
+
+  private getLegacyBinaryName() {
     if (process.platform === 'win32') return process.arch === 'arm64' ? 'elysia-backend-windows-arm64.exe' : 'elysia-backend.exe'
     if (process.platform === 'darwin') return process.arch === 'arm64' ? 'elysia-backend-darwin-arm64' : 'elysia-backend-darwin-amd64'
     if (process.platform === 'linux') return process.arch === 'arm64' ? 'elysia-backend-linux-arm64' : 'elysia-backend-linux'

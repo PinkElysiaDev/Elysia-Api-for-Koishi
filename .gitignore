@@ -1,10 +1,6 @@
-# TS 编译产物（仅 Koishi 包根的 lib/，不误伤 webui 的 src/lib 源码目录）
+# TS 编译产物（仅 Koishi 包根的 lib/）
 packages/*/lib
-backend/lib
 lib/
-!packages/webui/src/lib/
-dist
-external
 
 node_modules
 npm-debug.log
@@ -21,19 +17,8 @@ tsconfig.tsbuildinfo
 *.njsproj
 *.sln
 
-# 运行时 / 本地产物，不应提交
-backend/**/usage-records.jsonl
-backend/**/*.sqlite3
-backend/**/*.sqlite3-shm
-backend/**/*.sqlite3-wal
-backend/**/.db-key
-backend/**/master.key
+# 运行时数据，不应提交
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 package-lock.json
-
-# Go 后端二进制：体积过大，不入 git。发布前本地运行 scripts/build-backend.sh
-# 交叉编译生成，npm publish 仍会通过 package.json 的 files 字段打包。
-packages/*/assets/bin/
-
-# Playwright E2E 测试产物
-packages/webui/test-results/
-packages/webui/playwright-report/

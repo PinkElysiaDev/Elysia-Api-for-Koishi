@@ -24,7 +24,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.intersect([
     Schema.object({
       backendBinaryMode: Schema.union([
-        Schema.const('bundled' as const).description('使用插件内置后端二进制'),
+        Schema.const('bundled' as const).description('使用 npm 平台包安装的后端二进制（推荐，随插件自动安装）'),
         Schema.const('custom' as const).description('使用自定义后端二进制路径'),
       ]).default('bundled' as const).description('后端二进制来源'),
     }).description('后端程序'),

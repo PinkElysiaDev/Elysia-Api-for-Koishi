@@ -8,8 +8,6 @@
   "private": true,
   "license": "MIT",
   "scripts": {
-    "build:backend": "bash scripts/build-backend.sh",
-    "prebuild": "yarn build:backend",
     "build": "yakumo build",
     "bump": "yakumo version",
     "dep": "yakumo upgrade",
