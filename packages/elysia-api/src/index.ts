@@ -1,3 +1,5 @@
 ﻿export * from './config'
 export * from './manager'
-export { apply, usage } from './plugin'
+export * from './render'
+export { AgentBridge } from './agent'
+export { apply, usage, inject } from './plugin'

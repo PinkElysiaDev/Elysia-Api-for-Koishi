@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-elysia-api",
-  "description": "Standalone Elysia-API backend entry plugin for Koishi. It only manages backend bootstrap config, process lifecycle, and WebUI entry.",
-  "version": "1.2.0",
+  "description": "Standalone Elysia-API backend entry plugin for Koishi. Manages backend lifecycle and drives the built-in AI assistant from chat commands.",
+  "version": "1.3.0",
   "main": "lib/index.cjs",
   "module": "lib/index.mjs",
   "typings": "lib/index.d.ts",
@@ -42,18 +42,15 @@
   "peerDependencies": {
     "koishi": "^4.18.9"
   },
-  "optionalDependencies": {
-    "elysia-api-backend-windows-amd64": "1.4.0",
-    "elysia-api-backend-windows-arm64": "1.4.0",
-    "elysia-api-backend-linux-amd64": "1.4.0",
-    "elysia-api-backend-linux-arm64": "1.4.0",
-    "elysia-api-backend-darwin-amd64": "1.4.0",
-    "elysia-api-backend-darwin-arm64": "1.4.0"
-  },
   "koishi": {
     "description": {
-      "zh": "Elysia-API 独立后端入口插件，仅负责后端启动、bootstrap 配置和 WebUI 入口。",
-      "en": "Standalone Elysia-API backend entry plugin. It only manages backend startup, bootstrap config, and WebUI entry."
+      "zh": "Elysia-API 独立后端入口插件：启动后端，并用指令列出、进入、新建助手会话，以及对话、切换模型与审批方案。",
+      "en": "Standalone Elysia-API backend entry plugin. Starts the backend and drives assistant sessions, chat, model selection, and approvals from commands."
+    },
+    "service": {
+      "optional": [
+        "puppeteer"
+      ]
     }
   }
 }
