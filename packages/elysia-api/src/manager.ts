@@ -10,6 +10,7 @@ interface BootstrapConfig {
   port: number
   panelAccessToken: string
   httpTimeout: number
+  openBrowserOnStart?: boolean
 }
 
 export class StandaloneBackendManager {
@@ -62,6 +63,9 @@ export class StandaloneBackendManager {
       port: this.config.port,
       panelAccessToken,
       httpTimeout: this.config.httpTimeout,
+      // 宿主下默认不自动弹浏览器（桌面用户想要的话可显式写 true）——
+      // 新后端 nil 是「默认尝试」，Koishi 拉起的 daemon 不该在宿主机弹标签页。
+      openBrowserOnStart: existing.openBrowserOnStart ?? false,
     }
     writeFileSync(path, JSON.stringify(merged, null, 2))
     this.lastConfigHash = this.buildRuntimeHash()
